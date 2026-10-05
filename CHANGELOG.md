@@ -12,6 +12,14 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Highlights
+
+- Upgrading CodeGraph while an agent session is open no longer leaves an old background server saving files with no symbols.
+- `codegraph status` now tells you when indexed files are missing their symbols, and `codegraph sync` repairs them.
+- Indexing large Python projects is fast again.
+- Much more accurate VB.NET and C# results: structure members, property bodies, initializers and typed receiver calls are now linked, and constants no longer stand in for classes.
+- Re-index VB.NET and C# projects after upgrading to pick up the new links.
+
 ### Fixes
 
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.
