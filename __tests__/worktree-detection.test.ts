@@ -31,7 +31,10 @@ function git(cwd: string, ...args: string[]): void {
 
 /** realpath so macOS /var → /private/var symlinking doesn't break equality. */
 function real(p: string): string {
-  return fs.realpathSync(path.resolve(p));
+  // .native on Windows also expands 8.3 short names (RUNNER~1), as the code does.
+  return process.platform === 'win32'
+    ? fs.realpathSync.native(path.resolve(p))
+    : fs.realpathSync(path.resolve(p));
 }
 
 describe('detectWorktreeIndexMismatch (issue #155)', () => {

@@ -12,6 +12,10 @@ export default defineConfig({
     globals: true,
     environment: 'node',
     include: ['__tests__/**/*.test.ts'],
+    // CLI --testTimeout/--hookTimeout don't reach workspace projects, so a
+    // slow runner (hosted Windows CI, #1773) raises them through the env.
+    ...(process.env.VITEST_TEST_TIMEOUT ? { testTimeout: Number(process.env.VITEST_TEST_TIMEOUT) } : {}),
+    ...(process.env.VITEST_HOOK_TIMEOUT ? { hookTimeout: Number(process.env.VITEST_HOOK_TIMEOUT) } : {}),
     // Suites that spawn the built CLI need a current dist/ (#1879).
     globalSetup: ['./__tests__/global-setup-dist.ts'],
     // A throwaway home dir (and git global config) per test file, so nothing

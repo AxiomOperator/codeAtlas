@@ -3306,7 +3306,8 @@ describe('Installer — config-file safety', () => {
     fs.mkdirSync(path.dirname(vs), { recursive: true });
     fs.writeFileSync(vs, '[1, 2');
     const res2 = getTarget('copilot-vscode')!.install('local', { autoAllow: false });
-    expect(res2.files[0]).toEqual({ path: vs, action: 'kept' });
+    // A local target resolves from process.cwd(), which macOS reports under /private.
+    expect(res2.files[0]).toEqual({ path: fs.realpathSync(vs), action: 'kept' });
     expect(fs.readFileSync(vs, 'utf-8')).toBe('[1, 2');
   });
 

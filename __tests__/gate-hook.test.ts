@@ -11,7 +11,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { spawnSync } from 'node:child_process';
-import { WASM_RUNTIME_FLAGS } from '../src/extraction/wasm-runtime-flags';
+import { WASM_RUNTIME_FLAGS, NODE_RUNTIME_FLAGS } from '../src/extraction/wasm-runtime-flags';
 import CodeGraph from '../src/index';
 import {
   decideGate,
@@ -148,7 +148,7 @@ describe('gate-hook CLI (built)', () => {
   function run(payload: unknown, env: Record<string, string> = {}) {
     // Spawned the way the installed launcher runs it (its runtime flags mute
     // node:sqlite's ExperimentalWarning on Node 22).
-    return spawnSync(process.execPath, [...WASM_RUNTIME_FLAGS, path.resolve(__dirname, '../dist/bin/codegraph.js'), 'gate-hook'], {
+    return spawnSync(process.execPath, [...WASM_RUNTIME_FLAGS, ...NODE_RUNTIME_FLAGS, path.resolve(__dirname, '../dist/bin/codegraph.js'), 'gate-hook'], {
       input: typeof payload === 'string' ? payload : JSON.stringify(payload),
       encoding: 'utf8',
       timeout: 15_000,

@@ -28,7 +28,8 @@ import {
 } from '../src/db/schema-ddl';
 import { SYNTHESIZED_EDGE as STAGE_SYNTHESIZED_EDGE } from '../src/db/synthesis-stage';
 
-const schemaFile = fs.readFileSync(path.join(__dirname, '../src/db/schema.sql'), 'utf-8');
+// Windows checkouts may be CRLF.
+const schemaFile = fs.readFileSync(path.join(__dirname, '../src/db/schema.sql'), 'utf-8').replace(/\r\n/g, '\n');
 
 describe('schema-ddl constants match schema.sql', () => {
   it('schema.sql defines idx_edges_synthesis_site with exactly the shared expressions', () => {

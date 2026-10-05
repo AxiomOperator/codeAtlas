@@ -44,7 +44,10 @@ jobs:
         # failures (#1773). Fewer workers and longer timeouts test the code,
         # not the runner.
         if: runner.os == 'Windows'
-        run: npx vitest run --minWorkers=1 --maxWorkers=2 --testTimeout=30000 --hookTimeout=60000
+        env:
+          VITEST_TEST_TIMEOUT: '60000'
+          VITEST_HOOK_TIMEOUT: '120000'
+        run: npx vitest run --minWorkers=1 --maxWorkers=2
 
   kernel:
     runs-on: ubuntu-latest
