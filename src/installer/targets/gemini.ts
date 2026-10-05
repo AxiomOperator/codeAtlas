@@ -36,6 +36,8 @@ import {
   getMcpServerConfig,
   jsonDeepEqual,
   readJsonFile,
+  readJsonFileForEdit,
+  withConfigRefusal,
   removeMarkedSection,
   writeJsonFile,
   upsertInstructionsEntry,
@@ -97,7 +99,7 @@ class GeminiTarget implements AgentTarget {
     const files: WriteResult['files'] = [];
 
     const file = settingsJsonPath(loc);
-    const config = readJsonFile(file);
+    const config = readJsonFileForEdit(file);
     if (config.mcpServers?.codegraph) {
       delete config.mcpServers.codegraph;
       if (Object.keys(config.mcpServers).length === 0) {
@@ -133,7 +135,7 @@ function writeMcpEntry(loc: Location): WriteResult['files'][number] {
   const dir = path.dirname(file);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-  const existing = readJsonFile(file);
+  const existing = readJsonFileForEdit(file);
   const before = existing.mcpServers?.codegraph;
   const after = getMcpServerConfig();
 
@@ -159,4 +161,4 @@ function removeInstructionsEntry(loc: Location): WriteResult['files'][number] {
   return { path: file, action };
 }
 
-export const geminiTarget: AgentTarget = new GeminiTarget();
+export const geminiTarget: AgentTarget = withConfigRefusal(new GeminiTarget());

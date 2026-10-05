@@ -31,6 +31,7 @@ import { isGitRepo, isSyncHookInstalled, installGitSyncHook } from '../sync/git-
 import { getCodeGraphDir } from '../directory';
 import { getTelemetry, TELEMETRY_DOCS } from '../telemetry';
 import { maybeOfferBetaSignup } from './beta-signup';
+import { detectInstallMethod } from '../upgrade';
 
 // Backwards-compat: keep these named exports — downstream code may
 // import them. The shim in `config-writer.ts` continues to re-export
@@ -78,6 +79,60 @@ export interface RunInstallerOptions {
    * untouched, never enabled.
    */
   gateHook?: boolean;
+  /**
+   * `--personal` (#243): write project-local configs to each agent's
+   * personal, never-committed variants. Implies `location: 'local'`;
+   * targets without a personal variant are skipped with a message.
+   */
+  personal?: boolean;
+  /**
+   * `__filename` of the CLI entry — used to tell a standalone (install.sh)
+   * bundle from an npm install. Defaults to this build's `bin/codegraph.js`.
+   */
+  cliFilename?: string;
+}
+
+/**
+ * Why `npm install -g` failed, in words a user can act on — npm's own
+ * error lines, not a blanket "permission denied" (which sent people to
+ * `sudo` for network errors, a missing npm, or a timeout).
+ */
+export function describeNpmInstallFailure(err: unknown): { reason: string; detail: string[]; hint?: string } {
+  const e = (err ?? {}) as { code?: string; signal?: string; status?: number | null; stderr?: unknown; stdout?: unknown; message?: string };
+  const text = (v: unknown): string => (v == null ? '' : Buffer.isBuffer(v) ? v.toString('utf-8') : String(v));
+  const output = (text(e.stderr) + '\n' + text(e.stdout)).split(/\r?\n/).map((l) => l.trimEnd()).filter((l) => l.trim());
+  const npmLines = output.filter((l) => /^npm (ERR!|error)/.test(l));
+  const detail = (npmLines.length > 0 ? npmLines : output).slice(-6);
+  const all = output.join('\n') + '\n' + (e.message ?? '');
+
+  if (e.code === 'ENOENT' || /npm: (command )?not found|'npm' is not recognized/i.test(all)) {
+    return { reason: 'npm is not installed or not on your PATH', detail, hint: 'Install Node.js (which includes npm), or use the standalone installer: https://github.com/colbymchenry/codegraph#install' };
+  }
+  if (e.code === 'ETIMEDOUT' || e.signal === 'SIGTERM') {
+    return { reason: 'npm did not finish within 2 minutes', detail, hint: 'Check your network / npm registry, then run: npm install -g @colbymchenry/codegraph' };
+  }
+  if (/\bE(ACCES|PERM)\b/.test(all)) {
+    return { reason: 'permission denied writing npm\'s global directory', detail, hint: 'Try: sudo npm install -g @colbymchenry/codegraph — or point npm at a user-writable prefix (npm config set prefix ~/.npm-global).' };
+  }
+  if (/\b(ENOTFOUND|ECONNREFUSED|ECONNRESET|EAI_AGAIN|ETIMEDOUT|network)\b/i.test(all)) {
+    return { reason: 'a network error reaching the npm registry', detail, hint: 'Check your connection / proxy, then run: npm install -g @colbymchenry/codegraph' };
+  }
+  const status = typeof e.status === 'number' ? ` (exit ${e.status})` : '';
+  return { reason: `npm install failed${status}`, detail, hint: 'Run it yourself to see the full output: npm install -g @colbymchenry/codegraph' };
+}
+
+/**
+ * True when this CLI is the standalone bundle `install.sh` / `install.ps1`
+ * put on PATH. Offering `npm install -g` there would create a SECOND
+ * install that shadows (or is shadowed by) the bundle — the #1071 split
+ * where `codegraph -v` and `codegraph upgrade` disagree about the version.
+ */
+export function isStandaloneBundleInstall(cliFilename: string): boolean {
+  try {
+    return detectInstallMethod({ filename: cliFilename, platform: process.platform, cwd: process.cwd() }).kind === 'bundle';
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -108,9 +163,13 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     return;
   }
 
-  // Step 2: install the codegraph npm package on PATH (always offered;
-  // matches existing behavior). Skipped when --yes (assume present).
-  if (!useDefaults) {
+  // Step 2: install the codegraph npm package on PATH. Skipped when --yes
+  // (assume present), and when this IS the standalone bundle — it's already
+  // on PATH, and an npm copy beside it is the #1071 shadow install.
+  const cliFilename = opts.cliFilename ?? path.resolve(__dirname, '..', 'bin', 'codegraph.js');
+  if (!useDefaults && isStandaloneBundleInstall(cliFilename)) {
+    clack.log.info('CodeGraph CLI is already on your PATH (standalone install) — skipping npm install.');
+  } else if (!useDefaults) {
     const shouldInstallGlobally = await clack.confirm({
       message: 'Install the codegraph CLI on your PATH? (Required so agents can launch the MCP server)',
       initialValue: true,
@@ -127,9 +186,11 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
         // wedged npm can't hang the interactive installer forever (#1139).
         execSync('npm install -g @colbymchenry/codegraph', { stdio: 'pipe', windowsHide: true, timeout: 120_000 });
         s.stop('Installed codegraph CLI on PATH');
-      } catch {
-        s.stop('Could not install (permission denied)');
-        clack.log.warn('Try: sudo npm install -g @colbymchenry/codegraph');
+      } catch (err) {
+        const failure = describeNpmInstallFailure(err);
+        s.stop(`Could not install the CLI — ${failure.reason}`);
+        if (failure.detail.length > 0) clack.log.warn(failure.detail.join('\n'));
+        if (failure.hint) clack.log.warn(failure.hint);
       }
     } else {
       clack.log.info('Skipped CLI install — agents will not be able to launch the MCP server without it');
@@ -138,7 +199,10 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
 
   // Step 3: where the per-agent config files should land.
   let location: Location;
-  if (opts.location) {
+  if (opts.personal) {
+    // --personal is a project-local mode by definition (#243).
+    location = 'local';
+  } else if (opts.location) {
     location = opts.location;
   } else if (useDefaults) {
     location = 'global';
@@ -266,11 +330,22 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
       );
       continue;
     }
-    const result = target.install(location, { autoAllow, promptHook, gateHook });
+    if (opts.personal && !target.supportsPersonal) {
+      clack.log.warn(
+        `${target.displayName}: skipped — it has no personal (uncommitted) project config; ` +
+        're-run without --personal to write its team-shared project file.',
+      );
+      continue;
+    }
+    const result = target.install(location, { autoAllow, promptHook, gateHook, personal: opts.personal });
     installedIds.push(target.id);
     for (const file of result.files) {
       if (file.action === 'created') sawCreated = true;
       if (file.action === 'updated') sawUpdated = true;
+      if (file.action === 'kept' || file.action === 'not-found') {
+        if (file.action === 'kept') clack.log.warn(`${target.displayName}: Left ${tildify(file.path)} untouched`);
+        continue;
+      }
       const verb = file.action === 'unchanged'
         ? 'Unchanged'
         : file.action === 'created' ? 'Created'
@@ -341,6 +416,8 @@ export interface RunUninstallerOptions {
   yes?: boolean;
   /** Remove agent configs only — leave the CLI binary installed. */
   keepCli?: boolean;
+  /** Reverse a `--personal` install (implies `location: 'local'`, #243). */
+  personal?: boolean;
   /**
    * `__filename` of the CLI entry (dist/bin/codegraph.js) — install-method
    * detection is keyed off the running binary's real location.
@@ -379,8 +456,18 @@ export interface UninstallReport {
 export function uninstallTargets(
   targets: readonly AgentTarget[],
   location: Location,
+  opts: { personal?: boolean } = {},
 ): UninstallReport[] {
   return targets.map((target) => {
+    if (opts.personal && !target.supportsPersonal) {
+      return {
+        id: target.id,
+        displayName: target.displayName,
+        status: 'unsupported' as const,
+        removedPaths: [],
+        notes: ['no personal project config — --personal applies to Claude Code only'],
+      };
+    }
     if (!target.supportsLocation(location)) {
       const only: Location = location === 'local' ? 'global' : 'local';
       return {
@@ -391,7 +478,7 @@ export function uninstallTargets(
         notes: [`no ${location} config — this agent is ${only}-only`],
       };
     }
-    const result = target.uninstall(location);
+    const result = target.uninstall(location, opts.personal ? { personal: true } : undefined);
     const removedPaths = result.files
       .filter((f) => f.action === 'removed')
       .map((f) => f.path);
@@ -486,7 +573,9 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
   // must make. Global sweeps ~/.claude, ~/.codex, etc.; local sweeps
   // the configs in this project directory.
   let location: Location;
-  if (opts.location) {
+  if (opts.personal) {
+    location = 'local';
+  } else if (opts.location) {
     location = opts.location;
   } else if (useDefaults) {
     location = 'global';
@@ -522,7 +611,7 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
   }
 
   // Step 3: sweep + per-agent feedback.
-  const reports = uninstallTargets(targets, location);
+  const reports = uninstallTargets(targets, location, { personal: opts.personal });
   const removed = reports.filter((r) => r.status === 'removed');
 
   for (const r of reports) {
@@ -532,6 +621,7 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
       }
     } else if (r.status === 'not-configured') {
       clack.log.info(`${r.displayName}: not configured — nothing to remove`);
+      for (const note of r.notes) clack.log.warn(`${r.displayName}: ${note}`);
     } else {
       clack.log.info(`${r.displayName}: skipped — ${r.notes[0] ?? 'unsupported location'}`);
     }
@@ -688,7 +778,7 @@ async function resolveTargets(
 export async function offerWatchFallback(
   clack: typeof import('@clack/prompts'),
   projectPath: string,
-  opts: { yes?: boolean } = {},
+  opts: { yes?: boolean; forceHooksPath?: boolean } = {},
 ): Promise<void> {
   const reason = watchDisabledReason(projectPath);
   if (!reason) return; // Watcher runs normally — nothing to set up.
@@ -732,14 +822,15 @@ export async function offerWatchFallback(
     return;
   }
 
-  const result = installGitSyncHook(projectPath);
+  const result = installGitSyncHook(projectPath, undefined, { forceHooksPath: opts.forceHooksPath });
+  for (const note of result.notes) clack.log.warn(note);
   if (result.installed.length > 0) {
     clack.log.success(
       `Installed git ${result.installed.join(', ')} hook${result.installed.length > 1 ? 's' : ''} — ` +
       'the index refreshes in the background after each.',
     );
     clack.log.info('Run `codegraph sync` anytime to refresh immediately.');
-  } else {
+  } else if (result.notes.length === 0) {
     clack.log.warn(
       `Could not install git hooks${result.skipped ? ` (${result.skipped})` : ''}. ` +
       'Run `codegraph sync` after changes instead.',

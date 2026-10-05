@@ -391,7 +391,7 @@ npx @colbymchenry/codegraph
 
 The installer will:
 - Ask which agent(s) to configure — auto-detects installed ones from: **Claude Code**, **Cursor**, **Codex CLI**, **opencode**, **Hermes Agent**, **Gemini CLI**, **Antigravity IDE**, **Kiro**, **GitHub Copilot** (VS Code, Copilot CLI, JetBrains IDEs)
-- Prompt to install `codegraph` on your PATH (so agents can launch the MCP server)
+- Prompt to install `codegraph` on your PATH (so agents can launch the MCP server) — skipped when you installed with the standalone `install.sh` / `install.ps1`, which already put it there
 - Ask whether configs apply to all your projects or just this one
 - Write each chosen agent's MCP server config, plus a small marker-fenced CodeGraph section in the agent's instructions file (`CLAUDE.md` / `AGENTS.md` / `GEMINI.md`) — that's how subagents and non-MCP agents learn the `codegraph explore` command, since the MCP server's own guidance only reaches the main agent. Removed cleanly by `codegraph uninstall`.
 - Set up auto-allow permissions when Claude Code is one of the targets
@@ -405,6 +405,7 @@ codegraph install --yes                              # auto-detect agents, insta
 codegraph install --yes --init                       # same, then build the current project's index (one-shot bootstrap)
 codegraph install --target=cursor,claude --yes       # explicit target list
 codegraph install --target=auto --location=local     # detected agents, project-local
+codegraph install --target=claude --personal         # this project only, nothing committed (see below)
 codegraph install --target=copilot-vscode,copilot-cli,copilot-jetbrains --yes  # GitHub Copilot everywhere
 codegraph install --print-config codex               # print snippet, no file writes
 codegraph install --print-config copilot-vscode      # same, for Copilot in VS Code
@@ -418,6 +419,11 @@ codegraph install --print-config copilot-vscode      # same, for Copilot in VS C
 | `--init` | (boolean) run `codegraph init` in the current directory after wiring agents | — |
 | `--no-permissions` | (boolean) skip Claude auto-allow list | permissions on |
 | `--print-config <id>` | dump snippet for one agent and exit | — |
+| `--personal` | (boolean) project install that stays out of git — implies `--location=local` | — |
+
+**`--personal`** writes a project install to the agent's personal, never-committed config instead of the team-shared files. For Claude Code that is its *local* scope: the MCP server goes into `~/.claude.json` under this project's entry (what `claude mcp add --scope local` writes), permissions and hooks into `.claude/settings.local.json`, and the instructions block into `CLAUDE.local.md` — so `.mcp.json`, `.claude/settings.json` and `.claude/CLAUDE.md` are left alone. Keep `settings.local.json` and `CLAUDE.local.md` out of git (`.gitignore` or `.git/info/exclude`). Undo with `codegraph uninstall --personal`. The other agents have no personal project-config layer (Cursor, Codex, opencode, Gemini, Kiro and VS Code only read the shared project file), so `--personal` skips them with a message.
+
+Config edits are surgical: comments, formatting, and keys CodeGraph doesn't own survive in JSON/JSONC and TOML configs (including your own keys under Codex's `[mcp_servers.codegraph]`), symlinked configs keep pointing where they did, and a config file that can't be parsed is left untouched with a note telling you what to fix.
 
 ### 2. Restart Your Agent
 
@@ -630,8 +636,9 @@ that drive the graph directly: `DatabaseConnection`, `QueryBuilder`,
 - Install from npm (`npm i @colbymchenry/codegraph`) so the matching
   per-platform package — which carries the compiled library and its
   dependencies — is fetched alongside the shim.
-- The API runs on **your** runtime, so it needs **Node 22.5+** for the built-in
-  `node:sqlite` (Electron qualifies when its bundled Node is 22.5+). The CLI and
+- The API runs on **your** runtime, so it needs **Node 22.13+** for the built-in
+  `node:sqlite` (Electron qualifies when its bundled Node is 22.13+; Node
+  22.5–22.12 only with `--experimental-sqlite`). The CLI and
   MCP server are unaffected — they run on the self-contained bundled runtime.
 - TypeScript types ship with the package. As with any Node-targeting library,
   keep `@types/node` available and `skipLibCheck: true` (the common default).

@@ -394,33 +394,56 @@ function safeDecode(value: string): string {
   }
 }
 
+/** Options for {@link listenWithFallback}. */
+export interface ListenFallbackOptions {
+  port: number;
+  fallback: boolean;
+  attempts: number;
+  /** Test seam: one bind attempt. Defaults to a real loopback `listen()`. */
+  listen?: (port: number) => Promise<number>;
+  /** Test seam: the platform whose port rules apply. Defaults to `process.platform`. */
+  platform?: NodeJS.Platform;
+}
+
 /**
  * Bind the first free port at or after `port`, on loopback only.
  *
- * Only `EADDRINUSE` advances to the next port — a permission failure or a bad
- * address will not get better one port over, and retrying twenty times would
- * only bury the real error.
+ * `EADDRINUSE` advances to the next port, and so does `EACCES` — on Windows a
+ * port held exclusively by another program, or inside a reserved/excluded
+ * range (Hyper-V, WinNAT), fails with `EACCES` at any port number (#2299). On
+ * POSIX, `EACCES` below 1024 is the privileged-port rule, which every lower
+ * port shares, so that stops at once. Anything else (a bad address, …) will
+ * not get better one port over, so it stops too rather than bury the error.
  */
-async function listenWithFallback(
-  server: http.Server,
-  opts: { port: number; fallback: boolean; attempts: number }
+export async function listenWithFallback(
+  server: http.Server | null,
+  opts: ListenFallbackOptions
 ): Promise<number> {
+  const platform = opts.platform ?? process.platform;
+  const listen = opts.listen ?? (async (port: number): Promise<number> => {
+    if (!server) throw new Error('listenWithFallback needs a server or a listen function.');
+    await listenOnce(server, port);
+    const address = server.address();
+    if (address === null || typeof address === 'string') {
+      throw new Error('The UI server bound to an unexpected address.');
+    }
+    return address.port;
+  });
   // Port 0 means "any free port", so there is nothing to fall back from.
   const attempts = opts.port === 0 || !opts.fallback ? 1 : Math.max(1, opts.attempts);
+  const seen = new Set<string>();
 
   for (let i = 0; i < attempts; i++) {
     const candidate = opts.port === 0 ? 0 : opts.port + i;
     try {
-      await listenOnce(server, candidate);
-      const address = server.address();
-      if (address === null || typeof address === 'string') {
-        throw new Error('The UI server bound to an unexpected address.');
-      }
-      return address.port;
+      return await listen(candidate);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      if (code !== 'EADDRINUSE' || i === attempts - 1) {
-        throw describeBindFailure(err, candidate, opts);
+      const privileged = code === 'EACCES' && platform !== 'win32' && candidate < 1024;
+      const retryable = code === 'EADDRINUSE' || (code === 'EACCES' && !privileged);
+      if (code) seen.add(code);
+      if (!retryable || i === attempts - 1) {
+        throw describeBindFailure(err, candidate, { ...opts, platform, seen });
       }
     }
   }
@@ -456,18 +479,38 @@ function listenOnce(server: http.Server, port: number): Promise<void> {
 function describeBindFailure(
   err: unknown,
   port: number,
-  opts: { port: number; fallback: boolean; attempts: number }
+  opts: { port: number; fallback: boolean; platform: NodeJS.Platform; seen: Set<string> }
 ): Error {
   const code = (err as NodeJS.ErrnoException).code;
-  if (code === 'EADDRINUSE') {
-    return opts.fallback
-      ? new Error(
-          `Ports ${opts.port}–${port} are all in use. Free one, or pick another with --port.`
-        )
-      : new Error(`Port ${port} is already in use. Pick another with --port, or omit --port to let CodeGraph find a free one.`);
+  const searched = opts.fallback && opts.port !== 0 && port !== opts.port;
+  const range = `Ports ${opts.port}–${port}`;
+  const windowsHint = 'On Windows, list reserved ranges with `netsh int ipv4 show excludedportrange protocol=tcp`.';
+
+  if (code === 'EACCES' && opts.platform !== 'win32' && port < 1024) {
+    return new Error(`Not allowed to listen on port ${port}. Ports below 1024 need elevated privileges — pick a higher one with --port.`);
   }
-  if (code === 'EACCES') {
-    return new Error(`Not allowed to listen on port ${port}. Ports below 1024 usually need elevated privileges — pick a higher one with --port.`);
+  if (code !== 'EADDRINUSE' && code !== 'EACCES') {
+    return err instanceof Error ? err : new Error(String(err));
   }
-  return err instanceof Error ? err : new Error(String(err));
+  const sawInUse = opts.seen.has('EADDRINUSE');
+  const sawDenied = opts.seen.has('EACCES');
+
+  if (sawDenied && !sawInUse) {
+    // Every attempt was refused for permission — a pattern, not a busy port.
+    const what = searched ? `${range} were all refused` : `Port ${port} was refused`;
+    return new Error(
+      opts.platform === 'win32'
+        ? `Not allowed to listen: ${what} (EACCES). Another program holds ${searched ? 'them' : 'it'} exclusively, or ${searched ? 'they are' : 'it is'} in a reserved port range. ${windowsHint} Pick another with --port.`
+        : `Not allowed to listen: ${what} (EACCES) — a firewall or security policy may be blocking local listeners. Pick another with --port.`
+    );
+  }
+  if (sawDenied && sawInUse) {
+    return new Error(
+      `${range} are all in use or reserved. Free one, or pick another with --port.` +
+      (opts.platform === 'win32' ? ` ${windowsHint}` : '')
+    );
+  }
+  return opts.fallback
+    ? new Error(`${range} are all in use. Free one, or pick another with --port.`)
+    : new Error(`Port ${port} is already in use. Pick another with --port, or omit --port to let CodeGraph find a free one.`);
 }

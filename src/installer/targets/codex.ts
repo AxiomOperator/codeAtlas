@@ -49,7 +49,13 @@ import {
   CODEGRAPH_SECTION_END,
   CODEGRAPH_SECTION_START,
 } from '../instructions-template';
-import { buildTomlTable, removeTomlTable, upsertTomlTable } from './toml';
+import {
+  buildTomlTable,
+  findInlineTomlDefinition,
+  findTomlTable,
+  removeTomlTable,
+  upsertTomlTableKeys,
+} from './toml';
 
 const TOML_HEADER = 'mcp_servers.codegraph';
 
@@ -102,7 +108,8 @@ class CodexTarget implements AgentTarget {
     if (fs.existsSync(tomlPath)) {
       try {
         const content = fs.readFileSync(tomlPath, 'utf-8');
-        alreadyConfigured = content.includes(`[${TOML_HEADER}]`);
+        alreadyConfigured = findTomlTable(content, TOML_HEADER) !== null ||
+          findInlineTomlDefinition(content, TOML_HEADER);
       } catch { /* ignore */ }
     }
     // Global: ~/.codex/ existing means Codex has run here. Local: the
@@ -114,25 +121,33 @@ class CodexTarget implements AgentTarget {
 
   install(loc: Location, _opts: InstallOptions): WriteResult {
     const files: WriteResult['files'] = [];
+    const notes: string[] = [];
 
-    files.push(writeMcpEntry(loc));
+    files.push(writeMcpEntry(loc, notes));
 
     // AGENTS.md gets the short marker-fenced CodeGraph block (#704):
     // subagents and non-MCP harnesses read AGENTS.md but never the MCP
     // initialize instructions. Upsert self-heals a stale pre-#529 block.
     files.push(upsertInstructionsEntry(instructionsPath(loc)));
 
-    return loc === 'local' ? { files, notes: [trustNote()] } : { files };
+    if (loc === 'local') notes.push(trustNote());
+    return notes.length > 0 ? { files, notes } : { files };
   }
 
   uninstall(loc: Location): WriteResult {
     const files: WriteResult['files'] = [];
+    const notes: string[] = [];
 
     const tomlPath = tomlConfigPath(loc);
     if (fs.existsSync(tomlPath)) {
       const content = fs.readFileSync(tomlPath, 'utf-8');
       const { content: nextContent, action } = removeTomlTable(content, TOML_HEADER);
-      if (action === 'removed') {
+      if (findInlineTomlDefinition(content, TOML_HEADER)) {
+        // An inline `codegraph = { … }` / dotted-key definition can't be cut
+        // out line-wise without risking the surrounding table — say so.
+        notes.push(inlineNote(tomlPath));
+        files.push({ path: tomlPath, action: 'kept' });
+      } else if (action === 'removed') {
         if (nextContent.trim() === '') {
           try { fs.unlinkSync(tomlPath); } catch { /* ignore */ }
         } else {
@@ -148,7 +163,7 @@ class CodexTarget implements AgentTarget {
 
     files.push(removeInstructionsEntry(loc));
 
-    return { files };
+    return notes.length > 0 ? { files, notes } : { files };
   }
 
   printConfig(loc: Location): string {
@@ -161,27 +176,43 @@ class CodexTarget implements AgentTarget {
   }
 }
 
-function buildCodegraphBlock(): string {
+/** The keys the installer owns inside `[mcp_servers.codegraph]`. */
+function ownedValues(): { command: string; args: string[] } {
   const mcp = getMcpServerConfig();
-  return buildTomlTable(TOML_HEADER, {
-    command: mcp.command,
-    args: mcp.args,
-  });
+  return { command: mcp.command, args: mcp.args };
 }
 
-function writeMcpEntry(loc: Location): WriteResult['files'][number] {
+function buildCodegraphBlock(): string {
+  return buildTomlTable(TOML_HEADER, ownedValues());
+}
+
+function inlineNote(file: string): string {
+  return `${file} defines codegraph as an inline table or dotted keys (e.g. \`codegraph = { … }\` under [mcp_servers]) — CodeGraph left it untouched. ` +
+    'Replace it with a [mcp_servers.codegraph] table (see `codegraph install --print-config codex`) and re-run.';
+}
+
+/**
+ * Upsert our `command` / `args` inside `[mcp_servers.codegraph]`. Every
+ * other key in that table (`env`, `startup_timeout_sec`, `enabled`, …) and
+ * every `[mcp_servers.codegraph.*]` subtable is the user's and survives
+ * re-install and `install --refresh`.
+ */
+function writeMcpEntry(loc: Location, notes: string[]): WriteResult['files'][number] {
   const file = tomlConfigPath(loc);
   const dir = path.dirname(file);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-  const block = buildCodegraphBlock();
   // Single read — `existing === ''` derives both "is the file empty
   // or absent" and "what was its content," avoiding a TOCTOU window
   // between two `fs.existsSync` calls.
   const existing = fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : '';
   const created = existing.length === 0;
-  const { content: nextContent, action } = upsertTomlTable(existing, TOML_HEADER, block);
+  const { content: nextContent, action } = upsertTomlTableKeys(existing, TOML_HEADER, ownedValues());
 
+  if (action === 'refused') {
+    notes.push(inlineNote(file));
+    return { path: file, action: 'kept' };
+  }
   if (action === 'unchanged') {
     return { path: file, action: 'unchanged' };
   }

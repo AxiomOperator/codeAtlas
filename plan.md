@@ -284,6 +284,13 @@ Each item: minimal repro test from the issue → fix → probe on 3 real repos �
 - Remove dead `preuninstall` (R-17).
 - #2299 ui-server: advance the port on `EACCES` too (`src/ui-server/index.ts:422`), Windows-gated test.
 
+> **Phase 5 progress (2026-10-05)** — two worktree branches cherry-picked and squashed; full suite 476 files / 6148 tests green (wasm mode), `tsc` clean.
+> - ✅ 5.1 Every JSON/JSONC agent config is edited surgically via `jsonc-parser`; an unparseable file is left byte-identical with a note (also covers opencode, VS Code/JetBrains, the legacy `config-writer.ts` shim and upgrade's prompt-hook step). `atomicWriteFileSync` writes through symlinks, preserves mode, and re-reads before rename (re-applies the edit once on a concurrent change). Codex: installer owns only `command`/`args`; header variants recognised; inline/dotted definitions refused with a note; uninstall removes `[mcp_servers.codegraph.*]`; the misnamed test now asserts real survival. Prompt/gate hook matchers recognise only the exact forms we write.
+> - ✅ 5.2 No `npm i -g` offer from a bundle install; npm failures report the real cause. `--personal` (#243) for Claude: `~/.claude.json` `projects[<cwd>].mcpServers` + `.claude/settings.local.json` + `CLAUDE.local.md`; other agents have no personal scope (skipped with a message, README documents it). #1274: opencode now built on a shared `opencode-family.ts`. **Review decision:** the agent's new CoDev Code target was removed before merge — its config shape came from an unmerged PR and was never verified against the real binary.
+> - ✅ 5.3 Git hooks: block inserted before a trailing top-level `exit`/`exec`; byte-exact removal; only shell hooks edited (others get a note); non-executable hooks left disabled; tracked / git-ignored (husky v9 `.husky/_`) / out-of-repo `core.hooksPath` left alone unless `codegraph init --force-hooks-path`.
+> - ✅ 5.4 Node floor raised to **22.13** (not 22.5 — `node:sqlite` is flag-gated on 22.5–22.12) in `engines`, the version check, README/site/AGENTS.md; `codegraph.json` non-object → error, atomic write, only ENOENT = missing; path containment realpaths the nearest existing ancestor (dangling symlinks rejected); dead `preuninstall` + `src/bin/uninstall.ts` removed; #2299 ui-server advances on `EACCES` (stops at once for privileged ports on POSIX; all-EACCES → permission message with the Windows `netsh` hint). Note: upstream fixed #2299 independently (#2353) after this fork's base.
+> - ⏸ Windows VM validation of the Windows-gated tests (EACCES port, Codex/Claude paths) needs the maintainer's VM; GitHub-hosted Windows CI covers part of it.
+
 ---
 
 ## Phase 6 — Viewer launch & issue hygiene (ongoing)

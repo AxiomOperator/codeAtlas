@@ -57,31 +57,24 @@ describe('Installer Config Writer', () => {
       expect(content.mcpServers.codegraph).toBeDefined();
     });
 
-    it('should handle corrupted JSON by creating backup', () => {
+    it('should refuse to touch corrupted JSON, warning instead of replacing it', () => {
       // Create a corrupted .mcp.json
       const mcpJson = path.join(tempDir, '.mcp.json');
       fs.writeFileSync(mcpJson, '{ this is not valid json !!!');
 
-      // Suppress console.warn during test
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-      // Should not throw - gracefully handles corruption
+      // Should not throw - the file is left for the user to fix
       writeMcpConfig('local');
 
-      // Should have warned
       expect(warnSpy).toHaveBeenCalled();
       const warnMsg = warnSpy.mock.calls[0][0];
       expect(warnMsg).toContain('Warning');
+      expect(warnMsg).toContain('left it untouched');
 
-      // Backup should exist
-      expect(fs.existsSync(mcpJson + '.backup')).toBe(true);
-      // Original backup content should be the corrupted content
-      const backup = fs.readFileSync(mcpJson + '.backup', 'utf-8');
-      expect(backup).toContain('this is not valid json');
-
-      // New file should be valid JSON with codegraph config
-      const content = JSON.parse(fs.readFileSync(mcpJson, 'utf-8'));
-      expect(content.mcpServers.codegraph).toBeDefined();
+      // Untouched, and no backup needed because nothing was replaced
+      expect(fs.readFileSync(mcpJson, 'utf-8')).toBe('{ this is not valid json !!!');
+      expect(fs.existsSync(mcpJson + '.backup')).toBe(false);
 
       warnSpy.mockRestore();
     });

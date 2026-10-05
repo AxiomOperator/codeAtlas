@@ -42,6 +42,8 @@ import {
   getMcpServerConfig,
   jsonDeepEqual,
   readJsonFile,
+  readJsonFileForEdit,
+  withConfigRefusal,
   writeJsonFile,
 } from './shared';
 
@@ -146,7 +148,7 @@ class CopilotCliTarget implements AgentTarget {
     if (!fs.existsSync(file)) {
       return { files: [{ path: file, action: 'not-found' }] };
     }
-    const config = readJsonFile(file);
+    const config = readJsonFileForEdit(file);
     if (!config.mcpServers?.codegraph) {
       return { files: [{ path: file, action: 'not-found' }] };
     }
@@ -181,7 +183,7 @@ class CopilotCliTarget implements AgentTarget {
 
 function writeMcpEntry(): WriteResult['files'][number] {
   const file = mcpConfigPath();
-  const existing = readJsonFile(file);
+  const existing = readJsonFileForEdit(file);
   const before = existing.mcpServers?.codegraph;
   const after = buildCopilotMcpConfig();
 
@@ -195,4 +197,4 @@ function writeMcpEntry(): WriteResult['files'][number] {
   return { path: file, action: existed ? 'updated' : 'created' };
 }
 
-export const copilotCliTarget: AgentTarget = new CopilotCliTarget();
+export const copilotCliTarget: AgentTarget = withConfigRefusal(new CopilotCliTarget());

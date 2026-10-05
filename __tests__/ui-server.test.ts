@@ -24,6 +24,7 @@ import {
   isAllowedHost,
   isAllowedOrigin,
   isSafeRequestPath,
+  listenWithFallback,
   PathRefusalError,
   resolveProjectFile,
   resolveStaticAsset,
@@ -562,5 +563,80 @@ describe('browserOpenCommand', () => {
     for (const off of ['none', 'NONE', '0', 'false', 'off', '', '  ']) {
       expect(browserOpenCommand('http://x', 'darwin', off), off).toBeNull();
     }
+  });
+});
+
+describe('listenWithFallback port errors (#2299)', () => {
+  const fail = (code: string) => Object.assign(new Error(code), { code });
+  /** A fake listener: ports in `refuse` fail with that code, others bind. */
+  const fakeListen = (refuse: Record<number, string>) => {
+    const tried: number[] = [];
+    const listen = async (port: number): Promise<number> => {
+      tried.push(port);
+      const code = refuse[port];
+      if (code) throw fail(code);
+      return port;
+    };
+    return { listen, tried };
+  };
+
+  it('advances past an EACCES port (Windows exclusive / reserved range)', async () => {
+    const { listen, tried } = fakeListen({ 49912: 'EACCES', 49913: 'EADDRINUSE' });
+    const port = await listenWithFallback(null, { port: 49912, fallback: true, attempts: 5, listen, platform: 'win32' });
+    expect(port).toBe(49914);
+    expect(tried).toEqual([49912, 49913, 49914]);
+  });
+
+  it('also advances past EACCES above 1024 on POSIX (firewall / policy)', async () => {
+    const { listen } = fakeListen({ 5000: 'EACCES' });
+    expect(await listenWithFallback(null, { port: 5000, fallback: true, attempts: 3, listen, platform: 'linux' })).toBe(5001);
+  });
+
+  it('stops at once on a POSIX privileged port', async () => {
+    const { listen, tried } = fakeListen({ 80: 'EACCES', 81: 'EACCES' });
+    await expect(
+      listenWithFallback(null, { port: 80, fallback: true, attempts: 5, listen, platform: 'linux' })
+    ).rejects.toThrow(/below 1024 need elevated privileges/);
+    expect(tried).toEqual([80]);
+  });
+
+  it('reports a permission problem when EVERY attempt is EACCES', async () => {
+    const { listen } = fakeListen({ 6000: 'EACCES', 6001: 'EACCES', 6002: 'EACCES' });
+    const err = await listenWithFallback(null, { port: 6000, fallback: true, attempts: 3, listen, platform: 'win32' })
+      .catch((e: Error) => e);
+    expect((err as Error).message).toMatch(/Not allowed to listen: Ports 6000–6002 were all refused \(EACCES\)/);
+    expect((err as Error).message).toMatch(/excludedportrange/);
+    expect((err as Error).message).not.toMatch(/below 1024/);
+  });
+
+  it('says "in use or reserved" when the search ran out on a mix', async () => {
+    const { listen } = fakeListen({ 7000: 'EADDRINUSE', 7001: 'EACCES' });
+    await expect(
+      listenWithFallback(null, { port: 7000, fallback: true, attempts: 2, listen, platform: 'linux' })
+    ).rejects.toThrow(/Ports 7000–7001 are all in use or reserved/);
+  });
+
+  it('keeps the all-in-use message and stops on unrelated errors', async () => {
+    const busy = fakeListen({ 8000: 'EADDRINUSE', 8001: 'EADDRINUSE' });
+    await expect(
+      listenWithFallback(null, { port: 8000, fallback: true, attempts: 2, listen: busy.listen, platform: 'linux' })
+    ).rejects.toThrow(/Ports 8000–8001 are all in use\./);
+    const bad = fakeListen({ 9000: 'EADDRNOTAVAIL' });
+    await expect(
+      listenWithFallback(null, { port: 9000, fallback: true, attempts: 5, listen: bad.listen, platform: 'win32' })
+    ).rejects.toThrow(/EADDRNOTAVAIL/);
+    expect(bad.tried).toEqual([9000]);
+  });
+
+  it('a pinned port refused with EACCES on Windows names the reserved-range cause', async () => {
+    const { listen } = fakeListen({ 49912: 'EACCES' });
+    await expect(
+      listenWithFallback(null, { port: 49912, fallback: false, attempts: 20, listen, platform: 'win32' })
+    ).rejects.toThrow(/Port 49912 was refused \(EACCES\).*reserved port range/);
+  });
+
+  it.runIf(process.platform === 'win32')('on the real Windows platform, EACCES below 1024 still advances', async () => {
+    const { listen } = fakeListen({ 80: 'EACCES' });
+    expect(await listenWithFallback(null, { port: 80, fallback: true, attempts: 3, listen })).toBe(81);
   });
 });

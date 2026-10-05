@@ -67,6 +67,8 @@ import {
 import {
   jsonDeepEqual,
   readJsonFile,
+  readJsonFileForEdit,
+  withConfigRefusal,
   writeJsonFile,
 } from './shared';
 
@@ -248,7 +250,7 @@ function writeMcpEntry(): WriteResult['files'][number] {
   const dir = path.dirname(file);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-  const existing = readJsonFile(file);
+  const existing = readJsonFileForEdit(file);
   const before = existing.mcpServers?.codegraph;
   const after = buildAntigravityEntry();
 
@@ -274,7 +276,7 @@ function cleanupLegacyEntry(): WriteResult['files'][number] | null {
   if (preferredMcpConfigPath() !== unifiedMcpConfigPath()) return null;
   const legacy = legacyMcpConfigPath();
   if (!fs.existsSync(legacy)) return null;
-  const config = readJsonFile(legacy);
+  const config = readJsonFileForEdit(legacy);
   if (!config.mcpServers?.codegraph) return null;
   delete config.mcpServers.codegraph;
   if (Object.keys(config.mcpServers).length === 0) {
@@ -286,7 +288,7 @@ function cleanupLegacyEntry(): WriteResult['files'][number] | null {
 
 function removeCodegraphFromFile(file: string): WriteResult['files'][number] {
   if (!fs.existsSync(file)) return { path: file, action: 'not-found' };
-  const config = readJsonFile(file);
+  const config = readJsonFileForEdit(file);
   if (!config.mcpServers?.codegraph) return { path: file, action: 'not-found' };
   delete config.mcpServers.codegraph;
   if (Object.keys(config.mcpServers).length === 0) {
@@ -298,4 +300,4 @@ function removeCodegraphFromFile(file: string): WriteResult['files'][number] {
   return { path: file, action: 'removed' };
 }
 
-export const antigravityTarget: AgentTarget = new AntigravityTarget();
+export const antigravityTarget: AgentTarget = withConfigRefusal(new AntigravityTarget());

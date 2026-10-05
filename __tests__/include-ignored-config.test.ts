@@ -135,6 +135,46 @@ describe('addIncludeIgnoredPatterns (codegraph.json writer, #1156)', () => {
     expect(fs.readFileSync(path.join(dir, 'codegraph.json'), 'utf-8')).toBe(bad);
   });
 
+  it.each([
+    ['an array', '["mtc-a/"]'],
+    ['null', 'null'],
+    ['a string', '"x"'],
+  ])('refuses to overwrite a codegraph.json that is %s (throws, leaves file intact)', (_kind, body) => {
+    fs.writeFileSync(path.join(dir, 'codegraph.json'), body);
+    expect(() => addIncludeIgnoredPatterns(dir, ['mtc-a/'])).toThrow(/must contain a JSON object/);
+    expect(fs.readFileSync(path.join(dir, 'codegraph.json'), 'utf-8')).toBe(body);
+  });
+
+  it('treats an unreadable codegraph.json as an error, not as missing', () => {
+    // A directory named codegraph.json reads with EISDIR on every platform —
+    // the same "exists but can't be read" class as EACCES.
+    fs.mkdirSync(path.join(dir, 'codegraph.json'));
+    expect(() => addIncludeIgnoredPatterns(dir, ['mtc-a/'])).toThrow(/could not read codegraph\.json/);
+    expect(fs.statSync(path.join(dir, 'codegraph.json')).isDirectory()).toBe(true);
+  });
+
+  it.runIf(process.platform !== 'win32' && process.getuid?.() !== 0)(
+    'treats an EACCES codegraph.json as an error and leaves it untouched',
+    () => {
+      const file = path.join(dir, 'codegraph.json');
+      fs.writeFileSync(file, '{"includeIgnored":["keep/"]}');
+      fs.chmodSync(file, 0o000);
+      try {
+        expect(() => addIncludeIgnoredPatterns(dir, ['mtc-a/'])).toThrow(/EACCES/);
+      } finally {
+        fs.chmodSync(file, 0o644);
+      }
+      expect(fs.readFileSync(file, 'utf-8')).toBe('{"includeIgnored":["keep/"]}');
+    },
+  );
+
+  it('writes atomically — no temp file left behind', () => {
+    addIncludeIgnoredPatterns(dir, ['mtc-a/']);
+    addIncludeIgnoredPatterns(dir, ['mtc-b/']);
+    expect(fs.readdirSync(dir)).toEqual(['codegraph.json']);
+    expect(readConfig().includeIgnored).toEqual(['mtc-a/', 'mtc-b/']);
+  });
+
   it('writes pretty-printed, newline-terminated JSON', () => {
     addIncludeIgnoredPatterns(dir, ['mtc-a/']);
     const raw = fs.readFileSync(path.join(dir, 'codegraph.json'), 'utf-8');

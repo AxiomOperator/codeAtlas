@@ -12,6 +12,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import {
+  hookInterpreter,
   installGitSyncHook,
   removeGitSyncHook,
   isSyncHookInstalled,
@@ -105,6 +106,129 @@ describe('git sync hooks', () => {
     expect(body).not.toContain('codegraph sync');
   });
 
+  it('inserts the block before a trailing top-level exit, and remove round-trips exactly', () => {
+    gitInit(repo);
+    const file = path.join(repo, '.git', 'hooks', 'post-commit');
+    const original = '#!/bin/sh\necho "lint"\nexit 0\n';
+    fs.writeFileSync(file, original, { mode: 0o755 });
+
+    installGitSyncHook(repo, ['post-commit']);
+    const body = fs.readFileSync(file, 'utf8');
+    expect(body.indexOf('codegraph sync')).toBeLessThan(body.indexOf('exit 0'));
+    expect(body.trimEnd().endsWith('exit 0')).toBe(true);
+
+    // Re-install stays idempotent and still before the exit.
+    installGitSyncHook(repo, ['post-commit']);
+    expect(fs.readFileSync(file, 'utf8')).toBe(body);
+
+    removeGitSyncHook(repo, ['post-commit']);
+    expect(fs.readFileSync(file, 'utf8')).toBe(original);
+  });
+
+  it('inserts before a trailing exec (husky-style) but not before an indented exit', () => {
+    gitInit(repo);
+    const execHook = path.join(repo, '.git', 'hooks', 'post-merge');
+    fs.writeFileSync(execHook, '#!/usr/bin/env bash\nexec npx something "$@"\n', { mode: 0o755 });
+    const ifHook = path.join(repo, '.git', 'hooks', 'post-checkout');
+    fs.writeFileSync(ifHook, '#!/bin/sh\nif [ -n "$X" ]; then\n  exit 1\nfi\n', { mode: 0o755 });
+
+    installGitSyncHook(repo, ['post-merge', 'post-checkout']);
+    const execBody = fs.readFileSync(execHook, 'utf8');
+    expect(execBody.indexOf('codegraph sync')).toBeLessThan(execBody.indexOf('exec npx'));
+    const ifBody = fs.readFileSync(ifHook, 'utf8');
+    expect(ifBody.indexOf('codegraph sync')).toBeGreaterThan(ifBody.indexOf('fi\n'));
+  });
+
+  it('leaves non-shell hooks untouched and returns a note', () => {
+    gitInit(repo);
+    const file = path.join(repo, '.git', 'hooks', 'post-commit');
+    const original = '#!/usr/bin/env python3\nprint("hi")\n';
+    fs.writeFileSync(file, original, { mode: 0o755 });
+
+    const result = installGitSyncHook(repo, ['post-commit']);
+    expect(result.installed).toEqual([]);
+    expect(fs.readFileSync(file, 'utf8')).toBe(original);
+    expect(result.notes.join('\n')).toMatch(/python3 hook.*codegraph sync/s);
+    expect(isSyncHookInstalled(repo, ['post-commit'])).toBe(false);
+  });
+
+  it('edits hooks with no shebang or a zsh shebang', () => {
+    gitInit(repo);
+    const a = path.join(repo, '.git', 'hooks', 'post-commit');
+    const b = path.join(repo, '.git', 'hooks', 'post-merge');
+    fs.writeFileSync(a, 'echo plain\n', { mode: 0o755 });
+    fs.writeFileSync(b, '#!/usr/bin/env -S zsh -e\necho z\n', { mode: 0o755 });
+    const result = installGitSyncHook(repo, ['post-commit', 'post-merge']);
+    expect(result.installed.sort()).toEqual(['post-commit', 'post-merge']);
+    expect(result.notes).toEqual([]);
+  });
+
+  it.runIf(process.platform !== 'win32')('does not re-enable a disabled (non-executable) hook', () => {
+    gitInit(repo);
+    const file = path.join(repo, '.git', 'hooks', 'post-commit');
+    fs.writeFileSync(file, '#!/bin/sh\necho off\n', { mode: 0o644 });
+    fs.chmodSync(file, 0o644);
+
+    const result = installGitSyncHook(repo, ['post-commit']);
+    expect(result.installed).toEqual([]);
+    expect(isExecutable(file)).toBe(false);
+    expect(fs.readFileSync(file, 'utf8')).toBe('#!/bin/sh\necho off\n');
+    expect(result.notes.join('\n')).toMatch(/not executable/);
+  });
+
+  it.runIf(process.platform !== 'win32')('remove keeps the mode of a shared hook', () => {
+    gitInit(repo);
+    const file = path.join(repo, '.git', 'hooks', 'post-commit');
+    fs.writeFileSync(file, '#!/bin/sh\necho keep\n', { mode: 0o750 });
+    fs.chmodSync(file, 0o750);
+    installGitSyncHook(repo, ['post-commit']);
+    removeGitSyncHook(repo, ['post-commit']);
+    expect(fs.statSync(file).mode & 0o777).toBe(0o750);
+  });
+
+  it('refuses a tracked core.hooksPath (husky) unless forced; uninstall removes only our block', () => {
+    gitInit(repo);
+    const husky = path.join(repo, '.husky');
+    fs.mkdirSync(husky);
+    const hookFile = path.join(husky, 'post-commit');
+    const original = '#!/bin/sh\necho team hook\n';
+    fs.writeFileSync(hookFile, original, { mode: 0o755 });
+    execFileSync('git', ['add', '.husky'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['config', 'core.hooksPath', '.husky'], { cwd: repo, stdio: 'ignore' });
+
+    const refused = installGitSyncHook(repo, ['post-commit']);
+    expect(refused.installed).toEqual([]);
+    expect(refused.notes.join('\n')).toMatch(/tracked in this repository/);
+    expect(refused.notes.join('\n')).toMatch(/--force-hooks-path/);
+    expect(fs.readFileSync(hookFile, 'utf8')).toBe(original);
+
+    const forced = installGitSyncHook(repo, ['post-commit'], { forceHooksPath: true });
+    expect(forced.installed).toEqual(['post-commit']);
+    expect(fs.readFileSync(hookFile, 'utf8')).toContain('codegraph sync');
+
+    removeGitSyncHook(repo, ['post-commit']);
+    expect(fs.readFileSync(hookFile, 'utf8')).toBe(original);
+  });
+
+  it('refuses a core.hooksPath outside the repository unless forced', () => {
+    gitInit(repo);
+    const globalHooks = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-global-hooks-'));
+    try {
+      execFileSync('git', ['config', 'core.hooksPath', globalHooks], { cwd: repo, stdio: 'ignore' });
+      const refused = installGitSyncHook(repo, ['post-commit']);
+      expect(refused.installed).toEqual([]);
+      expect(refused.notes.join('\n')).toMatch(/outside this repository/);
+      expect(fs.existsSync(path.join(globalHooks, 'post-commit'))).toBe(false);
+
+      const forced = installGitSyncHook(repo, ['post-commit'], { forceHooksPath: true });
+      expect(forced.installed).toEqual(['post-commit']);
+      removeGitSyncHook(repo, ['post-commit']);
+      expect(fs.existsSync(path.join(globalHooks, 'post-commit'))).toBe(false);
+    } finally {
+      fs.rmSync(globalHooks, { recursive: true, force: true });
+    }
+  });
+
   it('honors core.hooksPath', () => {
     gitInit(repo);
     const customHooks = path.join(repo, '.husky');
@@ -125,5 +249,13 @@ describe('git sync hooks', () => {
     expect(result.hooksDir).toBeNull();
     expect(result.skipped).toMatch(/not a git repository/);
     expect(isSyncHookInstalled(repo)).toBe(false);
+  });
+
+  it('parses hook interpreters from shebangs', () => {
+    expect(hookInterpreter('echo hi')).toBeNull();
+    expect(hookInterpreter('#!/bin/sh\n')).toBe('sh');
+    expect(hookInterpreter('#!/usr/bin/env bash\n')).toBe('bash');
+    expect(hookInterpreter('#!/usr/bin/env -S node --no-warnings\n')).toBe('node');
+    expect(hookInterpreter('#!/usr/bin/python3\r\n')).toBe('python3');
   });
 });

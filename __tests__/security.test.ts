@@ -244,6 +244,32 @@ describe('Symlink escape prevention (#527)', () => {
     expect(validatePathWithinRoot(root, 'escapedir/secret.txt')).toBeNull();
   });
 
+  it.runIf(process.platform !== 'win32')(
+    'rejects a NOT-YET-EXISTING file under an in-repo symlinked dir that points outside (ENOENT path)',
+    () => {
+      fs.symlinkSync(path.join(outside, 'pkg'), path.join(root, 'linkdir'));
+      // Neither the file nor its nested parent exists — the nearest existing
+      // ancestor is the symlink, whose real target is outside the root.
+      expect(validatePathWithinRoot(root, 'linkdir/new.ts')).toBeNull();
+      expect(validatePathWithinRoot(root, 'linkdir/a/b/new.ts')).toBeNull();
+      // The indexing read path may still follow it (and gets the real path).
+      expect(validatePathWithinRoot(root, 'linkdir/new.ts', { allowSymlinkEscape: true }))
+        .toBe(path.join(outside, 'pkg', 'new.ts'));
+    },
+  );
+
+  it.runIf(process.platform !== 'win32')(
+    'allows a not-yet-existing file under an in-root symlinked dir, and rejects a dangling link',
+    () => {
+      fs.symlinkSync(path.join(root, 'src'), path.join(root, 'srclink'));
+      expect(validatePathWithinRoot(root, 'srclink/missing/new.ts'))
+        .toBe(path.join(root, 'src', 'missing', 'new.ts'));
+      fs.symlinkSync(path.join(outside, 'nope'), path.join(root, 'dangling'));
+      expect(validatePathWithinRoot(root, 'dangling')).toBeNull();
+      expect(validatePathWithinRoot(root, 'dangling/new.ts')).toBeNull();
+    },
+  );
+
   it('still allows an in-repo symlink that stays WITHIN the root (no over-blocking)', () => {
     if (!link(path.join(root, 'src', 'inlink.ts'), path.join(root, 'src', 'in.ts'))) return;
     expect(validatePathWithinRoot(root, 'src/inlink.ts')).not.toBeNull();

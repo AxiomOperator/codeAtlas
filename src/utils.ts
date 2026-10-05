@@ -143,22 +143,60 @@ export function validatePathWithinRoot(
   //    The indexing read path (allowSymlinkEscape) skips only this rejection so
   //    it stays consistent with the directory walk, which already followed the
   //    in-root symlink to enumerate these files (#935).
+  let realRoot: string;
   try {
-    const realRoot = fs.realpathSync(normalizedRoot);
-    const realResolved = fs.realpathSync(resolved);
-    if (options?.allowSymlinkEscape) {
-      return realResolved;
-    }
-    return isWithinDir(realResolved, realRoot) ? realResolved : null;
+    realRoot = fs.realpathSync(normalizedRoot);
+  } catch (err) {
+    // A root that doesn't exist has no symlinks to follow; the lexical check
+    // is all there is. Any other failure (ELOOP, EACCES, …) → reject.
+    return (err as NodeJS.ErrnoException).code === 'ENOENT' ? resolved : null;
+  }
+  let realResolved: string | null;
+  try {
+    realResolved = fs.realpathSync(resolved);
   } catch (err) {
     // ENOENT: the path doesn't exist yet (a file about to be written, or an
-    // index entry for a since-deleted file) — no symlink to follow, and the
-    // lexical check already passed, so allow the lexical path. Any other
-    // resolution failure (ELOOP, EACCES, …) is treated as unsafe → reject.
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      return resolved;
+    // index entry for a since-deleted file). Its PARENT may still be an
+    // in-repo symlink pointing outside the root, so resolve the nearest
+    // existing ancestor and re-append the missing remainder before the
+    // containment check. Any other failure (ELOOP, EACCES, …) → reject.
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return null;
+    realResolved = realpathOfMissingPath(resolved);
+    if (realResolved === null) return null;
+  }
+  if (options?.allowSymlinkEscape) {
+    return realResolved;
+  }
+  return isWithinDir(realResolved, realRoot) ? realResolved : null;
+}
+
+/**
+ * Real path of a path that doesn't exist (yet): realpath its nearest existing
+ * ancestor, then re-append the missing components. Returns null when a
+ * missing component is itself a dangling symlink (writing through it would
+ * land wherever it points) or an ancestor can't be resolved.
+ */
+function realpathOfMissingPath(p: string): string | null {
+  const missing: string[] = [];
+  let current = p;
+  for (;;) {
+    try {
+      fs.lstatSync(current);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return null;
+      const parent = path.dirname(current);
+      if (parent === current) return null;
+      missing.unshift(path.basename(current));
+      current = parent;
+      continue;
     }
-    return null;
+    // `current` exists as a directory entry. If realpath still fails it's a
+    // dangling symlink (or unreadable) — unsafe to resolve lexically.
+    try {
+      return path.join(fs.realpathSync(current), ...missing);
+    } catch {
+      return null;
+    }
   }
 }
 

@@ -17,7 +17,17 @@ import {
   writeMcpEntry,
   writePermissionsEntry,
 } from './targets/claude';
-import { readJsonFile } from './targets/shared';
+import { ConfigParseError, readJsonFile } from './targets/shared';
+
+/** An unparseable config is refused (left untouched) — warn, never throw. */
+function warnOnRefusal(write: () => unknown): void {
+  try {
+    write();
+  } catch (err) {
+    if (!(err instanceof ConfigParseError)) throw err;
+    console.warn(`  Warning: ${err.message}`);
+  }
+}
 
 export type InstallLocation = 'global' | 'local';
 
@@ -32,11 +42,11 @@ export type InstallLocation = 'global' | 'local';
  * `initialize` instructions are the single source of truth.
  */
 export function writeMcpConfig(location: InstallLocation): void {
-  writeMcpEntry(location);
+  warnOnRefusal(() => writeMcpEntry(location));
 }
 
 export function writePermissions(location: InstallLocation): void {
-  writePermissionsEntry(location);
+  warnOnRefusal(() => writePermissionsEntry(location));
 }
 
 export function hasMcpConfig(location: InstallLocation): boolean {

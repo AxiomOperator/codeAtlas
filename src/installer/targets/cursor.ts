@@ -46,6 +46,8 @@ import {
   getMcpServerConfig,
   jsonDeepEqual,
   readJsonFile,
+  readJsonFileForEdit,
+  withConfigRefusal,
   writeJsonFile,
 } from './shared';
 import {
@@ -129,7 +131,7 @@ class CursorTarget implements AgentTarget {
     const files: WriteResult['files'] = [];
 
     const mcpPath = mcpJsonPath(loc);
-    const config = readJsonFile(mcpPath);
+    const config = readJsonFileForEdit(mcpPath);
     if (config.mcpServers?.codegraph) {
       delete config.mcpServers.codegraph;
       if (Object.keys(config.mcpServers).length === 0) {
@@ -176,7 +178,7 @@ function buildCursorMcpConfig(loc: Location): { type: string; command: string; a
 
 function writeMcpEntry(loc: Location): WriteResult['files'][number] {
   const file = mcpJsonPath(loc);
-  const existing = readJsonFile(file);
+  const existing = readJsonFileForEdit(file);
   const before = existing.mcpServers?.codegraph;
   const after = buildCursorMcpConfig(loc);
 
@@ -244,4 +246,4 @@ function removeRulesEntry(): WriteResult['files'][number] {
   return { path: file, action: 'not-found' };
 }
 
-export const cursorTarget: AgentTarget = new CursorTarget();
+export const cursorTarget: AgentTarget = withConfigRefusal(new CursorTarget());

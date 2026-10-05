@@ -60,7 +60,7 @@ import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
 import { ansiColorsEnabled } from '../ui/color';
 
-import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
+import { buildNode25BlockBanner, buildNodeTooOldBanner, isNodeVersionTooOld } from './node-version-check';
 import { installFatalHandlers } from './fatal-handler';
 import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
 import { installCommandSupervision, watchParent } from './command-supervision';
@@ -119,7 +119,9 @@ if (nodeMajor >= 25) {
 // Enforce the supported Node floor. `engines` in package.json only *warns* on
 // install (unless engine-strict), so hard-block here to actually keep users off
 // unsupported versions. Mirrors the 25+ block above. See package.json `engines`.
-if (nodeMajor < MIN_NODE_MAJOR) {
+// The floor is node:sqlite's (unflagged in 22.13), so fail here with a clear
+// message rather than later with "No such built-in module: node:sqlite".
+if (isNodeVersionTooOld(nodeVersion)) {
   process.stderr.write(buildNodeTooOldBanner(nodeVersion) + '\n');
   if (!process.env.CODEGRAPH_ALLOW_UNSAFE_NODE) {
     process.exit(1);
@@ -681,7 +683,7 @@ async function recordIndexTelemetry(
  */
 async function runInit(
   projectPath: string,
-  options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean },
+  options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean; forceHooksPath?: boolean },
 ): Promise<void> {
   const clack = await importESM('@clack/prompts');
 
@@ -705,7 +707,7 @@ async function runInit(
       clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
       try {
         const { offerWatchFallback } = await import('../installer');
-        await offerWatchFallback(clack, projectPath, { yes: options.yes });
+        await offerWatchFallback(clack, projectPath, { yes: options.yes, forceHooksPath: options.forceHooksPath });
       } catch { /* non-fatal */ }
       clack.outro('');
       return;
@@ -774,7 +776,7 @@ async function runInit(
 
     try {
       const { offerWatchFallback } = await import('../installer');
-      await offerWatchFallback(clack, projectPath, { yes: options.yes });
+      await offerWatchFallback(clack, projectPath, { yes: options.yes, forceHooksPath: options.forceHooksPath });
     } catch { /* non-fatal */ }
 
     clack.outro('Done');
@@ -795,7 +797,8 @@ program
   .option('-f, --force', 'Initialize even if the path looks like your home directory or a filesystem root')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
   .option('-y, --yes', 'Non-interactive: skip every prompt and take the defaults (for scripts / CI / container bootstraps)')
-  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean }) => {
+  .option('--force-hooks-path', 'Allow the optional git sync hooks to edit a core.hooksPath directory that is tracked in the repo (husky, …) or shared outside it')
+  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean; forceHooksPath?: boolean }) => {
     await runInit(path.resolve(pathArg || process.cwd()), options);
   });
 
@@ -2756,6 +2759,7 @@ program
   .option('--gate-hook', 'Opt into the search gate hook: Grep/Glob/rg/find wait until the session has queried CodeGraph once (Claude Code only; off by default)')
   .option('--print-config <id>', 'Print MCP config snippet for the named agent and exit (no file writes)')
   .option('--refresh', 'Rewrite what previous installs configured, for already-configured agents only (never adds new ones). Run automatically by `codegraph upgrade`')
+  .option('--personal', 'Project install that stays out of git: Claude Code gets a local-scope MCP entry in ~/.claude.json plus .claude/settings.local.json and CLAUDE.local.md instead of the team-shared files (implies --location local; Claude Code only)')
   .action(async (opts: {
     target?: string;
     location?: string;
@@ -2765,6 +2769,7 @@ program
     printConfig?: string;
     refresh?: boolean;
     gateHook?: boolean;
+    personal?: boolean;
   }) => {
     if (opts.printConfig) {
       const { getTarget, listTargetIds } = await import('../installer/targets/registry');
@@ -2815,6 +2820,10 @@ program
       error(`--location must be "global" or "local" (got "${opts.location}").`);
       process.exit(1);
     }
+    if (opts.personal && opts.location === 'global') {
+      error('--personal is a project-local install; it cannot be combined with --location global.');
+      process.exit(1);
+    }
     try {
       // Commander's `--no-permissions` makes `opts.permissions === false`;
       // omitting the flag leaves it `true` (the positive-form default).
@@ -2836,6 +2845,8 @@ program
         yes: opts.yes,
         // Only an explicit `--gate-hook` opts in; absent → the installer asks (default NO).
         gateHook: opts.gateHook === true ? true : undefined,
+        personal: opts.personal === true ? true : undefined,
+        cliFilename: __filename,
       });
     } catch (err) {
       error(err instanceof Error ? err.message : String(err));
@@ -2870,15 +2881,21 @@ program
   .option('-l, --location <where>', 'Uninstall location: "global" or "local". Default: prompt')
   .option('-y, --yes', 'Non-interactive: defaults to --location=global --target=all')
   .option('--keep-cli', 'Remove agent configs only — leave the codegraph CLI installed')
+  .option('--personal', 'Reverse a `codegraph install --personal` for this project (Claude Code only)')
   .action(async (opts: {
     target?: string;
     location?: string;
     yes?: boolean;
     keepCli?: boolean;
+    personal?: boolean;
   }) => {
     const { runUninstaller } = await import('../installer');
     if (opts.location && opts.location !== 'global' && opts.location !== 'local') {
       error(`--location must be "global" or "local" (got "${opts.location}").`);
+      process.exit(1);
+    }
+    if (opts.personal && opts.location === 'global') {
+      error('--personal is project-local; it cannot be combined with --location global.');
       process.exit(1);
     }
     try {
@@ -2887,6 +2904,7 @@ program
         location: opts.location as 'global' | 'local' | undefined,
         yes: opts.yes,
         keepCli: opts.keepCli,
+        personal: opts.personal === true ? true : undefined,
         cliFilename: __filename,
       });
     } catch (err) {

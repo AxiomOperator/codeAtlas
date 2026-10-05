@@ -879,6 +879,14 @@ export async function defaultWirePromptHook(): Promise<boolean> {
   // The user said no at install time: never wire it behind their back.
   if (promptHookDeclined()) return false;
   if (!claudeTarget.detect('global').alreadyConfigured) return false;
-  const res = writePromptHookEntry('global');
-  return res.action === 'created' || res.action === 'updated';
+  const { ConfigParseError } = await import('../installer/targets/shared');
+  try {
+    const res = writePromptHookEntry('global');
+    return res.action === 'created' || res.action === 'updated';
+  } catch (err) {
+    // An unparseable settings.json is left for the user to fix — an
+    // upgrade never replaces it (or fails over it).
+    if (err instanceof ConfigParseError) return false;
+    throw err;
+  }
 }

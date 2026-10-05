@@ -21,12 +21,19 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Many languages link more of your code: Vue templates, plain JavaScript objects, Go modules in subfolders, Rust enum variants, Dart getters, VB.NET shared members and C++ operators.
 - Re-index your projects after upgrading (`codegraph index`) to pick up the new links.
 
+### Breaking Changes
+
+- Running CodeGraph from source (or from the npm package without its bundled runtime) now needs Node.js 22.13 or newer, the first release where its built-in SQLite works without a flag. The standalone installers ship their own runtime and are unaffected.
+
 ### Security
 
 - `codegraph upgrade` and the `install.sh` / `install.ps1` installers now check the download against the release's published checksums before installing it, and upgrades run the installer that shipped with the release you're installing instead of the latest one on the main branch. Set `CODEGRAPH_SKIP_VERIFY=1` to install from a mirror that doesn't carry the checksum file.
 - `codegraph upgrade <version>` only accepts a plain version number like `1.6.2`, so nothing else can reach the shell command that installs it.
 
 ### New Features
+
+- `codegraph install --personal` sets up Claude Code just for you in a shared project: the MCP server goes in your own `~/.claude.json` project entry and the hook and instruction files in `.claude/settings.local.json` and `CLAUDE.local.md`, instead of team-shared files. (#243)
+- `codegraph init --force-hooks-path` lets CodeGraph add its git sync hook to a `core.hooksPath` directory that is committed (like `.husky/`) or shared outside the repository; without it, those are left alone.
 
 - Micronaut routes: `@Controller` classes with `@Get`, `@Post` and the other verb annotations now appear as routes linked to their handler methods, in Java and Kotlin. (#971)
 - Drupal: class-based `#[Hook]` implementations, plugin attributes and annotations, and services declared in `*.services.yml` are now linked. (#300)
@@ -44,6 +51,14 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- `codegraph install` no longer wipes the rest of a Gemini CLI, Kiro or Antigravity settings file that contains comments, and never rewrites any agent config it can't parse — it leaves the file alone and tells you what to fix.
+- Installing or uninstalling keeps a config file that is a symlink (for example into a dotfiles repo) as a symlink, keeps its permissions, and no longer loses a change another program made to `~/.claude.json` at the same moment.
+- Re-installing or upgrading no longer removes settings you added to Codex's `[mcp_servers.codegraph]` table, such as `env` or `startup_timeout_sec`; uninstall also removes its sub-tables, and other spellings of the table header no longer produce a duplicate table that stopped Codex from starting.
+- Uninstalling no longer removes your own Claude Code hooks just because their command mentions `codegraph prompt-hook`.
+- The installer no longer offers a second, global npm install when CodeGraph was installed with the standalone installer, and a failed npm install now says why it failed.
+- CodeGraph's git sync hook is now added before a hook's final `exit`/`exec` so it actually runs, is never added to non-shell hooks, and never re-enables a hook you made non-executable.
+- A `codegraph.json` that isn't a JSON object is reported as an error instead of being overwritten, and it is now saved atomically.
+- `codegraph ui` keeps looking for a free port on Windows when a port is reserved by the system, and says clearly when ports are refused for permission reasons. (#2299)
 - Indexing large Django and other Python-plus-JavaScript projects is about twice as fast again: a check on destructured call results no longer re-scans the whole file for every call. Thanks @bompus for the report. (#2334)
 - In Vue, functions called from template expressions (`{{ }}`, `:prop`, `@event`, `v-*`) and from top-level destructuring like `const { a } = useFoo()` now show those callers, and a component with both `<script>` and `<script setup>` reads both. (#2340)
 - In JavaScript, functions inside an object literal now get their own symbols even when the object isn't exported — plain `const` objects, `window.X = { … }`, `ns.mod = { … }` and objects inside an IIFE — so script-tag code is no longer invisible. (#2300)

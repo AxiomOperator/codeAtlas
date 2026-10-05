@@ -81,6 +81,20 @@ export interface InstallOptions {
    * tri-state as `promptHook`; never auto-enabled. Ignored by other targets.
    */
   gateHook?: boolean;
+  /**
+   * `--personal` (#243): for a project-local install, write only to the
+   * agent's personal, never-committed config variants instead of the
+   * team-shared files. Only targets with `supportsPersonal` honor it; the
+   * orchestrator skips the rest. `undefined` lets a target infer it from
+   * what an earlier install wrote (so `install --refresh` keeps a personal
+   * install personal).
+   */
+  personal?: boolean;
+}
+
+export interface UninstallOptions {
+  /** Reverse a `--personal` install (only the personal variants are touched). */
+  personal?: boolean;
 }
 
 export interface AgentTarget {
@@ -114,7 +128,12 @@ export interface AgentTarget {
    * markdown sections. Must be safe to call when nothing was ever
    * installed (returns `not-found` actions).
    */
-  uninstall(loc: Location): WriteResult;
+  uninstall(loc: Location, opts?: UninstallOptions): WriteResult;
+  /**
+   * Whether this target has personal (gitignored / user-private) variants
+   * of its project-local config — see `InstallOptions.personal` (#243).
+   */
+  readonly supportsPersonal?: boolean;
   /**
    * Print the MCP-server snippet a user would paste manually for this
    * target. Used by `codegraph install --print-config <id>` and by

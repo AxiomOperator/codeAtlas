@@ -37,6 +37,8 @@ import {
   getMcpServerConfig,
   jsonDeepEqual,
   readJsonFile,
+  readJsonFileForEdit,
+  withConfigRefusal,
   writeJsonFile,
 } from './shared';
 
@@ -100,7 +102,7 @@ class KiroTarget implements AgentTarget {
     const files: WriteResult['files'] = [];
 
     const file = mcpJsonPath(loc);
-    const config = readJsonFile(file);
+    const config = readJsonFileForEdit(file);
     if (config.mcpServers?.codegraph) {
       delete config.mcpServers.codegraph;
       if (Object.keys(config.mcpServers).length === 0) {
@@ -133,7 +135,7 @@ function writeMcpEntry(loc: Location): WriteResult['files'][number] {
   const dir = path.dirname(file);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-  const existing = readJsonFile(file);
+  const existing = readJsonFileForEdit(file);
   const before = existing.mcpServers?.codegraph;
   const after = getMcpServerConfig();
 
@@ -162,4 +164,4 @@ function removeSteeringEntry(loc: Location): WriteResult['files'][number] {
   return { path: file, action: 'removed' };
 }
 
-export const kiroTarget: AgentTarget = new KiroTarget();
+export const kiroTarget: AgentTarget = withConfigRefusal(new KiroTarget());

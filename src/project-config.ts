@@ -465,7 +465,16 @@ export function addIncludeIgnoredPatterns(rootDir: string, patterns: string[]): 
   let raw: string | null = null;
   try {
     raw = fs.readFileSync(file, 'utf-8');
-  } catch {
+  } catch (err) {
+    // Only a genuinely missing file means "create a fresh one". Anything else
+    // (EACCES, EISDIR, EIO, …) is an existing config we can't read — writing
+    // over it would destroy the user's settings.
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      const code = (err as NodeJS.ErrnoException).code;
+      throw new Error(
+        `could not read ${PROJECT_CONFIG_FILENAME}${code ? ` (${code})` : ''} — fix its permissions, then re-run.`,
+      );
+    }
     raw = null; // missing file — create a fresh one below
   }
   if (raw !== null) {
@@ -475,9 +484,13 @@ export function addIncludeIgnoredPatterns(rootDir: string, patterns: string[]): 
     } catch {
       throw new Error(`${PROJECT_CONFIG_FILENAME} is not valid JSON — fix it by hand, then re-run.`);
     }
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      config = parsed as Record<string, unknown>;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      const kind = parsed === null ? 'null' : Array.isArray(parsed) ? 'an array' : `a ${typeof parsed}`;
+      throw new Error(
+        `${PROJECT_CONFIG_FILENAME} must contain a JSON object, but it is ${kind} — fix it by hand, then re-run.`,
+      );
     }
+    config = parsed as Record<string, unknown>;
   }
 
   const existing = Array.isArray(config.includeIgnored)
@@ -493,7 +506,34 @@ export function addIncludeIgnoredPatterns(rootDir: string, patterns: string[]): 
     added++;
   }
   config.includeIgnored = merged;
-  fs.writeFileSync(file, JSON.stringify(config, null, 2) + '\n');
+  writeFileAtomic(file, JSON.stringify(config, null, 2) + '\n');
   clearProjectConfigCache();
   return added;
+}
+
+/**
+ * Write via a sibling temp file + rename so a crash or full disk mid-write
+ * never leaves a truncated `codegraph.json`. Writes through a symlinked config
+ * to its target, and keeps an existing file's permission bits.
+ */
+function writeFileAtomic(file: string, content: string): void {
+  let target = file;
+  let mode: number | undefined;
+  try {
+    target = fs.realpathSync(file);
+    mode = fs.statSync(target).mode & 0o777;
+  } catch {
+    /* new file */
+  }
+  const tmp = `${target}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    fs.writeFileSync(tmp, content, mode !== undefined ? { mode } : undefined);
+    if (mode !== undefined) {
+      try { fs.chmodSync(tmp, mode); } catch { /* best effort (umask / Windows) */ }
+    }
+    fs.renameSync(tmp, target);
+  } catch (err) {
+    try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    throw err;
+  }
 }

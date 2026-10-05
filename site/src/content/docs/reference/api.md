@@ -65,5 +65,5 @@ import {
 ## Embedding requirements
 
 - **Install from npm** (`npm i @colbymchenry/codegraph`) so the matching per-platform package — which carries the compiled library — is fetched alongside the shim.
-- The API runs on **your** runtime, so it needs **Node 22.5+** for the built-in `node:sqlite` module (an Electron main process qualifies when its bundled Node is 22.5+). The CLI and MCP server are unaffected — they ship with a self-contained bundled runtime and need no Node at all.
+- The API runs on **your** runtime, so it needs **Node 22.13+** for the built-in `node:sqlite` module (an Electron main process qualifies when its bundled Node is 22.13+; Node 22.5–22.12 only with `--experimental-sqlite`). The CLI and MCP server are unaffected — they ship with a self-contained bundled runtime and need no Node at all.
 - TypeScript types ship with the package. Keep `@types/node` available and `skipLibCheck: true` (the common default).

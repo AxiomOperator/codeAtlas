@@ -51,6 +51,8 @@ import {
 } from './types';
 import {
   atomicWriteFileSync,
+  parseJsoncForEdit,
+  withConfigRefusal,
   getMcpServerConfig,
   jsonDeepEqual,
 } from './shared';
@@ -183,7 +185,7 @@ function writeMcpEntry(): WriteResult['files'][number] {
   let text = readConfigText(file);
   if (!text.trim()) text = '{}\n';
 
-  const config = parseConfig(text);
+  const config = parseJsoncForEdit(text, file);
   const before = config.servers?.codegraph;
   const after = getMcpServerConfig();
 
@@ -206,7 +208,7 @@ function removeMcpEntry(): WriteResult['files'][number] {
   const file = mcpJsonPath();
   if (!fs.existsSync(file)) return { path: file, action: 'not-found' };
   const text = readConfigText(file);
-  const config = parseConfig(text);
+  const config = parseJsoncForEdit(text, file);
   if (!config.servers?.codegraph) return { path: file, action: 'not-found' };
 
   let edits = modify(text, ['servers', 'codegraph'], undefined, {
@@ -227,4 +229,4 @@ function removeMcpEntry(): WriteResult['files'][number] {
   return { path: file, action: 'removed' };
 }
 
-export const copilotJetbrainsTarget: AgentTarget = new CopilotJetbrainsTarget();
+export const copilotJetbrainsTarget: AgentTarget = withConfigRefusal(new CopilotJetbrainsTarget());
