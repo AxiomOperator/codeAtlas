@@ -1509,7 +1509,9 @@ def init():
       } finally { cg.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); tmpDir = undefined; }
     }
     expect(got).toEqual(Object.fromEntries(Object.entries(cases).map(([name, [, want]]) => [name, want])));
-  }, 60_000);
+    // ~30 index/close cycles: ~4 s on Linux/macOS, 40-90 s on a loaded hosted
+    // Windows runner (#1773), so a slow-runner override may raise the cap.
+  }, Math.max(60_000, 2 * (Number(process.env.VITEST_TEST_TIMEOUT) || 0)));
 
   it('#1820: a module global re-resolves after its module changes (sync)', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-global-sync-'));
