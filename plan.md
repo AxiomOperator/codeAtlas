@@ -320,6 +320,12 @@ Each item: minimal repro test from the issue → fix → probe on 3 real repos �
 >   - Low-content, close after a courtesy comment: #1469, #1367, #1021.
 >   - Policy: #1868 (telemetry consent / `machine_id`) still needs a decision; #1644 needs an AV vendor submission + code signing.
 
+> **Post-phase CI follow-up (2026-10-05)** — the new PR CI (Phase 1.2) surfaced cross-platform issues, fixed in follow-up commits on `main`:
+> - Windows worktree detection never fired on paths with 8.3 short names (`RUNNER~1` vs git's `runneradmin`) — `src/sync/worktree.ts` now uses `realpathSync.native` on Windows (product fix; pre-existing upstream).
+> - `schema-ddl.ts` normalises a CRLF `schema.sql` so extracted DDL matches the shared constants on Windows checkouts (product fix).
+> - Test portability: gate-hook CLI spawned with the launcher's runtime flags (Node 22 `ExperimentalWarning`), a test handler leak (Windows `EBUSY`), macOS `/private` cwd, CRLF fixtures; vitest timeouts configurable via `VITEST_TEST_TIMEOUT` / `VITEST_HOOK_TIMEOUT` (CLI flags don't reach workspace projects), used by the Windows job.
+> - Result before the CRLF fix: Ubuntu and macOS green; Windows 2 failures (both the CRLF schema case, fixed after). `Deploy site to GitHub Pages` fails on this fork only because Pages isn't enabled here.
+
 ---
 
 ## Sequencing summary

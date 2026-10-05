@@ -61,7 +61,9 @@ let cachedSchema: string | null = null;
 
 /** The shipped `schema.sql` (copied beside this module into dist/db by copy-assets). */
 export function readSchemaSql(): string {
-  return (cachedSchema ??= fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf-8'));
+  // LF-normalised: a Windows checkout may be CRLF, and the extracted DDL must
+  // match the shared expressions byte-for-byte.
+  return (cachedSchema ??= fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf-8').replace(/\r\n/g, '\n'));
 }
 
 /**
