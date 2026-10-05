@@ -91,6 +91,16 @@ Several open issues are fixed on `main` but unreleased.
 ### 1.6 Antivirus false positive — #1644
 - Submit `codegraph.js` / bundle hashes to Kaspersky false-positive portal; evaluate Authenticode signing for the Windows bundle in the Release workflow. Document in README FAQ.
 
+> **Phase 1 progress (2026-10-05)**
+> - ✅ 1.1 `release.yml`: `persist-credentials: false` on checkout; `RELEASE_PAT` passed only to the two push steps via env; least-privilege `permissions` per job (kernel job read-only); both jobs gated on `refs/heads/main`; `gh release create --target <built SHA>`; `npm@11.19.0` pinned; all actions pinned by commit SHA; typecheck + build + full `npm test` before publishing. `npm ci` still runs install scripts (esbuild needs its postinstall for the viewer build) but no longer has a credential to read.
+> - ✅ 1.2 New `.github/workflows/ci.yml`: PRs + pushes to main run typecheck, build and `npm test` on Linux/macOS/Windows, plus a Linux kernel build + `kernel-*` parity suites. Branch protection requiring it is a repo setting for the maintainer.
+> - ✅ 1.3 Prompt-hook opt-out persisted in `~/.codegraph/preferences.json` (`src/installer/preferences.ts`); `defaultWirePromptHook` refuses when declined; opting back in clears it. Two new contract tests in `installer-targets.test.ts`.
+> - ✅ 1.4 (code parts) Telemetry: unknown MCP tool names counted as `other` (`KNOWN_MCP_TOOLS`, pinned to `tools.ts` by a test); non-identifier client labels dropped; **off by default under `CI`** with no stored choice; `codegraph serve --no-telemetry` (#1908); `TELEMETRY.md` updated. #2333: index events now lower `first_index_day` at ingest; dashboard freshness counts `usage_daily`; nightly purges before catch-up and stops catch-up after a 10-minute budget.
+>   - ⏸ Maintainer decision still needed for #1868: opt-in vs first-run prompt, and rotating/dropping the persistent `machine_id` (changes server-side activation math — not changed unilaterally). `isEnabled()` re-reading the consent file per call is intentional (catches another process's opt-out) and was left as is.
+> - ✅ 1.5 Upgrade: strict version validation (`isValidVersion`) before anything reaches a shell; Unix upgrade downloads `install.sh` from the **release tag**, then runs it (no `curl | sh`); `install.sh`, `install.ps1` and the Windows in-place upgrade verify the archive against `SHA256SUMS` (fail closed, `CODEGRAPH_SKIP_VERIFY=1` escape hatch); warning when `CODEGRAPH_VERSION` pins the upgrade. New tests in `upgrade.test.ts` (tag URL, failed-download exit code, injection rejected).
+> - ✅ 1.6 Troubleshooting doc entry for antivirus false positives (#1644). ⏸ Vendor submission and Authenticode signing need the maintainer's accounts/certificates.
+> - Verification: `tsc --noEmit` clean; full suite 453 files / 5788 tests pass; telemetry-worker typechecks (dashboard's only errors are pre-existing undeclared secret bindings).
+
 ---
 
 ## Phase 2 — Reliability & crash safety (weeks 1–3)

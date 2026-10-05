@@ -11,7 +11,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { Telemetry, getTelemetry, TELEMETRY_ENDPOINT } from '../src/telemetry';
+import { Telemetry, getTelemetry, TELEMETRY_ENDPOINT, KNOWN_MCP_TOOLS } from '../src/telemetry';
+import { tools as MCP_TOOLS } from '../src/mcp/tools';
 
 type FetchCall = { url: string; body: Record<string, unknown> };
 
@@ -55,6 +56,19 @@ describe('Telemetry', () => {
     it('defaults to enabled when nothing decides otherwise', () => {
       const t = make();
       expect(t.getStatus()).toMatchObject({ enabled: true, decidedBy: 'default', machineId: null });
+    });
+
+    it('defaults to off under CI when no choice is stored (nobody saw a notice)', () => {
+      const t = make({ env: { CI: 'true' } });
+      expect(t.getStatus()).toMatchObject({ enabled: false, decidedBy: 'default' });
+      t.recordUsage('cli_command', 'index', true);
+      t.persistSync();
+      expect(fs.existsSync(t.queuePath)).toBe(false);
+    });
+
+    it('a stored choice still wins under CI', () => {
+      make().setEnabled(true, 'cli');
+      expect(make({ env: { CI: 'true' } }).getStatus()).toMatchObject({ enabled: true, decidedBy: 'config' });
     });
 
     it('DO_NOT_TRACK beats everything, including a forced-on env and config', () => {
@@ -150,6 +164,23 @@ describe('Telemetry', () => {
       await t.flushNow();
       expect(calls).toHaveLength(1); // sent…
       expect(stderrLines).toEqual([]); // …without ever showing the notice
+    });
+  });
+
+  describe('payload minimisation', () => {
+    it('KNOWN_MCP_TOOLS lists exactly the tools the MCP server defines', () => {
+      expect([...KNOWN_MCP_TOOLS].sort()).toEqual(MCP_TOOLS.map((t) => t.name).sort());
+    });
+
+    it('counts an unknown MCP tool name as "other" and drops free-text client labels', async () => {
+      const t = make();
+      t.recordUsage('mcp_tool', '/home/alice/secret-project/notes.txt', true, { name: 'evil\nclient: {x}', version: '1.0' });
+      nowValue = new Date('2026-06-13T08:00:00.000Z');
+      await t.flushNow();
+      const events = calls[0]!.body.events as Array<{ props: Record<string, unknown> }>;
+      expect(events[0]!.props.name).toBe('other');
+      expect(events[0]!.props.client_name ?? '').toBe('');
+      expect(events[0]!.props.client_version).toBe('1.0');
     });
   });
 

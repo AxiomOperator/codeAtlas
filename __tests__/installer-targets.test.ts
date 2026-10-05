@@ -1302,6 +1302,24 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(promptCommands(s)).not.toContain(HOOK_CMD);
   });
 
+  it('claude: an install-time opt-out survives `codegraph upgrade` (the upgrade does not re-wire the hook)', async () => {
+    const { defaultWirePromptHook } = await import('../src/upgrade');
+    const claude = getTarget('claude')!;
+    claude.install('global', { autoAllow: true, promptHook: false });
+    expect(await defaultWirePromptHook()).toBe(false);
+    const s = JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude', 'settings.json'), 'utf-8'));
+    expect(promptCommands(s)).not.toContain(HOOK_CMD);
+  });
+
+  it('claude: opting back in at install clears the persisted opt-out', async () => {
+    const { defaultWirePromptHook } = await import('../src/upgrade');
+    const claude = getTarget('claude')!;
+    claude.install('global', { autoAllow: true, promptHook: false });
+    claude.install('global', { autoAllow: true, promptHook: true });
+    removePromptHookEntry('global');
+    expect(await defaultWirePromptHook()).toBe(true);
+  });
+
   it('claude: writePromptHookEntry preserves a sibling UserPromptSubmit hook', () => {
     const file = seedSettings('global', {
       hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'my-own-hook' }] }] },

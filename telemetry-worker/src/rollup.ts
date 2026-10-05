@@ -32,6 +32,13 @@ export const ROLLUP_LOOKBACK_DAYS = 3;
 export const MAX_MANUAL_DAYS = 31;
 /** Most missed days one nightly run catches up on, newest first; the next night takes the rest. */
 export const MAX_CATCHUP_DAYS = 31;
+/**
+ * Wall-clock budget for catch-up days. Cron Triggers stop at 15 minutes, and a day
+ * that still has legacy usage_rollup rows to fold can take several; stopping early
+ * leaves the rest for the next night (every write is idempotent) instead of being
+ * killed mid-day (#2333).
+ */
+export const CATCHUP_BUDGET_MS = 10 * 60_000;
 
 /** Rows per purge DELETE — bounded so one statement stays well inside D1's limits. */
 const PURGE_BATCH_ROWS = 5_000;
@@ -399,8 +406,8 @@ async function missedDays(env: Env, cutoff: string, before: string): Promise<str
 }
 
 /**
- * The cron body: roll up the completed day and the two before it, catch up any
- * earlier day a past run missed, then purge.
+ * The cron body: roll up the completed day and the two before it, purge, then catch
+ * up any earlier day a past run missed, within a wall-clock budget.
  *
  * Logs one line of counts — never a day's contents, never a machine id. Throws if
  * anything failed so the invocation is marked failed (and retried) rather than
@@ -414,20 +421,10 @@ export async function runNightly(env: Env, atMs: number): Promise<void> {
   const days: string[] = [];
   for (let back = 1; back <= ROLLUP_LOOKBACK_DAYS; back++) days.push(utcDay(atMs - back * DAY_MS));
 
-  // A failure to find the missed days must not cost tonight's regular rollup.
-  let caughtUp = 0;
-  try {
-    const missed = await missedDays(env, cutoff, days[days.length - 1] ?? utcDay(atMs));
-    days.push(...missed);
-    caughtUp = missed.length;
-  } catch (err) {
-    console.error(JSON.stringify({ msg: 'missed-day scan failed', err: String(err) }));
-  }
-
   const rolled: string[] = [];
   const failed: string[] = [];
   let rows = 0;
-  for (const day of days) {
+  const roll = async (day: string): Promise<void> => {
     try {
       rows += (await rollupDay(env, day, { cutoff })).rows;
       rolled.push(day);
@@ -435,8 +432,14 @@ export async function runNightly(env: Env, atMs: number): Promise<void> {
       failed.push(day);
       console.error(JSON.stringify({ msg: 'rollup day failed', day, err: String(err) }));
     }
-  }
+  };
 
+  // Tonight's regular days first.
+  for (const day of days) await roll(day);
+
+  // Purge BEFORE catch-up: a long catch-up can hit the cron's wall-clock limit, and
+  // the purge must not be skipped night after night while a backlog clears (#2333).
+  // Missed days are all >= cutoff, so purging first never deletes their raw rows.
   let purge: PurgeResult | null = null;
   try {
     purge = await purgeOldEvents(env, cutoff);
@@ -444,11 +447,29 @@ export async function runNightly(env: Env, atMs: number): Promise<void> {
     console.error(JSON.stringify({ msg: 'purge failed', cutoff, err: String(err) }));
   }
 
+  // A failure to find the missed days must not cost tonight's regular rollup.
+  let caughtUp = 0;
+  let catchupDeferred = 0;
+  try {
+    const missed = await missedDays(env, cutoff, days[days.length - 1] ?? utcDay(atMs));
+    for (const day of missed) {
+      if (Date.now() - started > CATCHUP_BUDGET_MS) {
+        catchupDeferred = missed.length - caughtUp;
+        break;
+      }
+      await roll(day);
+      caughtUp += 1;
+    }
+  } catch (err) {
+    console.error(JSON.stringify({ msg: 'missed-day scan failed', err: String(err) }));
+  }
+
   console.log(
     JSON.stringify({
       msg: 'nightly rollup',
       days: rolled,
       caught_up: caughtUp,
+      catchup_deferred: catchupDeferred,
       rows,
       failed: failed.length,
       retention_days: keepDays,

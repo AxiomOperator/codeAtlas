@@ -35,6 +35,10 @@ export const REPO = 'colbymchenry/codegraph';
 export const NPM_PACKAGE = '@colbymchenry/codegraph';
 const RAW_BASE = `https://raw.githubusercontent.com/${REPO}/main`;
 export const INSTALL_SH_URL = `${RAW_BASE}/install.sh`;
+/** The install.sh that shipped with a release tag (e.g. `v1.6.2`). */
+export function installShUrl(tag: string): string {
+  return `https://raw.githubusercontent.com/${REPO}/${tag}/install.sh`;
+}
 export const INSTALL_PS1_URL = `${RAW_BASE}/install.ps1`;
 
 // ---------------------------------------------------------------------------
@@ -193,6 +197,17 @@ export function isUpdateAvailable(current: string, latest: string): boolean {
 }
 
 /** `0.9.9` / `v0.9.9` → `v0.9.9` (release tags are v-prefixed). */
+/**
+ * A release version as a user (or the network) may supply it: `X.Y.Z` or
+ * `vX.Y.Z`, optional `-prerelease`. Anchored at both ends — the value reaches a
+ * shell (`cmd.exe /c npm install …@<v>` on Windows, the installer's env), so
+ * `1.0.0&calc` must never get through.
+ */
+const STRICT_VERSION = /^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+export function isValidVersion(v: string): boolean {
+  return STRICT_VERSION.test(v.trim());
+}
+
 export function normalizeVersion(v: string): string {
   const t = v.trim();
   return t.startsWith('v') ? t : `v${t}`;
@@ -347,7 +362,11 @@ export async function runUpgrade(opts: UpgradeOptions, deps: UpgradeDeps): Promi
   // Resolve the target version (pinned or latest).
   let latest: string;
   try {
-    latest = normalizeVersion(opts.version || (await deps.resolveLatest()));
+    const raw = opts.version || (await deps.resolveLatest());
+    if (!isValidVersion(raw)) {
+      throw new Error(`Not a CodeGraph version: ${JSON.stringify(raw)} (expected e.g. 1.6.2 or v1.6.2).`);
+    }
+    latest = normalizeVersion(raw);
   } catch (err) {
     deps.error(err instanceof Error ? err.message : String(err));
     return 1;
@@ -382,7 +401,7 @@ export async function runUpgrade(opts: UpgradeOptions, deps: UpgradeDeps): Promi
     case 'bundle':
       code = await (method.os === 'windows'
         ? upgradeWindowsBundle(method, latest, deps)
-        : upgradeUnixBundle(method, opts.version ? latest : undefined, deps));
+        : upgradeUnixBundle(method, latest, deps));
       break;
     case 'npm':
       // npm version specs have no leading "v" (`@0.9.8`, not `@v0.9.8` — the
@@ -548,26 +567,32 @@ async function selfHealPromptHook(deps: UpgradeDeps): Promise<void> {
 
 function upgradeUnixBundle(
   method: Extract<InstallMethod, { kind: 'bundle' }>,
-  pinned: string | undefined,
+  version: string,
   deps: UpgradeDeps
 ): number {
-  const downloader = deps.hasCommand('curl')
-    ? `curl -fsSL ${INSTALL_SH_URL}`
+  // The installer comes from the release's own tag, not from main: what runs
+  // is the script that shipped with the version being installed.
+  const scriptUrl = installShUrl(version);
+  const fetchTo = deps.hasCommand('curl')
+    ? `curl -fsSL ${scriptUrl} -o "$t"`
     : deps.hasCommand('wget')
-      ? `wget -qO- ${INSTALL_SH_URL}`
+      ? `wget -qO "$t" ${scriptUrl}`
       : null;
-  if (!downloader) {
+  if (!fetchTo) {
     deps.error('Neither curl nor wget is available to download the installer.');
-    deps.log(c.dim(`Install curl, or run manually:  ${INSTALL_SH_URL} | sh`));
+    deps.log(c.dim(`Install curl, or run manually:  curl -fsSL ${scriptUrl} | sh`));
     return 1;
   }
 
   const env: NodeJS.ProcessEnv = { ...process.env };
   if (method.installDir) env.CODEGRAPH_INSTALL_DIR = method.installDir;
-  if (pinned) env.CODEGRAPH_VERSION = pinned;
+  env.CODEGRAPH_VERSION = version;
 
-  deps.log(c.dim(`Running the installer (${downloader} | sh)…`));
-  const code = deps.run('sh', ['-c', `${downloader} | sh`], env);
+  // Download, then run — never `curl | sh`, whose exit status is sh's: a failed
+  // download ran an empty script and reported success.
+  const script = `set -e; t="$(mktemp)"; trap 'rm -f "$t"' EXIT; ${fetchTo}; sh "$t"`;
+  deps.log(c.dim(`Running the installer from ${scriptUrl}…`));
+  const code = deps.run('sh', ['-c', script], env);
   if (code !== 0) {
     deps.error(`Installer exited with code ${code}.`);
     return 1;
@@ -683,6 +708,7 @@ export const WINDOWS_UPGRADE_DAMAGED = 2;
 export function buildWindowsUpgradeScript(bundleRoot: string, version: string, arch: string): string {
   const target = `win32-${arch}`;
   const url = `https://github.com/${REPO}/releases/download/${version}/codegraph-${target}.zip`;
+  const sumsUrl = `https://github.com/${REPO}/releases/download/${version}/SHA256SUMS`;
   // Synchronous, no detached helper (which dies under SSH/job objects and has
   // worse UX). The bundle is unpacked into a sibling of current\ — the same
   // volume, so the swap is renames, never a half-finished copy — and nothing
@@ -703,6 +729,13 @@ export function buildWindowsUpgradeScript(bundleRoot: string, version: string, a
     `  New-Item -ItemType Directory -Force -Path $tmp | Out-Null`,
     `  $zip=Join-Path $tmp 'cg.zip'`,
     `  Invoke-WebRequest -Uri $url -OutFile $zip`,
+    // Verify against the release's SHA256SUMS before anything is unpacked.
+    `  $sums=Join-Path $tmp 'SHA256SUMS'`,
+    `  Invoke-WebRequest -Uri ${psQuote(sumsUrl)} -OutFile $sums`,
+    `  $expected=$null`,
+    `  foreach ($l in Get-Content $sums) { $p=$l.Split(' ',[StringSplitOptions]::RemoveEmptyEntries); if ($p.Count -ge 2 -and $p[1].TrimStart('*') -eq 'codegraph-${target}.zip') { $expected=$p[0].ToLower() } }`,
+    `  $actual=(Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLower()`,
+    `  if (-not $expected -or $expected -ne $actual) { throw "The CodeGraph download does not match the release checksum; nothing was changed." }`,
     `  Expand-Archive -Path $zip -DestinationPath $stage -Force`,
     `  $inner=Join-Path $stage 'codegraph-${target}'`,
     `  Install-CodeGraphFiles $(if(Test-Path $inner){$inner}else{$stage}) $dest`,
@@ -842,6 +875,9 @@ export function defaultCapture(cmd: string, args: string[]): { code: number; std
  */
 export async function defaultWirePromptHook(): Promise<boolean> {
   const { claudeTarget, writePromptHookEntry } = await import('../installer/targets/claude');
+  const { promptHookDeclined } = await import('../installer/preferences');
+  // The user said no at install time: never wire it behind their back.
+  if (promptHookDeclined()) return false;
   if (!claudeTarget.detect('global').alreadyConfigured) return false;
   const res = writePromptHookEntry('global');
   return res.action === 'created' || res.action === 'updated';

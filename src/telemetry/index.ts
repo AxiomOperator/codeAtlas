@@ -41,6 +41,37 @@ const DEFAULT_FLUSH_TIMEOUT_MS = 1500;
 const STALE_CLAIM_MS = 60 * 60_000;
 
 export type UsageKind = 'mcp_tool' | 'cli_command';
+
+/**
+ * The MCP tool names worth counting. A client can send any string as a tool
+ * name; anything outside this list is counted as `other` so a client can never
+ * smuggle free text (paths, prompts) into the payload. Keep in sync with the
+ * tool definitions in src/mcp/tools.ts.
+ */
+export const KNOWN_MCP_TOOLS: ReadonlySet<string> = new Set([
+  'codegraph_search',
+  'codegraph_callers',
+  'codegraph_callees',
+  'codegraph_impact',
+  'codegraph_node',
+  'codegraph_explore',
+  'codegraph_status',
+  'codegraph_files',
+]);
+
+/** Client names/versions are identifiers, never free text. */
+const SAFE_LABEL = /^[A-Za-z0-9._@/+ -]+$/;
+function safeLabel(value: string | undefined, max: number): string | undefined {
+  if (!value) return undefined;
+  const trimmed = value.slice(0, max);
+  return SAFE_LABEL.test(trimmed) ? trimmed : undefined;
+}
+
+/** True when the process looks like CI or another non-interactive automation run. */
+function isAutomation(env: NodeJS.ProcessEnv): boolean {
+  const ci = env.CI;
+  return ci !== undefined && ci !== '' && ci !== '0' && ci.toLowerCase() !== 'false';
+}
 export type LifecycleEvent = 'install' | 'index' | 'uninstall';
 
 /** Coarse buckets — exact counts are deliberately not collected. */
@@ -248,6 +279,12 @@ export class Telemetry {
       if (!config.enabled) this.clearPending();
       return { enabled: config.enabled, decidedBy: 'config', machineId, configPath: this.configPath };
     }
+    // Nobody is there to see a first-run notice in CI, so nobody could have
+    // consented: with no stored choice, automation defaults to off.
+    if (isAutomation(this.env)) {
+      this.clearPending();
+      return { enabled: false, decidedBy: 'default', machineId, configPath: this.configPath };
+    }
     return { enabled: true, decidedBy: 'default', machineId, configPath: this.configPath };
   }
 
@@ -292,9 +329,10 @@ export class Telemetry {
   /** Recheck shared consent, then increment in memory; no network or writes. */
   recordUsage(kind: UsageKind, name: string, ok: boolean, client?: ClientInfo): void {
     if (!this.isEnabled()) return;
-    const fresh: CountLine = { v: SCHEMA_VERSION, d: this.utcDay(), k: kind, n: name.slice(0, 64), c: 1, e: ok ? 0 : 1 };
-    const cn = client?.name?.slice(0, 64);
-    const cv = client?.version?.slice(0, 32);
+    const counted = kind === 'mcp_tool' && !KNOWN_MCP_TOOLS.has(name) ? 'other' : name.slice(0, 64);
+    const fresh: CountLine = { v: SCHEMA_VERSION, d: this.utcDay(), k: kind, n: counted, c: 1, e: ok ? 0 : 1 };
+    const cn = safeLabel(client?.name, 64);
+    const cv = safeLabel(client?.version, 32);
     if (cn) fresh.cn = cn;
     if (cv) fresh.cv = cv;
     const key = countKey(fresh);

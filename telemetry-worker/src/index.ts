@@ -204,6 +204,15 @@ const UPSERT_MACHINE_DAY = `INSERT INTO machine_days (machine_id, day, prod) VAL
 const UPSERT_FIRST_SEEN = `INSERT INTO machine_first_seen (machine_id, first_day) VALUES (?, ?)
   ON CONFLICT (machine_id) DO UPDATE SET first_day = min(machine_first_seen.first_day, excluded.first_day)`;
 
+// Lower first_index_day at ingest, the way UPSERT_FIRST_SEEN lowers first_day. The
+// nightly rollup only revisits the last few days, so an index event uploaded late
+// (clients keep the original timestamp; ingest accepts up to 30 days back) would
+// otherwise never count toward activation (#2333). Runs after UPSERT_FIRST_SEEN in
+// the same batch, so the row exists.
+const LOWER_FIRST_INDEX_DAY = `UPDATE machine_first_seen
+   SET first_index_day = ?2
+ WHERE machine_id = ?1 AND (first_index_day IS NULL OR first_index_day > ?2)`;
+
 // usage_rollup counters ADD into one row per machine × day × tool (migrations/0003):
 // clients upload the same counter many times over — once per process — so storing
 // a row per upload grew without bound.
@@ -329,6 +338,14 @@ async function writeToD1(
     const firstDay = [...days].sort()[0];
     if (firstDay !== undefined) {
       stmts.push(env.DB.prepare(UPSERT_FIRST_SEEN).bind(machineId, firstDay));
+    }
+
+    const indexDays = batch
+      .filter((e) => e.event === 'index')
+      .map((e) => (e.ts ?? receivedAt).slice(0, 10))
+      .sort();
+    if (indexDays[0] !== undefined) {
+      stmts.push(env.DB.prepare(LOWER_FIRST_INDEX_DAY).bind(machineId, indexDays[0]));
     }
 
     await env.DB.batch(stmts);

@@ -20,6 +20,14 @@ export CODEGRAPH_TELEMETRY=0   # per-shell / per-CI override
 export DO_NOT_TRACK=1          # the cross-tool standard — always honored
 ```
 
+For an MCP server launched by an agent, `codegraph serve --mcp --no-telemetry` turns it off for
+that server process (and a background server it starts). A background server that is already
+running keeps its own setting, so `codegraph telemetry off` is the way to be sure.
+
+In CI (any non-empty `CI` other than `0`/`false`) telemetry is **off by default**: nobody is
+there to see the first-run notice, so nobody could have agreed to it. A stored choice or
+`CODEGRAPH_TELEMETRY=1` still turns it on.
+
 `codegraph telemetry status` shows the current state, what decided it, and your machine ID.
 The interactive installer (`codegraph install`) asks up front with a visible default-on
 toggle and never re-asks. If you never saw the installer (e.g. `npx` straight into `init`),
@@ -64,7 +72,9 @@ And one of four events:
 - **`usage_rollup`** — one line per day per tool: the tool or CLI command **name** (e.g.
   `codegraph_explore`, `init`), how many times it ran, how many errored, and — for MCP
   tools — the connecting agent's name and version from the MCP handshake (e.g.
-  `Claude Code 2.1`). The Claude Code prompt hook also counts its **gate decision**
+  `Claude Code 2.1`). MCP tool names are checked against CodeGraph's own tool list — any
+  other name a client sends is counted as `other` — and an agent name or version that
+  isn't a plain identifier is dropped. The Claude Code prompt hook also counts its **gate decision**
   (fired fully, fired as a hint, or did nothing — fixed counter names like
   `prompt-hook-gate-medium-segment`); the prompt itself is never read, stored, or sent.
 - **`uninstall`** — when `codegraph uninstall`/`uninit` runs: which agents were removed.

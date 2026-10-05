@@ -15,6 +15,7 @@
 #   CODEGRAPH_VERSION      release tag to install (default: latest)
 #   CODEGRAPH_INSTALL_DIR  bundle location   (default: ~/.codegraph)
 #   CODEGRAPH_BIN_DIR      symlink location  (default: ~/.local/bin)
+#   CODEGRAPH_SKIP_VERIFY  set to 1 to skip the SHA256SUMS check
 set -eu
 
 REPO="colbymchenry/codegraph"
@@ -74,6 +75,31 @@ echo "Installing CodeGraph $version ($target)..."
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 curl -fsSL "$url" -o "$tmp/cg.tar.gz" || { echo "codegraph: download failed: $url" >&2; exit 1; }
+
+# Verify the archive against the release's SHA256SUMS before unpacking it.
+# CODEGRAPH_SKIP_VERIFY=1 skips this (e.g. a mirror that doesn't carry the file).
+if [ "${CODEGRAPH_SKIP_VERIFY:-}" != "1" ]; then
+  sums_url="https://github.com/$REPO/releases/download/$version/SHA256SUMS"
+  curl -fsSL "$sums_url" -o "$tmp/SHA256SUMS" || {
+    echo "codegraph: could not download $sums_url to verify the download." >&2
+    echo "  Set CODEGRAPH_SKIP_VERIFY=1 to install without verifying." >&2
+    exit 1
+  }
+  expected="$(awk -v f="codegraph-${target}.tar.gz" '{ n = $2; sub(/^\*/, "", n); if (n == f) print $1 }' "$tmp/SHA256SUMS")"
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$tmp/cg.tar.gz" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$tmp/cg.tar.gz" | awk '{print $1}')"
+  else
+    echo "codegraph: neither sha256sum nor shasum is available to verify the download." >&2
+    echo "  Set CODEGRAPH_SKIP_VERIFY=1 to install without verifying." >&2
+    exit 1
+  fi
+  if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+    echo "codegraph: the download does not match the release checksum; nothing was installed." >&2
+    exit 1
+  fi
+fi
 
 dest="$INSTALL_DIR/versions/$version"
 rm -rf "$dest"

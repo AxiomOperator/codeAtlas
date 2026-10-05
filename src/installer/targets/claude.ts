@@ -23,6 +23,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { writePreferences } from '../preferences';
 import {
   AgentTarget,
   DetectionResult,
@@ -154,9 +155,13 @@ class ClaudeCodeTarget implements AgentTarget {
     // `=== false` strips any a prior install wrote so opting out round-trips
     // (and an upgrade re-run honors the new choice); `undefined` leaves it
     // untouched for callers that don't manage it.
+    // The choice is also persisted, so `codegraph upgrade` doesn't re-wire a
+    // hook the user turned down.
     if (opts.promptHook === true) {
+      writePreferences({ promptHook: 'accepted' });
       files.push(writePromptHookEntry(loc));
     } else if (opts.promptHook === false) {
+      writePreferences({ promptHook: 'declined' });
       const removed = removePromptHookEntry(loc);
       if (removed.action === 'removed') files.push(removed);
     }

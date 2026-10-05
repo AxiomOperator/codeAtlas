@@ -243,6 +243,9 @@ const TELEMETRY_FLUSH_COMMANDS = new Set(['init', 'uninit', 'index', 'sync', 'up
 program.hook('preAction', (_thisCommand, actionCommand) => {
   try {
     // The detached daemon re-invokes `serve --mcp` internally — not a user action.
+    // `serve --no-telemetry` (#1908): off for this process and anything it
+    // spawns, decided before the usage count below is recorded.
+    if (actionCommand.opts().telemetry === false) process.env.CODEGRAPH_TELEMETRY = '0';
     if (process.env.CODEGRAPH_DAEMON_INTERNAL) return;
     const name = actionCommand.name();
     if (name === 'telemetry') return; // managing telemetry is not usage
@@ -2208,7 +2211,8 @@ program
   .option('-p, --path <path>', 'Project path (optional for MCP mode, uses rootUri from client)')
   .option('--mcp', 'Run as MCP server (stdio transport)')
   .option('--no-watch', 'Disable the file watcher (no auto-sync; useful on slow filesystems like WSL2 /mnt drives)')
-  .action(async (options: { path?: string; mcp?: boolean; watch?: boolean }) => {
+  .option('--no-telemetry', 'Disable usage telemetry for this server (same as CODEGRAPH_TELEMETRY=0)')
+  .action(async (options: { path?: string; mcp?: boolean; watch?: boolean; telemetry?: boolean }) => {
     const projectPath = options.path ? resolveProjectPath(options.path) : undefined;
 
     // Commander sets watch=false when --no-watch is passed. Route it through
@@ -2897,6 +2901,11 @@ program
       cwd: process.cwd(),
     });
     const pin = versionArg || process.env.CODEGRAPH_VERSION || undefined;
+    // A CODEGRAPH_VERSION left exported from an install.sh run would silently
+    // pin every later upgrade; say so instead of keeping it a surprise.
+    if (!versionArg && process.env.CODEGRAPH_VERSION) {
+      warn(`Pinned to ${process.env.CODEGRAPH_VERSION} by the CODEGRAPH_VERSION environment variable — unset it to upgrade to the latest release.`);
+    }
     const code = await up.runUpgrade(
       { version: pin, check: options.check, force: options.force },
       {

@@ -20,8 +20,21 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Much more accurate VB.NET and C# results: structure members, property bodies, initializers and typed receiver calls are now linked, and constants no longer stand in for classes.
 - Re-index VB.NET and C# projects after upgrading to pick up the new links.
 
+### Security
+
+- `codegraph upgrade` and the `install.sh` / `install.ps1` installers now check the download against the release's published checksums before installing it, and upgrades run the installer that shipped with the release you're installing instead of the latest one on the main branch. Set `CODEGRAPH_SKIP_VERIFY=1` to install from a mirror that doesn't carry the checksum file.
+- `codegraph upgrade <version>` only accepts a plain version number like `1.6.2`, so nothing else can reach the shell command that installs it.
+
+### New Features
+
+- `codegraph serve --mcp --no-telemetry` turns telemetry off for that MCP server. (#1908)
+- Telemetry is off by default in CI, where nobody sees the first-run notice; a stored choice or `CODEGRAPH_TELEMETRY=1` still turns it on. Tool names a client sends that aren't CodeGraph's own are counted as `other`, and agent names that aren't plain identifiers are dropped. (#1868)
+
 ### Fixes
 
+- If you said no to the Claude Code front-load prompt hook when installing, `codegraph upgrade` no longer turns it back on.
+- `codegraph upgrade` on a standalone install no longer reports success when downloading the installer failed.
+- `codegraph upgrade` now warns when a `CODEGRAPH_VERSION` left in your environment is pinning it to an old release.
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.
 - In VB.NET and C#, what a property's `Get` and `Set` code calls, creates and reads now belongs to that property, as do C#'s `get => …` accessors and `=> …` property bodies. Before, it was dropped, so a method used only from a property looked unused.
 - In VB.NET, a field or property initializer like `= Compute()` or `As New List(Of Order)` now links what it calls and creates, and so do a `Custom Event`'s `AddHandler`, `RemoveHandler` and `RaiseEvent` blocks. Re-index VB.NET and C# projects after upgrading.

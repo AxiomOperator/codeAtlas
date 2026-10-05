@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { spawnSync } from 'node:child_process';
 import {
   detectInstallMethod,
   deriveInstallDir,
@@ -416,9 +417,51 @@ describe('runUpgrade', () => {
     expect(calls.runs[0].cmd).toBe('sh');
     expect(calls.runs[0].args[0]).toBe('-c');
     expect(calls.runs[0].args[1]).toContain('curl -fsSL');
-    expect(calls.runs[0].args[1]).toContain('| sh');
+    // Download, then run — never `curl | sh` (its exit status is sh's).
+    expect(calls.runs[0].args[1]).not.toContain('| sh');
+    expect(calls.runs[0].args[1]).toContain('sh "$t"');
     expect(calls.runs[0].env?.CODEGRAPH_INSTALL_DIR).toBe('/h/.codegraph');
     expect(calls.logs.join('\n')).toMatch(/codegraph sync/); // re-index advisory printed
+  });
+
+  it('unix bundle: fetches install.sh from the release tag and pins that version', async () => {
+    const { deps, calls } = makeDeps({
+      method: { kind: 'bundle', os: 'unix', bundleRoot: '/h/.codegraph/versions/v0.9.8', installDir: '/h/.codegraph' },
+      currentVersion: '0.9.8',
+    });
+    expect(await runUpgrade({}, deps)).toBe(0);
+    const latest = calls.runs[0].env?.CODEGRAPH_VERSION;
+    expect(latest).toMatch(/^v\d+\.\d+\.\d+/);
+    expect(calls.runs[0].args[1]).toContain(`/colbymchenry/codegraph/${latest}/install.sh`);
+    expect(calls.runs[0].args[1]).not.toContain('/main/install.sh');
+  });
+
+  it.runIf(process.platform !== 'win32')('unix bundle: a failed download fails the upgrade (no curl|sh false success)', async () => {
+    // Run the real generated script with a curl that always fails.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-up-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'curl'), '#!/bin/sh\nexit 22\n', { mode: 0o755 });
+      const { deps, calls } = makeDeps({
+        method: { kind: 'bundle', os: 'unix', bundleRoot: '/h/.codegraph/versions/v0.9.8', installDir: '/h/.codegraph' },
+        currentVersion: '0.9.8',
+      });
+      await runUpgrade({}, deps);
+      const script = calls.runs[0]!.args[1]!;
+      const res = spawnSync('sh', ['-c', script], { env: { ...process.env, PATH: `${dir}:${process.env.PATH}` } });
+      expect(res.status).not.toBe(0);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a version that is not a plain semver (it reaches a shell)', async () => {
+    const { deps, calls } = makeDeps({
+      method: { kind: 'npm', scope: 'global' },
+      currentVersion: '0.9.8',
+    });
+    expect(await runUpgrade({ version: '1.0.0&calc' }, deps)).toBe(1);
+    expect(calls.runs).toHaveLength(0);
+    expect(calls.errors.join('\n')).toMatch(/Not a CodeGraph version/);
   });
 
   it('unix bundle: falls back to wget, and errors when neither downloader exists', async () => {

@@ -245,14 +245,17 @@ async function meta(env: Env): Promise<ApiResult> {
             (SELECT max(day) FROM machine_days)       AS latest_active_day,
             (SELECT min(day) FROM machine_days)       AS earliest_active_day,
             (SELECT min(day) FROM events)             AS earliest_raw_day,
-            (SELECT max(day) FROM events)             AS latest_raw_day,
+            max(coalesce((SELECT max(day) FROM events), ''),
+                coalesce((SELECT max(day) FROM usage_daily), '')) AS latest_raw_day,
             (SELECT count(*) FROM machine_days WHERE day = ?) AS machines_yesterday`,
   )
     .bind(yesterday)
     .first<MetaRow>();
 
   const latestRollup = row?.latest_rollup_day ?? null;
-  const latestRaw = row?.latest_raw_day ?? null;
+  // Usage counts land in usage_daily, not events, so a day with only usage
+  // traffic is still fresh ingest (#2333).
+  const latestRaw = row?.latest_raw_day || null;
   const latestActive = row?.latest_active_day ?? null;
 
   // Nothing at all since before yesterday. (Client clocks may run a few minutes

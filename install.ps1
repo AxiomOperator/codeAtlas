@@ -117,6 +117,19 @@ $dest = Join-Path $installDir 'current'
 $stage = Join-Path $installDir ('.staging-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 try {
   Invoke-WebRequest -Uri $url -OutFile $zip
+  # Verify the archive against the release's SHA256SUMS before unpacking it.
+  # CODEGRAPH_SKIP_VERIFY=1 skips this.
+  if ($env:CODEGRAPH_SKIP_VERIFY -ne '1') {
+    $sums = Join-Path $tmp 'SHA256SUMS'
+    Invoke-WebRequest -Uri "https://github.com/$repo/releases/download/$version/SHA256SUMS" -OutFile $sums
+    $expected = $null
+    foreach ($l in Get-Content $sums) {
+      $p = $l.Split(' ', [StringSplitOptions]::RemoveEmptyEntries)
+      if ($p.Count -ge 2 -and $p[1].TrimStart('*') -eq "codegraph-$target.zip") { $expected = $p[0].ToLower() }
+    }
+    $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLower()
+    if (-not $expected -or $expected -ne $actual) { throw "codegraph: the download does not match the release checksum; nothing was installed." }
+  }
   New-Item -ItemType Directory -Force -Path $stage | Out-Null
   Expand-Archive -Path $zip -DestinationPath $stage -Force
   # Archives contain a top-level codegraph-<target>\ dir.
