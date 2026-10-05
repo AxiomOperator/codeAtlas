@@ -64,6 +64,11 @@ import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
 import { minRefsForPool } from './resolution/resolver-pool';
+import { RESOLUTION_CONFIG_LANGUAGES } from './resolution/index';
+import { logDebug } from './errors';
+
+/** Metadata key holding the last resolution-config fingerprint (see reconcileResolutionConfig). */
+const RESOLUTION_CONFIG_FP_KEY = 'resolution_config_fp';
 
 // Re-export types for consumers
 export * from './types';
@@ -387,7 +392,11 @@ export class CodeGraph {
 
     // Open database
     const dbPath = getDatabasePath(resolvedRoot);
-    const db = DatabaseConnection.open(dbPath, { readOnly: options.readOnly });
+    // Bulk-load recovery runs off the main thread and the database is handed
+    // out only once it's done, so a watchdog-supervised caller keeps its
+    // event loop turning through a long CREATE INDEX (#1887).
+    const db = DatabaseConnection.open(dbPath, { readOnly: options.readOnly, deferHeal: true });
+    await db.whenHealed();
     const queries = new QueryBuilder(db.getDb());
 
     const instance = new CodeGraph(db, queries, resolvedRoot);
@@ -518,6 +527,9 @@ export class CodeGraph {
       } catch {
         return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
       }
+      // Holding the lock: finish any deferred/skipped bulk-load recovery
+      // first (off-thread, #1887) — an incremental run needs the indexes.
+      await this.db.healBulkLoad();
       // Defer WAL auto-checkpointing for the whole bulk run (#1231): the
       // default 1000-page interval re-writes hot pages into the main DB file
       // over and over — ~95% of all disk I/O during a bulk index, and a
@@ -536,6 +548,9 @@ export class CodeGraph {
       const freshDb = this.queries.getNodeAndEdgeCount().nodes === 0;
       const fastInit = process.env.CODEGRAPH_NO_FAST_INIT !== '1' && freshDb;
       if (fastInit) {
+        // Marker first, outside the DB: a death inside the non-durable window
+        // can tear the file, and the next open must discard it, not heal it.
+        this.db.markFastInit();
         try {
           this.db.getDb().pragma('journal_mode = MEMORY');
           this.db.getDb().pragma('synchronous = OFF');
@@ -618,6 +633,9 @@ export class CodeGraph {
         // chance to see the actual project before resolution runs.
         if (result.success && result.filesIndexed > 0) {
           const tReinit = Date.now();
+          // A long-lived instance may have loaded tsconfig/go.mod/... before
+          // an edit; a full index must resolve against today's config.
+          this.resolver.invalidateConfigCaches();
           this.resolver.initialize();
           // Cross-file finalization (e.g. NestJS RouterModule prefixes). Runs
           // before resolution so updated names show up in subsequent reads.
@@ -640,6 +658,7 @@ export class CodeGraph {
             try {
               this.db.getDb().pragma('synchronous = NORMAL');
               this.db.getDb().pragma('journal_mode = WAL');
+              this.db.clearFastInit(); // durable again
               // Defer auto-checkpointing for the resolution phase, same
               // rationale as the deferWal path above: at the default 1000-page
               // interval, the persist loop's edge inserts + ref deletes make
@@ -736,6 +755,8 @@ export class CodeGraph {
             this.queries.setMetadata('indexed_with_version', CodeGraphPackageVersion);
             this.queries.setMetadata('indexed_with_extraction_version', String(EXTRACTION_VERSION));
           } catch { /* metadata is advisory — never fail an index over it */ }
+          // Baseline for sync's resolution-config change detection.
+          this.reconcileResolutionConfig(false);
         }
 
         if (result.success && result.filesErrored === 0 &&
@@ -792,6 +813,9 @@ export class CodeGraph {
             this.db.getDb().pragma('synchronous = NORMAL');
             this.db.getDb().pragma('journal_mode = WAL');
           } catch { /* connection may be closing */ }
+          // Reaching here means no death mid-transaction: the file is
+          // consistent as of its last commit, so the marker can go.
+          this.db.clearFastInit();
         }
         this.fileLock.release();
       }
@@ -811,6 +835,7 @@ export class CodeGraph {
         return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
       }
       try {
+        await this.db.healBulkLoad(); // see sync() — #1887
         return this.orchestrator.indexFiles(filePaths);
       } finally {
         this.fileLock.release();
@@ -824,6 +849,53 @@ export class CodeGraph {
    *
    * Uses a mutex to prevent concurrent indexing operations.
    */
+  /**
+   * Compare the resolver's parsed-config fingerprint (see
+   * `ReferenceResolver.resolutionConfigFingerprint`) with the one stored at the
+   * last index/sync and persist the new one. With `markStale`, every indexed
+   * file of a language whose config component changed gets its stored
+   * hash/mtime cleared so the full reconcile that follows re-extracts and
+   * re-resolves it — an import resolved through the OLD `paths`/go.mod is
+   * otherwise never revisited. Config edits are rare; when nothing changed the
+   * cost is the (lazily cached) config load plus one metadata read. Returns
+   * the number of files marked stale.
+   */
+  private reconcileResolutionConfig(markStale: boolean): number {
+    try {
+      const languages = this.queries.getDistinctFileLanguages();
+      const current = this.resolver.resolutionConfigFingerprint(languages);
+      const raw = this.queries.getMetadata(RESOLUTION_CONFIG_FP_KEY);
+      let previous: Record<string, string> | null = null;
+      try { previous = raw ? JSON.parse(raw) as Record<string, string> : null; } catch { previous = null; }
+      let marked = 0;
+      if (markStale && previous) {
+        const staleLangs = new Set<string>();
+        for (const [component, fp] of Object.entries(current)) {
+          if (previous[component] === undefined || previous[component] === fp) continue;
+          for (const lang of RESOLUTION_CONFIG_LANGUAGES[component as keyof typeof RESOLUTION_CONFIG_LANGUAGES] ?? []) {
+            staleLangs.add(lang);
+          }
+        }
+        if (staleLangs.size > 0) {
+          for (const file of this.queries.getAllFiles()) {
+            if (!staleLangs.has(file.language)) continue;
+            this.queries.upsertFile({ ...file, contentHash: '', modifiedAt: -1 });
+            marked++;
+          }
+          logDebug('Resolution config changed; re-extracting affected files', {
+            languages: [...staleLangs], files: marked,
+          });
+        }
+      }
+      const merged = { ...(previous ?? {}), ...current };
+      if (raw !== JSON.stringify(merged)) this.queries.setMetadata(RESOLUTION_CONFIG_FP_KEY, JSON.stringify(merged));
+      return marked;
+    } catch (err) {
+      logDebug('Resolution config fingerprint failed', { error: String(err) });
+      return 0;
+    }
+  }
+
   async sync(options: IndexOptions = {}): Promise<SyncResult> {
     return this.indexMutex.withLock(async () => {
       try {
@@ -850,6 +922,10 @@ export class CodeGraph {
           `Sync could not open the rebuilt index yet; retry when the rebuild finishes. ${err instanceof Error ? err.message : String(err)}`
         );
       }
+      // Holding the lock, finish any bulk-load recovery open() deferred or
+      // skipped (another process held the lock then) before writing — off
+      // the main thread (#1887). Never rejects.
+      await this.db.healBulkLoad();
       if (this.pendingFullReconcile) {
         // `codegraph index` recreates the file, THEN takes the write lock in
         // indexAll. A sync landing in that gap would otherwise run a full
@@ -907,6 +983,14 @@ export class CodeGraph {
         // pin frames while the WAL grew without a bound.
         const backpressure = walValve ? () => walValve!.backpressure() : undefined;
         const fullReconcile = !options.paths || options.paths.length === 0;
+        // Config-derived resolver caches (tsconfig/jsconfig `paths`, workspace
+        // packages, go.mod, compile_commands.json, `_Imports.razor`) are
+        // reloaded lazily once per sync, so a long-lived daemon/watcher sees
+        // config edits. On a full reconcile, also re-extract the files whose
+        // already-resolved imports a changed config makes stale (the watcher
+        // turns a config-file edit into a full sync).
+        this.resolver.invalidateConfigCaches();
+        if (fullReconcile) this.reconcileResolutionConfig(true);
         const gitState = this.orchestrator.beginGitIndexState(fullReconcile);
 
         // An interrupted index may have absorbed its changed files before

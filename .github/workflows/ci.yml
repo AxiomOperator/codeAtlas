@@ -36,7 +36,15 @@ jobs:
       - name: Build
         run: npm run build
       - name: Test
+        if: runner.os != 'Windows'
         run: npm test
+      - name: Test (Windows)
+        # Hosted Windows runners are slow enough that full parallelism turns
+        # the suite's 5s timeouts and file-handle limits into load-dependent
+        # failures (#1773). Fewer workers and longer timeouts test the code,
+        # not the runner.
+        if: runner.os == 'Windows'
+        run: npx vitest run --maxWorkers=2 --testTimeout=30000 --hookTimeout=60000
 
   kernel:
     runs-on: ubuntu-latest

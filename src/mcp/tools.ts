@@ -121,7 +121,13 @@ function wslSharedIndexGuidance(err: WslSharedIndexError): string {
  */
 export { PathRefusalError } from '../errors';
 import { PathRefusalError } from '../errors';
-import { indexedHashInput } from '../file-limits';
+import { indexedHashInput, readSourceTextSync } from '../file-limits';
+import { LRUCache } from '../resolution/lru-cache';
+
+/** Bound for the per-start-path git caches (worktree mismatch, nested repo). */
+const MCP_PATH_CACHE_MAX = 256;
+/** Bound for the per-file drift memo; entries are only valid for DRIFT_TTL_MS anyway. */
+const DRIFT_CACHE_MAX = 2048;
 import { resolve as resolvePath, relative as relativePath } from 'path';
 
 /** Maximum output length to prevent context bloat (characters) */
@@ -1942,11 +1948,13 @@ export class ToolHandler {
   // .codegraph/ it resolves to), so the up-to-two `git rev-parse` spawns run
   // once and every later tool call reuses the result — never shelling out to
   // git on the hot path. `undefined` = not computed yet; `null` = no mismatch.
-  private worktreeMismatchCache: Map<string, WorktreeIndexMismatch | null> = new Map();
+  // LRU-bounded: a long-lived daemon serving many distinct start paths must
+  // not grow it forever (R-MCP8); an evicted entry just re-runs git once.
+  private worktreeMismatchCache = new LRUCache<string, WorktreeIndexMismatch | null>(MCP_PATH_CACHE_MAX);
   // Per-(projectPath, index root) cache of the different git repository the
   // path sits in below that root, if any (#2110) — the git half of
   // `uncoveredNestedRepo`, memoized like the mismatch above.
-  private nestedRepoCache: Map<string, NestedRepository | null> = new Map();
+  private nestedRepoCache = new LRUCache<string, NestedRepository | null>(MCP_PATH_CACHE_MAX);
   // Gate that the MCP engine pokes after `cg.open()` so the first tool call
   // blocks on the post-open filesystem reconcile (catch-up sync). Without
   // this, a tool call that races past `catchUpSync()` serves rows for files
@@ -2581,7 +2589,9 @@ export class ToolHandler {
    * Cost when nothing is pending — the common case — is one boolean check.
    * No I/O, no parsing of markdown beyond a per-pending-file substring scan.
    */
-  private driftCache = new Map<string, { at: number; stale: boolean }>();
+  // LRU-bounded (R-MCP8): entries are only useful for DRIFT_TTL_MS, but they
+  // were never pruned, so every file ever rendered stayed resident.
+  private driftCache = new LRUCache<string, { at: number; stale: boolean }>(DRIFT_CACHE_MAX);
   private static readonly DRIFT_TTL_MS = 2000;
   /**
    * On-disk drift check for a single indexed file (issue #1474). The code
@@ -2628,7 +2638,7 @@ export class ToolHandler {
         if (st.size !== rec.size || Math.floor(st.mtimeMs) !== Math.floor(rec.modifiedAt)) {
           // A file over the index's size limit is stored as its size stamp
           // (#1910), so it is compared as one, without reading it.
-          const data = indexedHashInput(st.size, () => content ?? readFileSync(absPath, 'utf-8'));
+          const data = indexedHashInput(st.size, () => content ?? readSourceTextSync(absPath));
           // Must stay byte-identical to extraction's `hashContent` (sha256 over
           // the utf-8 string) — the identical-rewrite test in
           // mcp-stale-slice.test.ts pins the parity. Inlined (not imported)
@@ -5616,7 +5626,7 @@ export class ToolHandler {
 
       let fileContent: string;
       try {
-        fileContent = readFileSync(absPath, 'utf-8');
+        fileContent = readSourceTextSync(absPath);
       } catch {
         diag?.recordSkip(filePath, 'unreadable');
         continue;
@@ -7806,7 +7816,7 @@ export class ToolHandler {
     const abs = validatePathWithinRoot(cg.getProjectRoot(), filePath);
     let content: string | null = null;
     if (abs) {
-      try { content = readFileSync(abs, 'utf-8'); } catch { content = null; }
+      try { content = readSourceTextSync(abs); } catch { content = null; }
     }
     if (content === null) {
       const out = [`**${filePath}** — could not read from disk (it may have moved since indexing). ${depSummary}`, ''];

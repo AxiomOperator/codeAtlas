@@ -1,7 +1,8 @@
 import { createHash } from 'crypto';
 import { createReadStream } from 'fs';
 import { stat } from 'fs/promises';
-import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp } from '../file-limits';
+import { MAX_SOURCE_FILE_SIZE_BYTES, decodeSourceBytes, hasUtf16Bom, oversizeStamp } from '../file-limits';
+import { StringDecoder } from 'string_decoder';
 import { validatePathWithinRoot } from '../utils';
 
 export interface AnswerFile {
@@ -45,14 +46,29 @@ export async function validateAnswerFiles(root: string, files: AnswerFile[]): Pr
           createHash('sha256').update(oversizeStamp(size)).digest('hex') === file.contentHash) {
         continue;
       }
-      const stream = createReadStream(absolute, {
-        encoding: 'utf8', highWaterMark: 64 * 1024, signal,
-      });
+      // Hash the text extraction hashed: decoded through decodeSourceBytes
+      // (UTF-8 BOM dropped, UTF-16 by BOM). UTF-8 streams chunk-wise; a UTF-16
+      // file is collected and decoded whole (still bounded by MAX_BYTES).
+      const stream = createReadStream(absolute, { highWaterMark: 64 * 1024, signal });
       let complete = true;
-      for await (const chunk of stream) {
-        bytes += Buffer.byteLength(chunk);
+      let first = true;
+      let utf16: Buffer[] | null = null;
+      const decoder = new StringDecoder('utf8');
+      for await (const raw of stream) {
+        let chunk = raw as Buffer;
+        bytes += chunk.length;
         if (bytes > MAX_BYTES) { complete = false; break; }
-        hash.update(chunk);
+        if (first) {
+          first = false;
+          if (hasUtf16Bom(chunk)) utf16 = [];
+          else if (chunk.length >= 3 && chunk[0] === 0xef && chunk[1] === 0xbb && chunk[2] === 0xbf) chunk = chunk.subarray(3);
+        }
+        if (utf16) utf16.push(chunk);
+        else hash.update(decoder.write(chunk));
+      }
+      if (complete) {
+        if (utf16) hash.update(decodeSourceBytes(Buffer.concat(utf16)));
+        else hash.update(decoder.end());
       }
       if (!complete) unchecked.push(file.path);
       else if (hash.digest('hex') !== file.contentHash) stale.push(file.path);

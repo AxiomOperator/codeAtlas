@@ -10,6 +10,7 @@ import * as path from 'path';
 import * as fsp from 'fs/promises';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { ExtractionError, Language } from '../types';
+import { logDebug } from '../errors';
 
 export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
 
@@ -484,7 +485,20 @@ export async function loadGrammarsForLanguages(languages: Language[], wasmBytes?
   for (const lang of toLoad) {
     try {
       const bytes = wasmBytes?.[lang];
-      const language = await WasmLanguage.load(bytes ?? resolveWasmPath(lang));
+      let language: WasmLanguage;
+      try {
+        language = await WasmLanguage.load(bytes ?? resolveWasmPath(lang));
+      } catch (firstError) {
+        // A load can fail transiently (EMFILE/EBUSY on the .wasm, a read racing
+        // an in-place upgrade, a truncated forwarded buffer). Marking the
+        // language unavailable is sticky for this worker's life, so retry once
+        // from disk after a short pause before giving up (R-DB12).
+        logDebug(`Grammar load for ${lang} failed; retrying once`, {
+          error: firstError instanceof Error ? firstError.message : String(firstError),
+        });
+        await new Promise((resolve) => setTimeout(resolve, GRAMMAR_LOAD_RETRY_DELAY_MS));
+        language = await WasmLanguage.load(resolveWasmPath(lang));
+      }
       languageCache.set(lang, language);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -493,6 +507,9 @@ export async function loadGrammarsForLanguages(languages: Language[], wasmBytes?
     }
   }
 }
+
+/** Pause before the single retry of a failed grammar load (R-DB12). */
+const GRAMMAR_LOAD_RETRY_DELAY_MS = 50;
 
 /**
  * Load ALL grammar WASM files. Convenience function for tests and
@@ -841,6 +858,15 @@ export function getUnavailableGrammarErrors(): Partial<Record<Language, string>>
  */
 export function hasGrammarLoadFailure(errors: readonly ExtractionError[] | undefined): boolean {
   return !!errors && errors.some((e) => e.code === 'parser_error');
+}
+
+/**
+ * Whether a stored file row holds no complete parse of its bytes — its grammar
+ * never loaded (#2335), or the extractor threw part-way (`incomplete`, R-DB11)
+ * — so sync must re-parse it even when size, mtime and hash all match.
+ */
+export function needsReparse(errors: readonly ExtractionError[] | undefined): boolean {
+  return !!errors && errors.some((e) => e.code === 'parser_error' || e.incomplete === true);
 }
 
 /**

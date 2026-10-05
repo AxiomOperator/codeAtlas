@@ -149,7 +149,7 @@ describe('CodeGraph Foundation', () => {
         originalExec(sql);
       };
 
-      (connection as any).healBulkSecondaryIndexes();
+      connection.healBulkLoadInline();
       connection.close();
 
       expect(execCalls).toBe(0);

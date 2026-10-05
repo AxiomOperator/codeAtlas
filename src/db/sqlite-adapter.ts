@@ -30,6 +30,8 @@ export interface SqliteDatabase {
   exec(sql: string): void;
   pragma(str: string, options?: { simple?: boolean }): any;
   transaction<T>(fn: (...args: any[]) => T): (...args: any[]) => T;
+  /** BEGIN … await fn … COMMIT as one atomic unit; see NodeSqliteAdapter. */
+  transactionAsync<T>(fn: () => Promise<T>): Promise<T>;
   close(): void;
   readonly open: boolean;
   /** Undefined on a runtime without `isTransaction`; callers must then not memoize. */
@@ -54,6 +56,7 @@ export type SqliteBackend = 'node-sqlite';
 class NodeSqliteAdapter implements SqliteDatabase {
   private _db: any;
   private _txDepth = 0;
+  private _asyncTail: Promise<void> = Promise.resolve();
   private readonly _dbPath: string;
 
   constructor(dbPath: string, opts?: { readOnly?: boolean }) {
@@ -61,6 +64,13 @@ class NodeSqliteAdapter implements SqliteDatabase {
     const { DatabaseSync } = require('node:sqlite');
     this._dbPath = dbPath;
     this._db = opts?.readOnly ? new DatabaseSync(dbPath, { readOnly: true }) : new DatabaseSync(dbPath);
+    // `INSERT OR REPLACE INTO nodes` deletes the old row implicitly, and SQLite
+    // fires DELETE triggers for that only with recursive_triggers on. Without
+    // it the nodes_fts delete trigger never runs, so every replaced node left
+    // an orphan entry in the external-content FTS index (stale tokens pointing
+    // at a dead rowid). Connection-level, touches no file, so it is set on
+    // every connection — the store worker's included.
+    this._db.exec('PRAGMA recursive_triggers = ON');
   }
 
   /**
@@ -155,37 +165,111 @@ class NodeSqliteAdapter implements SqliteDatabase {
   transaction<T>(fn: (...args: any[]) => T): (...args: any[]) => T {
     return (...args: any[]) => {
       // Nested call (a transaction()-wrapped helper invoked from inside another
-      // transaction): run the body directly inside the enclosing transaction.
-      // BEGIN would throw "cannot start a transaction within a transaction",
-      // so no existing caller ever relied on nested rollback granularity —
-      // flattening is behavior-preserving and free.
-      if (this._txDepth > 0) {
-        this._txDepth++;
-        try {
-          return fn(...args);
-        } finally {
-          this._txDepth--;
-        }
-      }
+      // transaction): run the body in a SAVEPOINT, so an inner failure the
+      // outer body catches rolls back only the inner's partial writes instead
+      // of committing them with the outer transaction.
+      if (this._txDepth > 0) return this.runInSavepoint(() => fn(...args));
       this._db.exec('BEGIN');
       this._txDepth = 1;
       try {
         const result = fn(...args);
-        this._db.exec('COMMIT');
-        this._txDepth = 0;
+        this.commitOrThrow();
         return result;
       } catch (error) {
-        this._db.exec('ROLLBACK');
-        this._txDepth = 0;
+        rollbackIfActive(this);
         throw error;
+      } finally {
+        this._txDepth = 0;
       }
     };
+  }
+
+  /**
+   * Async counterpart of `transaction()`: BEGIN, await `fn`, COMMIT — so a
+   * long store can yield to the event loop (savepoint-free, no intermediate
+   * commits) while other connections still see it land atomically. Calls are
+   * serialized on this connection (a second one waits for the first to
+   * finish); one must not be awaited from inside another. Synchronous
+   * `transaction()` calls made during `fn`'s awaits nest as savepoints.
+   */
+  async transactionAsync<T>(fn: () => Promise<T>): Promise<T> {
+    const previous = this._asyncTail;
+    let release!: () => void;
+    this._asyncTail = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      this._db.exec('BEGIN');
+      this._txDepth = 1;
+      try {
+        const result = await fn();
+        this.commitOrThrow();
+        return result;
+      } catch (error) {
+        rollbackIfActive(this);
+        throw error;
+      } finally {
+        this._txDepth = 0;
+      }
+    } finally {
+      release();
+    }
+  }
+
+  private runInSavepoint<T>(fn: () => T): T {
+    const name = `cg_sp_${this._txDepth}`;
+    this._db.exec(`SAVEPOINT ${name}`);
+    this._txDepth++;
+    try {
+      const result = fn();
+      this._db.exec(`RELEASE ${name}`);
+      return result;
+    } catch (error) {
+      // If SQLite already rolled the whole transaction back (SQLITE_FULL,
+      // IOERR, …) the savepoint is gone too — touching it would throw and
+      // mask the real error.
+      if (this.inTransaction !== false) {
+        try {
+          this._db.exec(`ROLLBACK TO ${name}`);
+          this._db.exec(`RELEASE ${name}`);
+        } catch {
+          /* keep the original error */
+        }
+      }
+      throw error;
+    } finally {
+      this._txDepth--;
+    }
+  }
+
+  /** COMMIT, unless SQLite already rolled the transaction back on its own. */
+  private commitOrThrow(): void {
+    if (this.inTransaction === false) {
+      throw new Error('SQLite rolled the transaction back before it could commit');
+    }
+    this._db.exec('COMMIT');
   }
 
   close(): void {
     // node:sqlite's DatabaseSync.close() throws if already closed; make it
     // idempotent to match better-sqlite3 (callers may close more than once).
     if (this._db.isOpen) this._db.close();
+  }
+}
+
+/**
+ * Roll back `db`'s open transaction, if it still has one. After SQLITE_FULL,
+ * IOERR and friends SQLite has already rolled back on its own; a blind
+ * ROLLBACK then throws "no transaction is active" and masks the real error.
+ * On a runtime without `isTransaction` (Node < 22.16) the ROLLBACK is
+ * attempted and its failure swallowed. Never throws — callers rethrow the
+ * ORIGINAL error.
+ */
+export function rollbackIfActive(db: Pick<SqliteDatabase, 'exec' | 'inTransaction'>): void {
+  if (db.inTransaction === false) return;
+  try {
+    db.exec('ROLLBACK');
+  } catch {
+    /* already rolled back — keep the caller's original error */
   }
 }
 

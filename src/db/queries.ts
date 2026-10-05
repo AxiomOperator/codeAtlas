@@ -619,6 +619,15 @@ export class QueryBuilder {
   }
 
   /**
+   * Async `runInTransaction`: `fn` may await (e.g. yield to the event loop
+   * between bounded chunks) and its writes still commit — or roll back — as
+   * one unit. Nothing intermediate is ever visible to another connection.
+   */
+  runInTransactionAsync<T>(fn: () => Promise<T>): Promise<T> {
+    return this.db.transactionAsync(fn);
+  }
+
+  /**
    * Store one file's whole extraction bundle — nodes, edges, unresolved refs,
    * and the file record — in a SINGLE transaction. The bulk-index path calls
    * this once per file instead of opening one transaction per table (#1015
@@ -2751,14 +2760,12 @@ export class QueryBuilder {
       const insert = this.db.prepare(
         'INSERT OR REPLACE INTO cg_module_map (path, mod) VALUES (?, ?)'
       );
-      this.db.exec('BEGIN');
-      try {
+      // Through the adapter, not a raw BEGIN: this read path can run while a
+      // long store holds the connection's transaction open across a yield,
+      // and then it nests as a savepoint instead of failing.
+      this.db.transaction(() => {
         for (const row of assignments) insert.run(row.filePath, row.module);
-        this.db.exec('COMMIT');
-      } catch (err) {
-        this.db.exec('ROLLBACK');
-        throw err;
-      }
+      })();
 
       // ONE pass over the edge table. Grouping by the symbol names as well as
       // the modules costs nothing extra in scan time — the join is what is

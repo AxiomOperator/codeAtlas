@@ -27,7 +27,7 @@ import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
 import { clearVbnetReceiverMemos } from './vbnet-receivers';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isJsPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, clearCppIncludeDirCache, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isJsPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks } from './frameworks';
@@ -220,6 +220,26 @@ const CPP_BUILT_INS = new Set([
 ]);
 
 /**
+ * Languages whose import resolution depends on each config component of
+ * `ReferenceResolver.resolutionConfigFingerprint`.
+ */
+export const RESOLUTION_CONFIG_LANGUAGES = {
+  js: ['typescript', 'javascript', 'tsx', 'jsx', 'vue', 'svelte', 'astro', 'arkts'],
+  go: ['go'],
+  cpp: ['c', 'cpp'],
+} as const satisfies Record<string, readonly string[]>;
+
+/** JSON with Maps/Sets/RegExps serialized by content (for config fingerprints). */
+function stableConfigJson(value: unknown): string {
+  return JSON.stringify(value, (_key, v: unknown) => {
+    if (v instanceof Map) return { __map: [...v.entries()].sort((a, b) => String(a[0]).localeCompare(String(b[0]))) };
+    if (v instanceof Set) return { __set: [...v].map(String).sort() };
+    if (v instanceof RegExp) return { __re: v.source, flags: v.flags };
+    return v;
+  });
+}
+
+/**
  * Reference Resolver
  *
  * Orchestrates reference resolution using multiple strategies.
@@ -305,15 +325,33 @@ export class ReferenceResolver {
   private knownFiles: Set<string> | null = null;
   private cachesWarmed = false;
   // tsconfig/jsconfig path-alias map. `undefined` = not yet computed,
-  // `null` = computed and absent. Treated as immutable for the
-  // resolver's lifetime; callers re-create the resolver if config changes.
+  // `null` = computed and absent. Loaded lazily and kept until
+  // invalidateConfigCaches() — once per index/sync, so a long-lived process
+  // (MCP daemon, watch mode) picks up an edited tsconfig without a restart.
   private projectAliases: AliasMap | null | undefined = undefined;
   // Per directory: the aliases of the nearest non-root tsconfig declaring `paths`.
   private dirAliases = new Map<string, AliasMap | null>();
-  // go.mod module path. Same lazy/immutable convention as projectAliases.
+  // go.mod module path. Same lazy convention as projectAliases.
   private goModule: GoModule | null | undefined = undefined;
-  // Monorepo workspace member packages. Same lazy/immutable convention.
+  // Monorepo workspace member packages. Same lazy convention.
   private workspacePackages: WorkspacePackages | null | undefined = undefined;
+  /**
+   * Registry of the caches derived from project CONFIG files (tsconfig /
+   * jsconfig `paths`, nested tsconfigs, workspace package.json, go.mod,
+   * compile_commands.json, `_Imports.razor`). Unlike the per-pass caches that
+   * clearCaches() drops several times inside one pass, these are reset once
+   * per index/sync by invalidateConfigCaches(): reloading is lazy and cheap for
+   * the JSON configs, but a large compile_commands.json is not something to
+   * re-parse on every intra-pass clearCaches().
+   */
+  private readonly configCacheResets: ReadonlyArray<() => void> = [
+    () => { this.projectAliases = undefined; },
+    () => { this.dirAliases.clear(); },
+    () => { this.goModule = undefined; },
+    () => { this.workspacePackages = undefined; },
+    () => { this.razorUsingsCache.clear(); },
+    () => { clearCppIncludeDirCache(); },
+  ];
 
   constructor(projectRoot: string, queries: QueryBuilder) {
     this.projectRoot = projectRoot;
@@ -451,6 +489,11 @@ export class ReferenceResolver {
     this.knownLowerNames = null;
     this.knownFiles = null;
     this.cachesWarmed = false;
+    // Per-file memos that read file CONTENT (a `.razor` file's own `@using`s)
+    // or probe the tree (which directories hold a tsconfig): same stable
+    // window as fileCache above, and cheap to rebuild.
+    this.razorUsingsCache.clear();
+    this.dirAliases.clear();
     // The import-resolver's and name-matcher's per-context memos assume the
     // same stable window as the caches above — drop them together.
     if (this.context) {
@@ -461,6 +504,41 @@ export class ReferenceResolver {
       clearVbnetReceiverMemos(this.context);
       clearTypeParameterMemos(this.context);
     }
+  }
+
+  /**
+   * Drop every config-derived cache (see configCacheResets) plus the per-pass
+   * caches. Called at the start of every index and sync so an edited
+   * tsconfig/jsconfig `paths`, nested tsconfig, workspace package.json, go.mod,
+   * compile_commands.json or `_Imports.razor` takes effect in a long-lived
+   * process. Reloads happen lazily, at most once per pass.
+   */
+  invalidateConfigCaches(): void {
+    for (const reset of this.configCacheResets) reset();
+    this.clearCaches();
+  }
+
+  /**
+   * Fingerprint of the resolution-relevant project config, per component,
+   * computed from the PARSED config (not file mtimes) so an unrelated edit to
+   * package.json (a dependency bump) is not a change. `CodeGraph.sync` compares
+   * it to the stored one to decide which already-resolved imports are stale.
+   * Only the components whose languages are indexed are computed.
+   */
+  resolutionConfigFingerprint(languages: ReadonlySet<string>): Record<string, string> {
+    const ctx = this.context;
+    const out: Record<string, string> = {};
+    const has = (langs: readonly string[]): boolean => langs.some((l) => languages.has(l));
+    if (has(RESOLUTION_CONFIG_LANGUAGES.js)) {
+      out.js = stableConfigJson([ctx.getProjectAliases?.() ?? null, ctx.getWorkspacePackages?.() ?? null]);
+    }
+    if (has(RESOLUTION_CONFIG_LANGUAGES.go)) {
+      out.go = stableConfigJson(ctx.getGoModule?.() ?? null);
+    }
+    if (has(RESOLUTION_CONFIG_LANGUAGES.cpp)) {
+      out.cpp = stableConfigJson(loadCppIncludeDirs(this.projectRoot));
+    }
+    return out;
   }
 
   /** `readFile` through the LRU content cache (null = read failed, also cached). */

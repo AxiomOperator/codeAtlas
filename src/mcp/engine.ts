@@ -289,8 +289,18 @@ export class MCPEngine {
         this.writerLockRoot = null;
       } else if (this.cg) {
         this.cg.unwatch();
-        while (this.cg.isIndexing()) await new Promise((resolve) => setTimeout(resolve, 25));
-        this.cg.close();
+        // Let an in-flight index/sync finish before closing its database, but
+        // never wait forever: a wedged sync must not hang shutdown (R-MCP11).
+        // Past the deadline the handle is left open — the process is on its
+        // way out, and closing under a running writer would turn its next
+        // statement into an error mid-transaction.
+        if (await waitUntilIdle(() => this.cg!.isIndexing(), STOP_INDEXING_DEADLINE_MS)) {
+          this.cg.close();
+        } else {
+          process.stderr.write(
+            `[CodeGraph MCP] Shutdown: indexing still running after ${STOP_INDEXING_DEADLINE_MS}ms; not waiting further\n`
+          );
+        }
       }
       this.cg = null;
       if (this.writerLockRoot) releaseWriterLock(this.writerLockRoot);
@@ -469,4 +479,20 @@ export function parseDebounceEnv(raw: string | undefined): number | undefined {
   if (!Number.isFinite(n) || !Number.isInteger(n)) return undefined;
   if (n < 100 || n > 60000) return undefined;
   return n;
+}
+
+/** How long engine shutdown waits for an in-flight index/sync before giving up (R-MCP11). */
+export const STOP_INDEXING_DEADLINE_MS = 30_000;
+
+/**
+ * Poll `busy` every `pollMs` until it returns false or `deadlineMs` elapses.
+ * Resolves true when it went idle, false on timeout.
+ */
+export async function waitUntilIdle(busy: () => boolean, deadlineMs: number, pollMs = 25): Promise<boolean> {
+  const deadline = Date.now() + deadlineMs;
+  while (busy()) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+  return true;
 }

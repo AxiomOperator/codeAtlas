@@ -31,6 +31,10 @@ class FakeWorker implements ParsePoolWorker {
   private msgCb?: (m: unknown) => void;
   private exitCb?: (code: number) => void;
   alive = true;
+  /** Exit code of the worker's own exit (after `shutdown`), or null. */
+  selfExitCode: number | null = null;
+  /** Whether this fake honours `shutdown` by exiting (the real worker does). */
+  exitsOnShutdown = true;
   constructor(private behavior: (m: ParseMsg) => Action, private onTerminate?: () => void) {}
   on(event: string, cb: (...args: any[]) => void): void {
     if (event === 'message') this.msgCb = cb;
@@ -44,6 +48,17 @@ class FakeWorker implements ParsePoolWorker {
     const m = msg as { type: string } & Partial<ParseMsg>;
     if (m.type === 'load-grammars') {
       setTimeout(() => { if (this.alive) this.msgCb?.({ type: 'grammars-loaded' }); }, 0);
+      return;
+    }
+    if (m.type === 'shutdown') {
+      // The real parse-worker collects garbage, then process.exit(0).
+      if (!this.exitsOnShutdown) return;
+      setTimeout(() => {
+        if (!this.alive) return;
+        this.alive = false;
+        this.selfExitCode = 0;
+        this.exitCb?.(0);
+      }, 0);
       return;
     }
     if (m.type !== 'parse') return;
@@ -67,17 +82,25 @@ const result = (tag = 0): ExtractionResult => ({ nodes: [], edges: [], unresolve
 function makePool(
   size: number,
   behavior: (m: ParseMsg) => Action,
-  opts: Partial<{ recycleInterval: number; parseTimeoutMs: number }> = {}
+  opts: Partial<{ recycleInterval: number; parseTimeoutMs: number; recycleExitGraceMs: number; exitsOnShutdown: boolean }> = {}
 ) {
   let spawned = 0, terminated = 0;
+  const workers: FakeWorker[] = [];
   const pool = new ParseWorkerPool({
     languages: ['typescript'] as Language[],
     size,
     recycleInterval: opts.recycleInterval,
     parseTimeoutMs: opts.parseTimeoutMs,
-    createWorker: () => { spawned++; return new FakeWorker(behavior, () => { terminated++; }); },
+    recycleExitGraceMs: opts.recycleExitGraceMs,
+    createWorker: () => {
+      spawned++;
+      const w = new FakeWorker(behavior, () => { terminated++; });
+      if (opts.exitsOnShutdown === false) w.exitsOnShutdown = false;
+      workers.push(w);
+      return w;
+    },
   });
-  return { pool, counts: () => ({ spawned, terminated }) };
+  return { pool, workers, counts: () => ({ spawned, terminated }) };
 }
 
 describe('resolveParseTimeoutMs', () => {
@@ -155,13 +178,57 @@ describe('ParseWorkerPool', () => {
   });
 
   it('recycles a worker after recycleInterval parses', async () => {
-    const { pool, counts } = makePool(1, () => ({ result: result() }), { recycleInterval: 3 });
+    const { pool, workers, counts } = makePool(1, () => ({ result: result() }), { recycleInterval: 3 });
     for (let i = 0; i < 4; i++) await pool.requestParse(task(`f${i}.ts`));
-    // 3 parses on the first worker → recycle (terminate + respawn); the 4th runs
+    // 3 parses on the first worker → recycle (shutdown + respawn); the 4th runs
     // on the fresh worker.
     expect(counts().spawned).toBe(2);
-    expect(counts().terminated).toBeGreaterThanOrEqual(1);
+    await sleep(10);
+    // Recycle is graceful: the old worker ends by its own exit(0) after a
+    // collection — it is never terminate()d (worker-teardown.ts).
+    expect(workers[0].selfExitCode).toBe(0);
+    expect(counts().terminated).toBe(0);
     await pool.destroy();
+  });
+
+  it('recycle falls back to terminate() only when the worker does not exit in time', async () => {
+    const { pool, workers, counts } = makePool(1, () => ({ result: result(5) }), {
+      recycleInterval: 2, recycleExitGraceMs: 60, exitsOnShutdown: false,
+    });
+    for (let i = 0; i < 2; i++) await pool.requestParse(task(`f${i}.ts`));
+    expect(counts().spawned).toBe(2); // replacement spawned at once, not after the grace
+    await sleep(20);
+    expect(counts().terminated).toBe(0); // still within the grace window
+    // The replacement keeps serving while the old one is on its way out.
+    expect((await pool.requestParse(task('next.ts'))).durationMs).toBe(5);
+    await sleep(80);
+    expect(counts().terminated).toBe(1); // the wedged old worker, after the grace
+    expect(workers[0].selfExitCode).toBeNull();
+    await pool.destroy();
+  });
+
+  it('recycle neither loses nor duplicates jobs', async () => {
+    const seen: string[] = [];
+    const { pool, counts } = makePool(2, (m) => { seen.push(m.filePath); return { result: result(Number(m.filePath.replace(/\D/g, ''))) }; }, { recycleInterval: 2 });
+    const res = await Promise.all(Array.from({ length: 20 }, (_, i) => pool.requestParse(task(`${i}.ts`))));
+    expect(res.map((r) => r.durationMs).sort((a, b) => a - b)).toEqual(Array.from({ length: 20 }, (_, i) => i));
+    expect(seen.sort()).toEqual(Array.from({ length: 20 }, (_, i) => `${i}.ts`).sort());
+    expect(counts().spawned).toBeGreaterThan(2);
+    await sleep(10);
+    expect(counts().terminated).toBe(0);
+    await pool.destroy();
+  });
+
+  it('destroy() waits out a recycled worker still on its way out', async () => {
+    const { pool, counts } = makePool(1, () => ({ result: result() }), {
+      recycleInterval: 1, recycleExitGraceMs: 80, exitsOnShutdown: false,
+    });
+    await pool.requestParse(task('a.ts'));
+    const t0 = Date.now();
+    await pool.destroy();
+    // The retiring worker never exits by itself → destroy settles via the fallback.
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(60);
+    expect(counts().terminated).toBe(2); // the retired one + the live replacement
   });
 
   it('rejects a parse whose worker crashes (retry-pass-recognisable message) and keeps serving', async () => {

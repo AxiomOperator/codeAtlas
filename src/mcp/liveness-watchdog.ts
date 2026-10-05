@@ -103,6 +103,19 @@ function debug(msg: string): void {
   }
 }
 
+/** Live watchdogs armed in this process (see {@link isMainThreadWatchdogArmed}). */
+let armedWatchdogs = 0;
+
+/**
+ * True while this process's main thread is supervised by a liveness watchdog —
+ * i.e. a long synchronous step here can get the process SIGKILLed. Work that
+ * may run for minutes (open-time bulk-load recovery, #1887) consults this to
+ * move off the main thread instead of blocking it.
+ */
+export function isMainThreadWatchdogArmed(): boolean {
+  return armedWatchdogs > 0;
+}
+
 export interface WatchdogHandle {
   /** Stop heartbeating and shut the watchdog child down. Idempotent. */
   stop(): void;
@@ -242,10 +255,12 @@ export function installMainThreadWatchdog(options: WatchdogOptions = {}): Watchd
   debug(`armed (child pid ${child.pid ?? '?'}): timeoutMs=${timeoutMs} checkMs=${checkMs} progressPaths=${progressPaths.length}`);
 
   let stopped = false;
+  armedWatchdogs++;
   return {
     stop(): void {
       if (stopped) return;
       stopped = true;
+      armedWatchdogs--;
       clearInterval(heartbeat);
       try { stdin.end(); } catch { /* ignore */ } // EOF -> child exits cleanly
       try { child.kill(); } catch { /* ignore */ } // belt-and-suspenders

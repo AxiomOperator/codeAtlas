@@ -10,6 +10,8 @@ import * as path from 'path';
 import { SchemaVersion } from '../types';
 import { runMigrations, getCurrentVersion, CURRENT_SCHEMA_VERSION } from './migrations';
 import { getCodeGraphDir, statInode } from '../directory';
+import { awaitExitOrTerminate, COLLECT_BEFORE_EXIT_SOURCE } from '../worker-teardown';
+import { isMainThreadWatchdogArmed } from '../mcp/liveness-watchdog';
 
 export { SqliteDatabase, SqliteBackend } from './sqlite-adapter';
 
@@ -161,10 +163,33 @@ export class DatabaseConnection {
 
   /**
    * Open an existing database
+   *
+   * `deferHeal`: close a killed run's bulk-load windows (dropped FTS triggers /
+   * secondary indexes) on a worker thread instead of inline, so a minutes-long
+   * CREATE INDEX can't stall a liveness-watchdog-supervised main thread
+   * (#1887). The connection is returned at once; {@link whenHealed} settles
+   * when recovery is done. Defaults to deferring exactly when this process's
+   * main thread is watchdog-supervised; otherwise the heal runs inline, as
+   * before.
    */
-  static open(dbPath: string, options: { readOnly?: boolean } = {}): DatabaseConnection {
+  static open(dbPath: string, options: { readOnly?: boolean; deferHeal?: boolean } = {}): DatabaseConnection {
     if (!fs.existsSync(dbPath)) {
       throw new Error(`Database not found: ${dbPath}`);
+    }
+
+    // A fresh build that died inside its fast-init window (journal in memory,
+    // no fsync) can leave a torn file: discard it rather than migrating and
+    // healing it (R-DB4). A live fast init elsewhere leaves the file alone.
+    let mayHeal = true;
+    if (!options.readOnly) {
+      const fastInit = fastInitState(dbPath);
+      if (fastInit === 'aborted') {
+        const fresh = DatabaseConnection.discardAbortedFastInit(dbPath);
+        if (fresh) return fresh;
+        mayHeal = false;
+      } else if (fastInit === 'live') {
+        mayHeal = false;
+      }
     }
 
     const { db, backend } = createDatabase(dbPath, options);
@@ -191,16 +216,59 @@ export class DatabaseConnection {
     }
 
     // Self-heal a bulk-load window that never closed (crash between
-    // beginBulkNodeLoad and endBulkNodeLoad): the FTS triggers are missing and
-    // nodes_fts is stale. Rebuild + recreate so search stays in sync.
-    conn.healBulkNodeLoad();
-    conn.healBulkSecondaryIndexes();
+    // beginBulk*Load and endBulk*Load): FTS triggers missing / nodes_fts
+    // stale, secondary indexes dropped. Never while another live process
+    // holds the index lock — its windows are open on purpose and it closes
+    // them itself (#1887); the next locked write (sync/index) heals instead.
+    if (mayHeal) {
+      if (options.deferHeal ?? isMainThreadWatchdogArmed()) void conn.healBulkLoad();
+      else conn.healBulkLoadInline();
+    }
 
     // Self-heal a killed session's leftover oversized WAL (#1431) — one
     // statSync when healthy, off-thread checkpoint+truncate when not.
     void conn.healOversizedWal();
 
     return conn;
+  }
+
+  /**
+   * Replace a database whose fast init died mid-run with an empty one marked
+   * `index_state = 'indexing'` — what `codegraph status` reports as "the last
+   * index run never finished, re-run codegraph index", and what the next full
+   * sync rebuilds from. Returns null (open as-is, no heal) when the file can't
+   * be removed, e.g. still held open by another process on Windows.
+   */
+  private static discardAbortedFastInit(dbPath: string): DatabaseConnection | null {
+    try {
+      removeDatabaseFiles(dbPath);
+    } catch {
+      return null;
+    }
+    const fresh = DatabaseConnection.initialize(dbPath);
+    try {
+      fresh.db.prepare(
+        'INSERT INTO project_metadata (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at'
+      ).run('index_state', 'indexing', Date.now());
+    } catch { /* metadata is advisory */ }
+    return fresh;
+  }
+
+  /**
+   * Record that this connection's file is entering fast init (memory journal,
+   * synchronous=OFF): a process death inside the window can tear the file, so
+   * the next open must discard it instead of trusting it. Written BEFORE the
+   * pragmas switch, cleared once the durable journal is back.
+   */
+  markFastInit(): void {
+    if (!this.dbPath || this.dbPath === ':memory:') return;
+    try { fs.writeFileSync(this.dbPath + FAST_INIT_MARKER_SUFFIX, String(process.pid)); } catch { /* best-effort */ }
+  }
+
+  /** Clear the {@link markFastInit} marker. */
+  clearFastInit(): void {
+    if (!this.dbPath || this.dbPath === ':memory:') return;
+    try { fs.rmSync(this.dbPath + FAST_INIT_MARKER_SUFFIX, { force: true }); } catch { /* best-effort */ }
   }
 
   /**
@@ -422,38 +490,170 @@ export class DatabaseConnection {
 
   private static readonly SYNTHESIS_SITE_INDEX = 'idx_edges_synthesis_site';
 
-  /** Recreate the FTS triggers + rebuild if a bulk-load window never closed. */
-  private healBulkNodeLoad(): void {
-    if (!this.fts5Available) return;
-    const row = this.db
-      .prepare(
-        `SELECT count(*) AS c FROM sqlite_master WHERE type = 'trigger' AND name IN ('nodes_ai','nodes_ad','nodes_au')`
-      )
-      .get() as { c: number } | undefined;
-    if ((row?.c ?? 0) >= DatabaseConnection.FTS_TRIGGER_NAMES.length) return;
-    this.endBulkNodeLoad();
-  }
+  /**
+   * The statements that close every bulk-load window a killed run left open,
+   * one per element, each its own commit — so recovery killed half-way keeps
+   * what it finished and the next attempt resumes instead of repeating
+   * (#1887). Empty when the schema is healthy (two sqlite_master probes).
+   * The FTS rebuild and its triggers share ONE transaction: a node written
+   * between a rebuild and the triggers' return would be missing from search.
+   */
+  private bulkLoadHealPlan(): string[] {
+    const plan: string[] = [];
+    let schema: string | null = null;
+    const readSchema = (): string => (schema ??= fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf-8'));
 
-  /** Recreate every secondary index a killed bulk parse/ref/edge window may leave dropped. */
-  private healBulkSecondaryIndexes(): void {
+    if (this.fts5Available) {
+      const row = this.db
+        .prepare(
+          `SELECT count(*) AS c FROM sqlite_master WHERE type = 'trigger' AND name IN ('nodes_ai','nodes_ad','nodes_au')`
+        )
+        .get() as { c: number } | undefined;
+      if ((row?.c ?? 0) < DatabaseConnection.FTS_TRIGGER_NAMES.length) {
+        plan.push(
+          `BEGIN IMMEDIATE;\nINSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');\n` +
+          `${DatabaseConnection.ftsTriggerDdls(readSchema()).join('\n')}\nCOMMIT;`
+        );
+      }
+    }
+
     const names = [...new Set<string>([
       ...DatabaseConnection.BULK_PARSE_INDEX_NAMES,
       ...DatabaseConnection.BULK_REF_INDEX_NAMES,
       ...DatabaseConnection.BULK_EDGE_INDEX_NAMES,
     ])];
     const placeholders = names.map(() => '?').join(',');
-    const row = this.db
-      .prepare(`SELECT count(*) AS c FROM sqlite_master WHERE type = 'index' AND name IN (${placeholders})`)
-      .get(...names) as { c: number } | undefined;
-    if ((row?.c ?? 0) >= names.length) return;
-
-    const schemaPath = path.join(__dirname, 'schema.sql');
-    const schema = fs.readFileSync(schemaPath, 'utf-8');
+    const present = new Set((this.db
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND name IN (${placeholders})`)
+      .all(...names) as Array<{ name: string }>).map((r) => r.name));
     for (const idx of names) {
-      const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
+      if (present.has(idx)) continue;
+      const m = readSchema().match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
       if (!m) throw new Error(`schema.sql: index ${idx} not found for crash recovery`);
-      this.db.exec(m[0]);
+      plan.push(m[0]);
     }
+    return plan;
+  }
+
+  /**
+   * Close a killed run's bulk-load windows on THIS thread. Each step commits on
+   * its own; a failing step (e.g. a busy concurrent writer) stops the pass and
+   * leaves the rest for the next open or locked write.
+   */
+  healBulkLoadInline(): void {
+    if (this.readOnly || indexLockHolder(this.dbPath) !== null) return;
+    for (const sql of this.bulkLoadHealPlan()) {
+      try {
+        this.db.exec(sql);
+      } catch (err) {
+        try { this.db.exec('ROLLBACK'); } catch { /* no transaction open */ }
+        if (process.env.CODEGRAPH_MCP_DEBUG) {
+          console.error(`[codegraph] bulk-load recovery deferred: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        return;
+      }
+    }
+  }
+
+  /**
+   * Close a killed run's bulk-load windows on a WORKER THREAD with its own
+   * connection (#1887): one CREATE INDEX over millions of rows can outlast the
+   * #850 liveness watchdog's window, and inline that killed every restart
+   * before the index committed. The main thread just awaits, so the event loop
+   * — and the watchdog heartbeat — keep turning. The worker sorts with
+   * temp_store=FILE: an in-memory sorter over a multi-GB table is a likely
+   * source of the multi-GiB spikes reported during recovery. Single-flight;
+   * never rejects. Skipped while another live process holds the index lock
+   * (its windows are open on purpose).
+   */
+  healBulkLoad(): Promise<void> {
+    if (this.bulkHeal) return this.bulkHeal;
+    if (this.readOnly || indexLockHolder(this.dbPath) !== null) return Promise.resolve();
+    let plan: string[];
+    try {
+      plan = this.bulkLoadHealPlan();
+    } catch {
+      return Promise.resolve();
+    }
+    if (plan.length === 0) return Promise.resolve();
+    if (!this.dbPath || this.dbPath === ':memory:') {
+      this.healBulkLoadInline();
+      return Promise.resolve();
+    }
+    this.bulkHeal = this.runHealPlanOffThread(plan).finally(() => { this.bulkHeal = null; });
+    return this.bulkHeal;
+  }
+
+  /** Settles once any in-flight {@link healBulkLoad} is done. */
+  whenHealed(): Promise<void> {
+    return this.bulkHeal ?? Promise.resolve();
+  }
+
+  private bulkHeal: Promise<void> | null = null;
+
+  private async runHealPlanOffThread(plan: string[]): Promise<void> {
+    let Worker: typeof import('node:worker_threads').Worker;
+    try {
+      ({ Worker } = await import('node:worker_threads'));
+    } catch {
+      this.healBulkLoadInline();
+      return;
+    }
+    const workerSource = `
+      const { workerData, parentPort } = require('node:worker_threads');
+      let done = 0;
+      let err = null;
+      try {
+        const { DatabaseSync } = require('node:sqlite');
+        const db = new DatabaseSync(workerData.dbPath);
+        try {
+          db.exec('PRAGMA busy_timeout = 30000');
+          db.exec('PRAGMA temp_store = FILE');
+          for (const sql of workerData.plan) {
+            try { db.exec(sql); done++; }
+            catch (e) { err = String(e && e.message || e); try { db.exec('ROLLBACK'); } catch {} break; }
+          }
+        } finally { try { db.close(); } catch {} }
+      } catch (e) { err = err || String(e && e.message || e); }
+      parentPort.postMessage({ done, err });
+      // Then end by itself after a full collection (worker-teardown.ts).
+      __collectBeforeExit();
+    ` + COLLECT_BEFORE_EXIT_SOURCE;
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = (): void => {
+        if (!settled) { settled = true; resolve(); }
+      };
+      try {
+        const worker = new Worker(workerSource, { eval: true, workerData: { dbPath: this.dbPath, plan } });
+        worker.once('message', (m: { done?: number; err?: string | null }) => {
+          if (m?.err && process.env.CODEGRAPH_MCP_DEBUG) {
+            console.error(`[codegraph] bulk-load recovery stopped after ${m.done ?? 0}/${plan.length} steps: ${m.err}`);
+          }
+          // Not terminate(): the worker exits by itself once it has
+          // replied (terminate only if it doesn't — worker-teardown.ts).
+          void awaitExitOrTerminate(worker);
+          finish();
+        });
+        worker.once('error', () => { void worker.terminate(); finish(); });
+        worker.once('exit', finish);
+      } catch {
+        finish();
+      }
+    });
+  }
+
+  /** The three FTS sync-trigger DDLs, extracted from schema.sql. */
+  private static ftsTriggerDdls(schema: string): string[] {
+    const triggerDdls = schema.match(
+      /CREATE TRIGGER IF NOT EXISTS nodes_a[idu]\b[\s\S]*?END;/g
+    );
+    if (!triggerDdls || triggerDdls.length !== DatabaseConnection.FTS_TRIGGER_NAMES.length) {
+      throw new Error(
+        `schema.sql: expected ${DatabaseConnection.FTS_TRIGGER_NAMES.length} nodes FTS triggers, found ${triggerDdls?.length ?? 0}`
+      );
+    }
+    return triggerDdls;
   }
 
   /**
@@ -465,15 +665,7 @@ export class DatabaseConnection {
   private recreateFtsTriggers(): void {
     const schemaPath = path.join(__dirname, 'schema.sql');
     const schema = fs.readFileSync(schemaPath, 'utf-8');
-    const triggerDdls = schema.match(
-      /CREATE TRIGGER IF NOT EXISTS nodes_a[idu]\b[\s\S]*?END;/g
-    );
-    if (!triggerDdls || triggerDdls.length !== DatabaseConnection.FTS_TRIGGER_NAMES.length) {
-      throw new Error(
-        `schema.sql: expected ${DatabaseConnection.FTS_TRIGGER_NAMES.length} nodes FTS triggers, found ${triggerDdls?.length ?? 0}`
-      );
-    }
-    for (const ddl of triggerDdls) {
+    for (const ddl of DatabaseConnection.ftsTriggerDdls(schema)) {
       this.db.exec(ddl);
     }
   }
@@ -704,7 +896,9 @@ export class DatabaseConnection {
           try { db.close(); } catch {}
         } catch (e) { err = err || String(e && e.message || e); }
         parentPort.postMessage({ row, err });
-      `;
+        // Then end by itself after a full collection (worker-teardown.ts).
+        __collectBeforeExit();
+      ` + COLLECT_BEFORE_EXIT_SOURCE;
       return await new Promise((resolve) => {
         let settled = false;
         const finish = (row?: Record<string, number> | null): void => {
@@ -718,7 +912,9 @@ export class DatabaseConnection {
             if (m?.err && process.env.CODEGRAPH_WAL_VALVE_DEBUG) {
               console.error(`[wal-valve] checkpoint worker (${mode}): ${m.err}`);
             }
-            void worker.terminate();
+            // Not terminate(): the worker exits by itself once it has
+            // replied (terminate only if it doesn't — worker-teardown.ts).
+            void awaitExitOrTerminate(worker);
             finish(m?.row ?? null);
           });
           worker.once('error', () => { void worker.terminate(); finish(null); });
@@ -803,7 +999,9 @@ export class DatabaseConnection {
           try { db.close(); } catch {}
         } catch {}
         parentPort.postMessage('done');
-      `;
+        // Then end by itself after a full collection (worker-teardown.ts).
+        __collectBeforeExit();
+      ` + COLLECT_BEFORE_EXIT_SOURCE;
       await new Promise<void>((resolve) => {
         let settled = false;
         const finish = (): void => {
@@ -811,7 +1009,9 @@ export class DatabaseConnection {
         };
         try {
           const worker = new Worker(workerSource, { eval: true, workerData: { dbPath: this.dbPath, pragmas } });
-          worker.once('message', () => { void worker.terminate(); finish(); });
+          // Not terminate(): the worker exits by itself once it has replied
+          // (terminate only if it doesn't — worker-teardown.ts).
+          worker.once('message', () => { void awaitExitOrTerminate(worker); finish(); });
           worker.once('error', () => { void worker.terminate(); finish(); });
           worker.once('exit', finish);
         } catch {
@@ -870,6 +1070,57 @@ export const DATABASE_FILENAME = 'codegraph.db';
 const WAL_SIDECAR_SUFFIXES = ['-wal', '-shm'] as const;
 
 /**
+ * Beside the DB file while a fresh build runs in fast-init mode (memory
+ * journal, synchronous=OFF); holds the builder's pid. Outside the database on
+ * purpose: the marker must stay readable when the file it describes is torn.
+ */
+const FAST_INIT_MARKER_SUFFIX = '-fastinit';
+
+/** `kill(pid, 0)` liveness; EPERM means the process exists but isn't ours. */
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === 'EPERM';
+  }
+}
+
+/**
+ * The pid of a LIVE process other than this one holding the project's
+ * cross-process index lock (`codegraph.lock` beside the DB — see FileLock in
+ * utils.ts), or null. While one does, it may be mid-index with its bulk-load
+ * windows deliberately open, so recovery must not touch them (#1887).
+ */
+export function indexLockHolder(dbPath: string): number | null {
+  if (!dbPath || dbPath === ':memory:') return null;
+  let pid: number;
+  try {
+    pid = parseInt(fs.readFileSync(path.join(path.dirname(dbPath), 'codegraph.lock'), 'utf-8').trim(), 10);
+  } catch {
+    return null;
+  }
+  if (isNaN(pid) || pid === process.pid) return null;
+  return isPidAlive(pid) ? pid : null;
+}
+
+/**
+ * Whether a fast init is running against `dbPath` ('live' — this process or
+ * another live one), died inside its window ('aborted'), or isn't marked.
+ */
+export function fastInitState(dbPath: string): 'live' | 'aborted' | 'none' {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(dbPath + FAST_INIT_MARKER_SUFFIX, 'utf-8').trim();
+  } catch {
+    return 'none';
+  }
+  const pid = parseInt(raw, 10);
+  if (!isNaN(pid) && (pid === process.pid || isPidAlive(pid))) return 'live';
+  return 'aborted';
+}
+
+/**
  * Get the default database path for a project
  */
 export function getDatabasePath(projectRoot: string): string {
@@ -906,4 +1157,6 @@ export function removeDatabaseFiles(dbPath: string): void {
       // A sidecar still held/locked is harmless — SQLite rebuilds it on open.
     }
   }
+  // Last: the file it vouched against is gone.
+  try { fs.rmSync(dbPath + FAST_INIT_MARKER_SUFFIX, { force: true }); } catch { /* best-effort */ }
 }

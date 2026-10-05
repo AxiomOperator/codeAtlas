@@ -14,7 +14,14 @@ import * as os from 'os';
 import * as path from 'path';
 import { Worker } from 'worker_threads';
 import CodeGraph from '../src/index';
-import { terminateOnceStarted, workerStarted } from '../src/worker-teardown';
+import {
+  awaitExitOrTerminate,
+  COLLECT_BEFORE_EXIT_SOURCE,
+  exitAfterCollect,
+  terminateOnceStarted,
+  workerStarted,
+} from '../src/worker-teardown';
+import { DatabaseConnection } from '../src/db';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -127,5 +134,106 @@ describe('real workers are never terminated before they have started', () => {
     const writer = new StoreWriter(path.resolve(__dirname, '../dist/extraction/store-worker.js'), dbPath, false);
     await writer.close(0);
     expect(startedWhenEnded.every(Boolean)).toBe(true);
+  }, 30_000);
+});
+
+describe('a worker that ends itself collects first', () => {
+  it('exitAfterCollect collects, then exits with the code', () => {
+    const calls: string[] = [];
+    exitAfterCollect(1, { collect: () => calls.push('collect'), exit: (c) => calls.push(`exit ${c}`) });
+    expect(calls).toEqual(['collect', 'exit 1']);
+  });
+
+  it('the parse worker never calls process.exit without collecting (OOM and shutdown paths)', () => {
+    const src = fs.readFileSync(path.resolve(__dirname, '../src/extraction/parse-worker.ts'), 'utf8');
+    // Strip comments, then: no bare process.exit — every exit goes through exitAfterCollect.
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+    expect(code).not.toMatch(/process\.exit\(/);
+    // The WASM-corruption branch exits via exitAfterCollect(1).
+    expect(code).toMatch(/out of memory'\)\)\s*\{\s*exitAfterCollect\(1\);/);
+    expect(code).toMatch(/'shutdown'\)\s*\{[\s\S]*?exitAfterCollect\(0\);/);
+  });
+
+  it('a real parse worker sent shutdown exits by itself with code 0', async () => {
+    const w = new Worker(path.resolve(__dirname, '../dist/extraction/parse-worker.js'));
+    const started = workerStarted(w);
+    w.postMessage({ type: 'load-grammars', languages: ['typescript'] });
+    await started; // 'grammars-loaded'
+    const terminate = vi.spyOn(w, 'terminate');
+    const code = await new Promise<number>((resolve) => {
+      w.once('exit', resolve);
+      w.postMessage({ type: 'shutdown' });
+    });
+    expect(code).toBe(0);
+    expect(terminate).not.toHaveBeenCalled();
+  }, 30_000);
+
+  it('COLLECT_BEFORE_EXIT_SOURCE collects in an eval worker, which then exits by itself', async () => {
+    const w = new Worker(`
+      const { parentPort } = require('node:worker_threads');
+      parentPort.postMessage({ collected: __collectBeforeExit(), gc: typeof globalThis.gc });
+    ` + COLLECT_BEFORE_EXIT_SOURCE, { eval: true });
+    const [msg, code] = await Promise.all([
+      new Promise((resolve) => w.once('message', resolve)),
+      new Promise<number>((resolve) => w.once('exit', resolve)),
+    ]);
+    expect(msg).toEqual({ collected: true, gc: 'undefined' });
+    expect(code).toBe(0);
+  }, 30_000);
+});
+
+describe('awaitExitOrTerminate', () => {
+  class ExitingWorker extends EventEmitter {
+    terminate = vi.fn(async () => 1);
+  }
+
+  it('resolves true and never terminates a worker that exits in time', async () => {
+    const w = new ExitingWorker();
+    const done = awaitExitOrTerminate(w as unknown as Worker, 200);
+    setTimeout(() => w.emit('exit', 0), 10);
+    expect(await done).toBe(true);
+    await sleep(250);
+    expect(w.terminate).not.toHaveBeenCalled();
+  });
+
+  it('terminates after the grace when the worker does not exit, and never rejects', async () => {
+    const w = new ExitingWorker();
+    w.terminate.mockRejectedValue(new Error('already gone'));
+    const t0 = Date.now();
+    expect(await awaitExitOrTerminate(w as unknown as Worker, 60)).toBe(false);
+    expect(w.terminate).toHaveBeenCalledOnce();
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(55);
+  });
+});
+
+describe('database checkpoint and maintenance workers end by themselves', () => {
+  let dir: string;
+  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-db-worker-exit-')); });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+
+  it('are never terminated, and exit with code 0', async () => {
+    const terminate = vi.spyOn(Worker.prototype, 'terminate');
+    const exits: number[] = [];
+    const emit = Worker.prototype.emit;
+    vi.spyOn(Worker.prototype, 'emit').mockImplementation(function (this: Worker, event: string | symbol, ...args: unknown[]) {
+      if (event === 'exit') exits.push(args[0] as number);
+      return emit.call(this, event, ...args);
+    });
+    const db = DatabaseConnection.initialize(path.join(dir, 'test.db'));
+    try {
+      db.getDb().exec("CREATE TABLE t (x TEXT); INSERT INTO t VALUES ('a')");
+      expect(await db.checkpointWalPassive()).not.toBeNull();
+      expect(await db.checkpointWalTruncate()).not.toBeNull();
+      await db.runMaintenance();
+      // Each worker replied first; let them finish exiting.
+      for (let i = 0; i < 100 && exits.length < 3; i++) await sleep(20);
+    } finally {
+      db.close();
+    }
+    expect(exits).toEqual([0, 0, 0]);
+    expect(terminate).not.toHaveBeenCalled();
   }, 30_000);
 });

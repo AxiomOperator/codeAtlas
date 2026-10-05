@@ -345,6 +345,14 @@ export interface ExtractionError {
 
   /** Error code for categorization */
   code?: string;
+
+  /**
+   * The extractor threw part-way through the file, so the stored symbols are
+   * a PARTIAL result. Persisted with the file row; sync re-parses such a file
+   * even when its bytes are unchanged (see `needsReparse`), instead of
+   * treating the partial result as the file's complete parse (R-DB11).
+   */
+  incomplete?: boolean;
 }
 
 /**

@@ -333,6 +333,9 @@ export class StdioTransport extends LineBasedJsonRpcTransport {
   }
 }
 
+/** Default cap on one buffered JSON-RPC line for {@link SocketTransport} (64 MiB of UTF-16 code units). */
+export const SOCKET_MAX_LINE_LENGTH = 64 * 1024 * 1024;
+
 /**
  * Socket Transport for MCP daemon sessions.
  *
@@ -345,7 +348,17 @@ export class SocketTransport extends LineBasedJsonRpcTransport {
   private buffer = '';
   private closeHandlers: Array<() => void> = [];
 
-  constructor(private socket: Socket, private prefix: string = 'cg-sock') {
+  constructor(
+    private socket: Socket,
+    private prefix: string = 'cg-sock',
+    /**
+     * Longest unterminated line (in UTF-16 code units) the transport will
+     * buffer. A client that streams without ever sending `\n` would otherwise
+     * grow the daemon's heap without bound (R-MCP9); past the cap the
+     * connection is dropped — no well-formed MCP message comes close.
+     */
+    private readonly maxLineLength: number = SOCKET_MAX_LINE_LENGTH,
+  ) {
     super();
   }
 
@@ -377,6 +390,15 @@ export class SocketTransport extends LineBasedJsonRpcTransport {
         const line = this.buffer.slice(0, idx);
         this.buffer = this.buffer.slice(idx + 1);
         void this.handleLine(line);
+      }
+      if (this.buffer.length > this.maxLineLength) {
+        process.stderr.write(
+          `[CodeGraph daemon] client sent a line over ${this.maxLineLength} chars without a newline; closing the connection\n`
+        );
+        this.buffer = '';
+        // destroy() (not stop()) so the 'close' event runs handleSocketClose
+        // and the daemon's close handlers (client refcount) still fire.
+        this.socket.destroy();
       }
     });
 

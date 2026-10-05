@@ -1,4 +1,4 @@
-import { createDatabase, type SqliteDatabase } from './sqlite-adapter';
+import { createDatabase, rollbackIfActive, type SqliteDatabase } from './sqlite-adapter';
 import { QueryBuilder } from './queries';
 import { createYielder } from '../resolution/cooperative-yield';
 
@@ -74,7 +74,7 @@ export class SynthesisStage {
         INSERT INTO main.synthesis_inputs SELECT * FROM temp.synthesis_inputs`);
       this.db.exec('COMMIT');
     } catch (error) {
-      this.db.exec('ROLLBACK');
+      rollbackIfActive(this.db);
       throw error;
     }
     await backpressure?.();

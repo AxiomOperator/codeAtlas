@@ -56,6 +56,7 @@ function recordingDb(raw: SqliteDatabase): { db: SqliteDatabase; sqls: string[] 
     exec: (sql: string) => raw.exec(sql),
     pragma: (str: string, options?: { simple?: boolean }) => raw.pragma(str, options),
     transaction: <T>(fn: (...args: any[]) => T) => raw.transaction(fn),
+    transactionAsync: <T>(fn: () => Promise<T>) => raw.transactionAsync(fn),
     close: () => raw.close(),
     get open() {
       return raw.open;

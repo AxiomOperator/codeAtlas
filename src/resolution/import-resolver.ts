@@ -657,13 +657,16 @@ function resolveAliasedImport(
 }
 
 /**
- * C/C++ include directory cache (keyed by project root).
- * Loaded once per resolver instance, shared across calls.
+ * C/C++ include directory cache (keyed by project root). Module-global, so
+ * `ReferenceResolver.invalidateConfigCaches()` clears it once per index/sync —
+ * a long-lived process (MCP daemon, watch mode) must see an edited
+ * `compile_commands.json` without a restart.
  */
 const cppIncludeDirCache = new Map<string, string[]>();
 
 /**
- * Clear the C/C++ include directory cache (call between indexing runs)
+ * Clear the C/C++ include directory cache (called from
+ * `ReferenceResolver.invalidateConfigCaches()` at the start of every index/sync).
  */
 export function clearCppIncludeDirCache(): void {
   cppIncludeDirCache.clear();
@@ -1258,17 +1261,6 @@ function extractCppImports(content: string): ImportMapping[] {
   }
 
   return mappings;
-}
-
-// Cache import mappings per file to avoid re-reading and re-parsing
-const importMappingCache = new Map<string, ImportMapping[]>();
-
-/**
- * Clear the import mapping cache (call between indexing runs)
- */
-export function clearImportMappingCache(): void {
-  importMappingCache.clear();
-  cppIncludeDirCache.clear();
 }
 
 /**

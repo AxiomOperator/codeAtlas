@@ -20,6 +20,7 @@ import { tryKernelExtractRaw } from './kernel';
 import { commonJsRequireRefs } from './commonjs-requires';
 import { getAllFrameworkResolvers, getApplicableFrameworks } from '../resolution/frameworks';
 import type { Language, ExtractionResult } from '../types';
+import { exitAfterCollect } from '../worker-teardown';
 
 // Emscripten prints `Aborted()` (and a follow-up RuntimeError diag
 // line) directly to stderr when WASM aborts — before the JS catch
@@ -128,9 +129,12 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
 
       // WASM memory errors leave the module in a corrupted state — all
       // subsequent parses would also fail (cascading failures). Crash the
-      // worker so the main thread spawns a fresh one with a clean heap.
+      // worker so the main thread spawns a fresh one with a clean heap —
+      // collecting first, so no GC marking is in flight when the thread ends
+      // (worker-teardown.ts: the Windows 0xC0000005 crash).
       if (message.includes('memory access out of bounds') || message.includes('out of memory')) {
-        process.exit(1);
+        exitAfterCollect(1);
+        return;
       }
 
       parentPort!.postMessage({
@@ -147,6 +151,10 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
       });
     }
   } else if (msg.type === 'shutdown') {
+    // The pool is retiring this worker (recycle). End by our own exit after a
+    // full collection rather than being terminate()d mid-marking — the pool
+    // falls back to terminate() only if this never arrives (worker-teardown.ts).
     parentPort!.postMessage({ type: 'shutdown-ack' });
+    exitAfterCollect(0);
   }
 });

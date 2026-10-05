@@ -108,3 +108,36 @@ export function readBoundedSourceSync(file: string): BoundedSource {
     fs.closeSync(fd);
   }
 }
+
+/**
+ * Decode a source file's bytes to text the one way every reader must agree on
+ * (R-DB9): a UTF-8 byte-order mark is dropped, a UTF-16 LE/BE BOM switches to
+ * that encoding (Windows tooling — PowerShell, older Visual Studio, `.resx`
+ * exports — writes UTF-16 source), and anything else is UTF-8. Extraction
+ * hashes the result, so drift checks that compare a file on disk with its
+ * stored `contentHash` must decode through this too.
+ */
+export function decodeSourceBytes(bytes: Buffer): string {
+  if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+    return bytes.toString('utf8', 3);
+  }
+  if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+    return bytes.toString('utf16le', 2);
+  }
+  if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+    // Swap to little-endian (dropping a dangling odd byte) and decode.
+    const body = bytes.subarray(2, 2 + ((bytes.length - 2) & ~1));
+    return Buffer.from(body).swap16().toString('utf16le');
+  }
+  return bytes.toString('utf8');
+}
+
+/** True when `head` starts with a UTF-16 (LE or BE) byte-order mark. */
+export function hasUtf16Bom(head: Buffer): boolean {
+  return head.length >= 2 && ((head[0] === 0xff && head[1] === 0xfe) || (head[0] === 0xfe && head[1] === 0xff));
+}
+
+/** `fs.readFileSync` + {@link decodeSourceBytes}. */
+export function readSourceTextSync(file: string): string {
+  return decodeSourceBytes(fs.readFileSync(file));
+}

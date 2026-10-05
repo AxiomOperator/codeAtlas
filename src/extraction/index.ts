@@ -25,7 +25,7 @@ import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs } from './
 import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
-import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
+import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure, needsReparse } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
@@ -35,7 +35,7 @@ import { detectFrameworks, getFrameworkResolver } from '../resolution/frameworks
 import { declaredDependencies } from '../resolution/frameworks/package-deps';
 import type { ResolutionContext } from '../resolution/types';
 import { createYielder, type MaybeYield } from '../resolution/cooperative-yield';
-import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp, readBoundedSource, readBoundedSourceSync } from '../file-limits';
+import { MAX_SOURCE_FILE_SIZE_BYTES, decodeSourceBytes, oversizeStamp, readBoundedSource, readBoundedSourceSync } from '../file-limits';
 export { oversizeStamp };
 
 /**
@@ -171,7 +171,7 @@ export function hashContent(content: string): string {
 function readSourceOrStamp(fullPath: string): string | null {
   const { stats, bytes } = readBoundedSourceSync(fullPath);
   if (bytes === null) return oversizeStamp(stats.size);
-  return isMpegTsBytes(fullPath, bytes) ? null : bytes.toString('utf8');
+  return isMpegTsBytes(fullPath, bytes) ? null : decodeSourceBytes(bytes);
 }
 
 /** Whether these bytes, read from `filePath`, are a `.ts` MPEG transport stream (#1910). */
@@ -1949,7 +1949,8 @@ export class ExtractionOrchestrator {
         try {
           // Framework detectors scan source by name; a file over the size
           // limit was never indexed and must not be decoded here either (#1910).
-          return readBoundedSourceSync(full).bytes?.toString('utf8') ?? null;
+          const bytes = readBoundedSourceSync(full).bytes;
+          return bytes ? decodeSourceBytes(bytes) : null;
         } catch {
           return null;
         }
@@ -2458,7 +2459,7 @@ export class ExtractionOrchestrator {
             if (isMpegTsBytes(fp, bytes)) {
               return { filePath: fp, content: null as string | null, stats: null as fs.Stats | null, error: null as Error | null, skipped: true };
             }
-            const content = bytes.toString('utf-8');
+            const content = decodeSourceBytes(bytes);
             return { filePath: fp, content, stats, error: null as Error | null };
           } catch (err) {
             return { filePath: fp, content: null as string | null, stats: null as fs.Stats | null, error: err as Error };
@@ -2608,7 +2609,7 @@ export class ExtractionOrchestrator {
           // Bounded like the first read: the file may have grown since (#1910).
           const bytes = (await readBoundedSource(fullPath)).bytes;
           if (bytes === null) continue;
-          content = bytes.toString('utf8');
+          content = decodeSourceBytes(bytes);
         } catch {
           continue;
         }
@@ -2662,7 +2663,7 @@ export class ExtractionOrchestrator {
             if (!fullPath) continue;
             const bytes = (await readBoundedSource(fullPath)).bytes;
             if (bytes === null) continue;
-            fullContent = bytes.toString('utf8');
+            fullContent = decodeSourceBytes(bytes);
           } catch {
             continue;
           }
@@ -2801,7 +2802,7 @@ export class ExtractionOrchestrator {
       if (read.bytes !== null && isMpegTsBytes(relativePath, read.bytes)) {
         return { nodes: [], edges: [], unresolvedReferences: [], errors: [], durationMs: 0 };
       }
-      content = read.bytes === null ? oversizeStamp(stats.size) : read.bytes.toString('utf8');
+      content = read.bytes === null ? oversizeStamp(stats.size) : decodeSourceBytes(read.bytes);
     } catch (error) {
       return {
         nodes: [],
@@ -2943,9 +2944,8 @@ export class ExtractionOrchestrator {
     // Bulk inserts run in bounded sub-transactions with a yield between, so a
     // giant generated file (tens of thousands of symbols) can't block the
     // event loop — and the #850 watchdog heartbeat — for the whole store.
-    // That chunked path is not one atomic transaction (each insert call has
-    // its own), and the files-table record still lands last, so a
-    // partially-stored file has no record and re-indexes.
+    // The chunks share ONE transaction (the yields happen inside it, not at
+    // commits), so a crash mid-store leaves the file's previous state intact.
     const STORE_CHUNK = 2000;
     const contentHash = hashContent(content);
 
@@ -2961,8 +2961,9 @@ export class ExtractionOrchestrator {
         existingFile.nodeCount === 0 && (existingFile.errors?.length ?? 0) > 0;
       const incomingHasContent = result.nodes.length > 0;
       // A row an older engine stored while the grammar could not load
-      // (#2335) records no parse at all: any real result replaces it.
-      const existingNeverParsed = hasGrammarLoadFailure(existingFile.errors);
+      // (#2335) records no parse at all, and one whose extractor threw
+      // part-way (R-DB11) only a partial one: any fresh result replaces it.
+      const existingNeverParsed = needsReparse(existingFile.errors);
       if (!existingNeverParsed && (!existingIsMarker || !incomingHasContent)) {
         return; // No changes
       }
@@ -3056,67 +3057,74 @@ export class ExtractionOrchestrator {
       return;
     }
 
-    // Delete existing data for this file
-    if (existingFile) {
-      this.queries.deleteFile(filePath);
-    }
+    // Chunked path: same single transaction as above, but awaited so the
+    // bounded chunks can still yield to the event loop between them (#850
+    // heartbeat). Yields happen INSIDE the transaction — never at a commit — so
+    // a crash anywhere rolls back to the previous state of the file, with
+    // other files' incoming edges intact.
+    await this.queries.runInTransactionAsync(async () => {
+      // Delete existing data for this file
+      if (existingFile) {
+        this.queries.deleteFile(filePath);
+      }
 
-    // Insert nodes (chunked — see STORE_CHUNK above)
-    for (let i = 0; i < validNodes.length; i += STORE_CHUNK) {
-      this.queries.insertNodes(validNodes.slice(i, i + STORE_CHUNK));
-      await onYield?.();
-    }
-
-    // Filter edges to only reference nodes that were actually inserted
-    if (validEdges.length > 0) {
-      for (let i = 0; i < validEdges.length; i += STORE_CHUNK) {
-        this.queries.insertEdges(validEdges.slice(i, i + STORE_CHUNK));
+      // Insert nodes (chunked — see STORE_CHUNK above)
+      for (let i = 0; i < validNodes.length; i += STORE_CHUNK) {
+        this.queries.insertNodes(validNodes.slice(i, i + STORE_CHUNK));
         await onYield?.();
       }
-    }
 
-    // Re-insert cross-file incoming edges snapshotted before the delete,
-    // moving each edge's target to the re-indexed node that replaces it (see
-    // pairReindexedNodes). Node ids include the source line, so any line
-    // shift in the callee file (e.g. a docstring-only edit above the symbol)
-    // changes every target id and a naive re-insert by old id would drop them
-    // all. `insertEdges` still filters to endpoints that exist. This closes
-    // the #899 edge-drop on `sync`.
-    //
-    // Edges whose callee (target) was renamed/removed during the re-index, or
-    // can't be told apart from a same-named sibling (#2276), are not silently
-    // dropped or guessed at: each is resurrected as its ORIGINAL unresolved
-    // ref (stamped on the edge as metadata.refName/refKind at creation) so
-    // the same sync's resolution sweep can rebind it to the right definition
-    // here or an alternative one elsewhere, or park it as status='failed' to
-    // be retried when the symbol reappears — the removal-side counterpart of
-    // #1240. Edges without refName (built before the stamp existed, or
-    // synthesized) still drop silently: reconstructing a ref from the
-    // target's plain name would strip receiver/qualifier context and risk a
-    // rebind a full re-index would never make.
-    if (crossFileIncomingEdges.length > 0) {
-      this.reattachCrossFileEdges(crossFileIncomingEdges, priorNodes, validNodes);
-    }
+      // Filter edges to only reference nodes that were actually inserted
+      if (validEdges.length > 0) {
+        for (let i = 0; i < validEdges.length; i += STORE_CHUNK) {
+          this.queries.insertEdges(validEdges.slice(i, i + STORE_CHUNK));
+          await onYield?.();
+        }
+      }
 
-    // Insert unresolved references in batch with denormalized filePath/language
-    for (let i = 0; i < validRefs.length; i += STORE_CHUNK) {
-      this.queries.insertUnresolvedRefsBatch(validRefs.slice(i, i + STORE_CHUNK));
-      await onYield?.();
-    }
+      // Re-insert cross-file incoming edges snapshotted before the delete,
+      // moving each edge's target to the re-indexed node that replaces it (see
+      // pairReindexedNodes). Node ids include the source line, so any line
+      // shift in the callee file (e.g. a docstring-only edit above the symbol)
+      // changes every target id and a naive re-insert by old id would drop them
+      // all. `insertEdges` still filters to endpoints that exist. This closes
+      // the #899 edge-drop on `sync`.
+      //
+      // Edges whose callee (target) was renamed/removed during the re-index, or
+      // can't be told apart from a same-named sibling (#2276), are not silently
+      // dropped or guessed at: each is resurrected as its ORIGINAL unresolved
+      // ref (stamped on the edge as metadata.refName/refKind at creation) so
+      // the same sync's resolution sweep can rebind it to the right definition
+      // here or an alternative one elsewhere, or park it as status='failed' to
+      // be retried when the symbol reappears — the removal-side counterpart of
+      // #1240. Edges without refName (built before the stamp existed, or
+      // synthesized) still drop silently: reconstructing a ref from the
+      // target's plain name would strip receiver/qualifier context and risk a
+      // rebind a full re-index would never make.
+      if (crossFileIncomingEdges.length > 0) {
+        this.reattachCrossFileEdges(crossFileIncomingEdges, priorNodes, validNodes);
+      }
 
-    // Insert file record
-    const fileRecord: FileRecord = {
-      path: filePath,
-      contentHash,
-      language,
-      size: stats.size,
-      modifiedAt: stats.mtimeMs,
-      indexedAt: Date.now(),
-      nodeCount: result.nodes.length,
-      errors: result.errors.length > 0 ? result.errors : undefined,
-      generated,
-    };
-    this.queries.upsertFile(fileRecord);
+      // Insert unresolved references in batch with denormalized filePath/language
+      for (let i = 0; i < validRefs.length; i += STORE_CHUNK) {
+        this.queries.insertUnresolvedRefsBatch(validRefs.slice(i, i + STORE_CHUNK));
+        await onYield?.();
+      }
+
+      // Insert file record
+      const fileRecord: FileRecord = {
+        path: filePath,
+        contentHash,
+        language,
+        size: stats.size,
+        modifiedAt: stats.mtimeMs,
+        indexedAt: Date.now(),
+        nodeCount: result.nodes.length,
+        errors: result.errors.length > 0 ? result.errors : undefined,
+        generated,
+      };
+      this.queries.upsertFile(fileRecord);
+    });
   }
 
   /**
@@ -3387,17 +3395,22 @@ export class ExtractionOrchestrator {
       // Every name this file defined is about to stop existing here, which
       // narrows the candidate set for that name repo-wide (CG-33).
       for (const pair of this.queries.getNodeNamePairsByFiles([tracked.path])) pairsBefore.add(pair);
-      const incoming = this.queries.getCrossFileIncomingEdgesWithTarget(tracked.path);
-      if (incoming.length > 0) {
-        const resurrected = incoming
-          .map((e) => resurrectRefFromDroppedEdge(e))
-          .filter((r): r is UnresolvedReference => r !== null);
-        if (resurrected.length > 0) {
-          this.queries.insertUnresolvedRefsBatch(resurrected);
-        }
-      }
       onFileChange?.(tracked.path);
-      this.queries.deleteFile(tracked.path);
+      // Resurrection + delete commit together: apart, a crash between them
+      // left either duplicate refs (re-resurrected next sync) or a deleted
+      // file whose callers' edges were never turned back into refs.
+      this.queries.runInTransaction(() => {
+        const incoming = this.queries.getCrossFileIncomingEdgesWithTarget(tracked.path);
+        if (incoming.length > 0) {
+          const resurrected = incoming
+            .map((e) => resurrectRefFromDroppedEdge(e))
+            .filter((r): r is UnresolvedReference => r !== null);
+          if (resurrected.length > 0) {
+            this.queries.insertUnresolvedRefsBatch(resurrected);
+          }
+        }
+        this.queries.deleteFile(tracked.path);
+      });
       filesRemoved++;
     };
     for (const tracked of trackedFiles) {
@@ -3421,9 +3434,10 @@ export class ExtractionOrchestrator {
       const tracked = trackedMap.get(filePath);
       // A row an older engine stored while the file's grammar could not load
       // (#2335) holds no parse of these bytes: re-index it even though its
-      // size, mtime and hash all match. Rows with a real parse error are
+      // size, mtime and hash all match — as is a row whose extractor threw part-way
+      // (`incomplete`, R-DB11). Rows with an ordinary parse error are
       // deterministic and are not retried.
-      const neverParsed = tracked !== undefined && hasGrammarLoadFailure(tracked.errors);
+      const neverParsed = tracked !== undefined && needsReparse(tracked.errors);
 
       // Cheap pre-filter: an already-indexed file whose size AND mtime both match
       // the DB is unchanged — skip it without reading or hashing. (A content

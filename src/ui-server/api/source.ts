@@ -39,7 +39,7 @@ import * as path from 'path';
 import type { FileRecord } from '../../types';
 import type { CodeGraph } from '../../index';
 import { resolveProjectFile } from '../security';
-import { indexedHashInput } from '../../file-limits';
+import { indexedHashInput, readSourceTextSync } from '../../file-limits';
 import { highlightLines, type HighlightResult } from '../highlight';
 import { ApiError, badRequest, intParam, notFound, textParam } from './respond';
 
@@ -212,7 +212,7 @@ export function hasDriftedOnDisk(
     }
     // A file over the index's size limit is stored as its size stamp (#1910),
     // so it is compared as one — without reading it.
-    const hashed = indexedHashInput(stats.size, () => fs.readFileSync(absolute, 'utf-8'));
+    const hashed = indexedHashInput(stats.size, () => readSourceTextSync(absolute));
     return createHash('sha256').update(hashed).digest('hex') !== record.contentHash;
   } catch {
     return false;
@@ -251,7 +251,7 @@ export function readFileShape(
     if (stats.size > MAX_SOURCE_BYTES) {
       return { drift: false, totalLines: null, reason: 'The file is too large to read here.' };
     }
-    const content = fs.readFileSync(absolute, 'utf-8');
+    const content = readSourceTextSync(absolute);
     const hashed = indexedHashInput(stats.size, () => content);
     const drift = createHash('sha256').update(hashed).digest('hex') !== record.contentHash;
     return {
@@ -386,7 +386,7 @@ export async function buildSource(
 
   let content: string;
   try {
-    content = fs.readFileSync(absolute, 'utf-8');
+    content = readSourceTextSync(absolute);
   } catch (err) {
     throw new ApiError(
       'internal',

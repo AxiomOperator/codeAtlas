@@ -29,6 +29,24 @@ interface TraversalStep {
 }
 
 /**
+ * A traversal step written as a generator: it yields the child step it would
+ * have called recursively, and {@link runFrames} drives the steps on an
+ * explicit heap stack. Same visit order as plain recursion, but a graph of any
+ * depth cannot overflow the JS call stack.
+ */
+export type Frame = Generator<Frame, void, void>;
+
+/** Run a {@link Frame} tree depth-first on an explicit stack. */
+export function runFrames(root: Frame): void {
+  const stack: Frame[] = [root];
+  while (stack.length > 0) {
+    const step = stack[stack.length - 1]!.next();
+    if (step.done) stack.pop();
+    else stack.push(step.value);
+  }
+}
+
+/**
  * Graph traverser for BFS and DFS traversal
  */
 export class GraphTraverser {
@@ -167,7 +185,7 @@ export class GraphTraverser {
       nodes.set(startNode.id, startNode);
     }
 
-    this.dfsRecursive(startNode, 0, opts, nodes, edges, visited);
+    runFrames(this.dfsFrame(startNode, 0, opts, nodes, edges, visited));
 
     return {
       nodes,
@@ -177,16 +195,19 @@ export class GraphTraverser {
   }
 
   /**
-   * Recursive DFS helper
+   * DFS step. Written as a generator frame — each `yield` is a "recursive
+   * call" the {@link runFrames} trampoline runs on an explicit stack — so a
+   * deep graph cannot overflow the JS call stack (R-MCP10). Visit order is
+   * exactly the old recursion's.
    */
-  private dfsRecursive(
+  private *dfsFrame(
     node: Node,
     depth: number,
     opts: Required<TraversalOptions>,
     nodes: Map<string, Node>,
     edges: Edge[],
     visited: Set<string>
-  ): void {
+  ): Frame {
     if (visited.has(node.id) || nodes.size >= opts.limit || depth >= opts.maxDepth) {
       return;
     }
@@ -225,7 +246,7 @@ export class GraphTraverser {
       edges.push(edge);
 
       // Recurse
-      this.dfsRecursive(nextNode, depth + 1, opts, nodes, edges, visited);
+      yield this.dfsFrame(nextNode, depth + 1, opts, nodes, edges, visited);
     }
   }
 
@@ -280,19 +301,20 @@ export class GraphTraverser {
     const result: Array<{ node: Node; edge: Edge }> = [];
     const visited = new Map<string, number>();
 
-    this.getCallersRecursive(nodeId, maxDepth, 0, result, visited, new Set([nodeId]));
+    runFrames(this.callersFrame(nodeId, maxDepth, 0, result, visited, new Set([nodeId])));
 
     return result;
   }
 
-  private getCallersRecursive(
+  /** One getCallers step; a generator frame for {@link runFrames} (no call-stack recursion). */
+  private *callersFrame(
     nodeId: string,
     maxDepth: number,
     currentDepth: number,
     result: Array<{ node: Node; edge: Edge }>,
     visited: Map<string, number>,
     reported: Set<string>
-  ): void {
+  ): Frame {
     // Mark visited BEFORE the depth check, not after. Folding both into one
     // guard meant that when `currentDepth >= maxDepth` fired we returned without
     // marking the node — so a caller reachable from the same parent via two
@@ -323,7 +345,7 @@ export class GraphTraverser {
         reported.add(callerNode.id);
         result.push({ node: callerNode, edge });
       }
-      this.getCallersRecursive(callerNode.id, maxDepth, currentDepth + 1, result, visited, reported);
+      yield this.callersFrame(callerNode.id, maxDepth, currentDepth + 1, result, visited, reported);
     }
   }
 
@@ -338,20 +360,21 @@ export class GraphTraverser {
     const result: Array<{ node: Node; edge: Edge }> = [];
     const visited = new Map<string, number>();
 
-    this.getCalleesRecursive(nodeId, maxDepth, 0, result, visited, new Set([nodeId]));
+    runFrames(this.calleesFrame(nodeId, maxDepth, 0, result, visited, new Set([nodeId])));
 
     return result;
   }
 
-  private getCalleesRecursive(
+  /** One getCallees step; a generator frame for {@link runFrames} (no call-stack recursion). */
+  private *calleesFrame(
     nodeId: string,
     maxDepth: number,
     currentDepth: number,
     result: Array<{ node: Node; edge: Edge }>,
     visited: Map<string, number>,
     reported: Set<string>
-  ): void {
-    // Mark visited before the depth check — see getCallersRecursive: the merged
+  ): Frame {
+    // Mark visited before the depth check — see callersFrame: the merged
     // guard dropped the `visited.add` at the depth boundary, duplicating a
     // callee reached from the same node via two edges at `maxDepth=1` (#1086).
     if (!this.enterAtDepth(visited, nodeId, currentDepth)) return;
@@ -366,7 +389,7 @@ export class GraphTraverser {
     const outgoingEdges = this.queries.getOutgoingEdges(nodeId, ['calls', 'references', 'imports', 'instantiates', 'navigates']);
     if (outgoingEdges.length === 0) return;
 
-    // Batch-fetch callee nodes (was N+1 — see getCallersRecursive note).
+    // Batch-fetch callee nodes (was N+1 — see callersFrame note).
     const targetIds = outgoingEdges.map((e) => e.target);
     const calleeNodes = this.queries.getNodesByIds(targetIds);
 
@@ -377,7 +400,7 @@ export class GraphTraverser {
         reported.add(calleeNode.id);
         result.push({ node: calleeNode, edge });
       }
-      this.getCalleesRecursive(calleeNode.id, maxDepth, currentDepth + 1, result, visited, reported);
+      yield this.calleesFrame(calleeNode.id, maxDepth, currentDepth + 1, result, visited, reported);
     }
   }
 
@@ -549,7 +572,7 @@ export class GraphTraverser {
     nodes.set(focalNode.id, focalNode);
 
     // Traverse incoming edges to find all dependents
-    this.getImpactRecursive(nodeId, maxDepth, 0, nodes, edges, visited, new Set());
+    runFrames(this.impactFrame(nodeId, maxDepth, 0, nodes, edges, visited, new Set()));
 
     return {
       nodes,
@@ -558,7 +581,8 @@ export class GraphTraverser {
     };
   }
 
-  private getImpactRecursive(
+  /** One impact-radius step; a generator frame for {@link runFrames} (no call-stack recursion). */
+  private *impactFrame(
     nodeId: string,
     maxDepth: number,
     currentDepth: number,
@@ -566,7 +590,7 @@ export class GraphTraverser {
     edges: Edge[],
     visited: Map<string, number>,
     expanded: Set<string>
-  ): void {
+  ): Frame {
     // Mark visited before the depth check so a node collected at the depth
     // boundary still lands in `visited`. Otherwise it could sit in `nodes` but
     // not `visited`, and the two loops below — which used different sets to
@@ -597,7 +621,7 @@ export class GraphTraverser {
                 edges.push(edge);
               }
               // Recurse into children at the same depth (they're part of the same symbol)
-              this.getImpactRecursive(childNode.id, maxDepth, currentDepth, nodes, edges, visited, expanded);
+              yield this.impactFrame(childNode.id, maxDepth, currentDepth, nodes, edges, visited, expanded);
             }
           }
         }
@@ -623,7 +647,7 @@ export class GraphTraverser {
       if (firstExpansion) edges.push(edge);
       if (this.nearerThanBefore(visited, sourceNode.id, currentDepth + 1)) {
         nodes.set(sourceNode.id, sourceNode);
-        this.getImpactRecursive(sourceNode.id, maxDepth, currentDepth + 1, nodes, edges, visited, expanded);
+        yield this.impactFrame(sourceNode.id, maxDepth, currentDepth + 1, nodes, edges, visited, expanded);
       }
     }
   }

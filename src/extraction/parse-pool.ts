@@ -86,6 +86,15 @@ const HARD_KILL_MULTIPLIER = 3;
  */
 const GRAMMAR_LOAD_SETTLE_MS = 15_000;
 /**
+ * How long a recycled worker gets to exit by itself after it is sent
+ * `shutdown` (it collects garbage, then calls `process.exit(0)`) before the
+ * pool falls back to `terminate()`. Being terminated while V8 is marking the
+ * worker's heap can crash the whole process on Windows (0xC0000005); exiting
+ * after a full collection does not (worker-teardown.ts). A healthy worker
+ * exits in milliseconds; the cap only bounds one whose WASM is wedged.
+ */
+const RECYCLE_EXIT_GRACE_MS = 5_000;
+/**
  * Max workers cold-starting at once. A worker's cold start is heavy (module load
  * + grammar WASM compile); starting the whole pool simultaneously thrashes CPU.
  * Warming a couple at a time keeps each start fast while the pool still reaches
@@ -181,6 +190,8 @@ export interface ParseWorkerPoolOptions {
   createWorker?: () => ParsePoolWorker;
   /** How long destroy() waits on a worker still loading grammars (tests shorten it). Default 15s. */
   loadSettleMs?: number;
+  /** How long a recycled worker gets to exit by itself before it is terminated (tests shorten it). Default 5s. */
+  recycleExitGraceMs?: number;
   /** Optional verbose logger (the orchestrator's `[worker] …` logger). */
   log?: (msg: string) => void;
   /**
@@ -207,6 +218,9 @@ export class ParseWorkerPool {
   // GRAMMAR_LOAD_SETTLE_MS).
   private loads = new Map<ParsePoolWorker, { settled: Promise<void>; settle: () => void }>();
   private parseCounts = new Map<ParsePoolWorker, number>();
+  // Recycled workers sent `shutdown`, not yet exited. Each entry settles on the
+  // worker's own exit or, after recycleExitGraceMs, a fallback terminate().
+  private retiring = new Map<ParsePoolWorker, { done: Promise<void>; exited: () => void }>();
   private nextId = 1;
   private totalCrashes = 0;
   private destroyed = false;
@@ -217,6 +231,7 @@ export class ParseWorkerPool {
   private readonly parseTimeoutMs: number;
   private readonly createWorker: () => ParsePoolWorker;
   private readonly loadSettleMs: number;
+  private readonly recycleExitGraceMs: number;
   private readonly log: (msg: string) => void;
   private readonly grammarBuffers?: Record<string, Uint8Array>;
 
@@ -227,6 +242,7 @@ export class ParseWorkerPool {
     this.recycleInterval = opts.recycleInterval ?? DEFAULT_RECYCLE_INTERVAL;
     this.parseTimeoutMs = opts.parseTimeoutMs ?? DEFAULT_PARSE_TIMEOUT_MS;
     this.loadSettleMs = opts.loadSettleMs ?? GRAMMAR_LOAD_SETTLE_MS;
+    this.recycleExitGraceMs = opts.recycleExitGraceMs ?? RECYCLE_EXIT_GRACE_MS;
     this.log = opts.log ?? (() => {});
     if (opts.createWorker) {
       this.createWorker = opts.createWorker;
@@ -301,7 +317,11 @@ export class ParseWorkerPool {
     this.loads.set(w, { settled, settle });
     w.on('message', (m) => this.onMessage(w, (m ?? {}) as ParseWorkerMessage));
     w.on('error', (e) => { this.loadSettled(w); this.onWorkerGone(w, `Worker error: ${e?.message ?? 'unknown'}`); });
-    w.on('exit', (code) => { this.loadSettled(w); if (code !== 0) this.onWorkerGone(w, `Worker exited with code ${code}`); });
+    w.on('exit', (code) => {
+      this.loadSettled(w);
+      this.retiring.get(w)?.exited();
+      if (code !== 0) this.onWorkerGone(w, `Worker exited with code ${code}`);
+    });
     // Load grammars; the worker replies 'grammars-loaded' and only then is idle.
     // Pre-read WASM bytes (when the orchestrator provided them) make this a
     // memory load instead of a per-spawn disk read.
@@ -363,14 +383,51 @@ export class ParseWorkerPool {
     this.drain();
   }
 
-  /** Tear down a worker that has hit its recycle threshold and replace it. Not a
-   *  crash, so it doesn't count against the budget. */
+  /** Retire a worker that has hit its recycle threshold and replace it. Not a
+   *  crash, so it doesn't count against the budget. Only ever called on a
+   *  loaded, idle worker (no parse in flight). */
   private recycle(w: ParsePoolWorker): void {
     this.log(`Recycling worker after ${this.parseCounts.get(w)} parses (heap: ${Math.round(process.memoryUsage().rss / 1024 / 1024)}MB RSS)`);
     this.removeWorker(w);
-    // Fire-and-forget: worker.terminate() can hang if WASM is wedged.
-    try { void w.terminate(); } catch { /* already gone */ }
+    this.retire(w);
     if (this.healthy && !this.destroyed) this.spawnOne();
+  }
+
+  /**
+   * Ask a loaded, idle worker to end itself: it collects garbage and calls
+   * `process.exit(0)` (parse-worker's `shutdown` handler), which — unlike
+   * `terminate()` — cannot catch V8 mid-marking (worker-teardown.ts). Only a
+   * worker that hasn't exited after `recycleExitGraceMs` is terminated. Never
+   * awaited by the caller: the replacement is spawned at once, and a wedged
+   * worker's terminate() can itself hang.
+   */
+  private retire(w: ParsePoolWorker): void {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let finish!: () => void;
+    const done = new Promise<void>((resolve) => { finish = resolve; });
+    const end = (): void => {
+      clearTimeout(timer);
+      if (this.retiring.get(w)?.done === done) this.retiring.delete(w);
+      finish();
+    };
+    const fallback = (): void => {
+      if (!this.retiring.has(w)) return;
+      this.log('Recycled worker did not exit by itself — terminating it');
+      try {
+        void Promise.resolve(w.terminate()).catch(() => { /* already gone */ }).finally(end);
+      } catch {
+        end();
+      }
+    };
+    this.retiring.set(w, { done, exited: end });
+    timer = setTimeout(fallback, this.recycleExitGraceMs);
+    timer.unref?.();
+    try {
+      w.postMessage({ type: 'shutdown' });
+    } catch {
+      clearTimeout(timer);
+      fallback(); // can't reach it — fall back now
+    }
   }
 
   /** The worker's grammar load is over: it reported ready, errored or exited. */
@@ -519,6 +576,11 @@ export class ParseWorkerPool {
     }
     this.inflight.clear();
     this.queue = [];
-    await Promise.all(ws.map((w) => this.terminateSettled(w)));
+    await Promise.all([
+      ...ws.map((w) => this.terminateSettled(w)),
+      // Recycled workers still on their way out: their own exit, or the
+      // fallback terminate, settles each.
+      ...[...this.retiring.values()].map((r) => r.done),
+    ]);
   }
 }

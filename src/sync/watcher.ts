@@ -231,6 +231,20 @@ export class LockUnavailableError extends Error {
 }
 
 /**
+ * Project config files the reference resolver reads (see
+ * `ReferenceResolver.invalidateConfigCaches`). Edits to these change how
+ * already-indexed imports resolve, though none of them is a source file.
+ */
+export function isResolutionConfigFile(rel: string): boolean {
+  const base = rel.slice(rel.lastIndexOf('/') + 1);
+  return /^(?:tsconfig|jsconfig)(?:\.[\w-]+)?\.json$/.test(base) ||
+    base === 'package.json' ||
+    base === 'pnpm-workspace.yaml' ||
+    base === 'go.mod' ||
+    base === 'compile_commands.json';
+}
+
+/**
  * Per-file pending entry — tracks a source file the watcher saw an event for
  * but hasn't yet synced into the index. Exposed via {@link FileWatcher.getPendingFiles}
  * so MCP tool responses can mark stale results without forcing a wait.
@@ -320,14 +334,17 @@ export class FileWatcher {
    * same project-relative POSIX path the rest of the codebase uses, so a
    * caller can intersect tool-response file paths against this map cheaply.
    */
-  private pendingFiles = new Map<string, { firstSeenMs: number; lastSeenMs: number }>();
+  private pendingFiles = new Map<string, { firstSeenMs: number; lastSeenMs: number; seq: number }>();
   /**
-   * Wall-clock ms at which the in-flight sync began. Combined with
-   * {@link pendingFiles}'s `lastSeenMs`, this distinguishes "still in the
-   * debounce window" (lastSeen > syncStarted, sync hasn't started yet for
-   * this edit) from "currently being indexed" (lastSeen <= syncStarted).
+   * Monotonic event counter. Each recorded change takes the next value; a
+   * sync snapshots it at start (`syncStartSeq`) and on success clears only
+   * entries with `seq <= syncStartSeq`. Wall-clock ms alone cannot order an
+   * edit that lands in the same millisecond the sync started — the old
+   * `lastSeenMs <= syncStartedMs` test cleared such an edit although the sync may never have read
+   * it (R-18).
    */
-  private syncStartedMs = 0;
+  private eventSeq = 0;
+  private syncStartSeq = 0;
   private syncing = false;
   private stopped = false;
   /**
@@ -651,6 +668,16 @@ export class FileWatcher {
       return;
     }
     if (!isSourceFile(rel, loadExtensionOverrides(this.projectRoot))) {
+      if (isResolutionConfigFile(rel)) {
+        // tsconfig/jsconfig `paths`, a workspace package.json, go.mod or a
+        // compile_commands.json changes how EXISTING imports resolve. A full
+        // reconcile lets CodeGraph.sync compare the parsed config against the
+        // stored fingerprint and re-extract the affected files (R-RES1).
+        logDebug('Resolution config changed; scheduling full sync', { file: rel });
+        this.needsFullScan = true;
+        this.scheduleSync();
+        return;
+      }
       this.maybeScheduleForRemovedDir(rel);
       return;
     }
@@ -676,6 +703,7 @@ export class FileWatcher {
       this.pendingFiles.set(rel, {
         firstSeenMs: existing?.firstSeenMs ?? now,
         lastSeenMs: now,
+        seq: ++this.eventSeq,
       });
     }
     this.scheduleSync();
@@ -987,7 +1015,7 @@ export class FileWatcher {
    *
    * pendingFiles is NOT cleared at the start of sync — entries are removed
    * only after sync commits successfully, and only for entries whose
-   * lastSeenMs <= syncStartedMs. That way, a query that arrives mid-sync
+   * seq <= syncStartSeq (recorded before the sync began). That way, a query that arrives mid-sync
    * still sees the affected files marked stale (the DB hasn't been updated
    * yet), and an event that lands mid-sync persists into the follow-up.
    *
@@ -998,7 +1026,7 @@ export class FileWatcher {
     // If already syncing, the post-sync check will re-trigger
     if (this.syncing || this.stopped) return;
 
-    this.syncStartedMs = Date.now();
+    this.syncStartSeq = this.eventSeq;
     this.syncing = true;
 
     // Scoped fast path: when every pending change is a known file event, hand
@@ -1023,14 +1051,14 @@ export class FileWatcher {
       this.lockRetryCount = 0; // a clean sync clears any contention backoff
       this.syncFailureRetryCount = 0; // ...and any generic-failure backoff
       // Remove entries whose most recent event predates this sync — those
-      // edits are now in the DB. Entries with lastSeenMs > syncStartedMs
+      // edits are now in the DB. Entries with seq > syncStartSeq
       // arrived mid-sync; whether the in-flight sync captured them depends
       // on when sync read that file, so we keep them as pending and let
       // the follow-up sync handle them. We prefer false positives ("shown
       // stale, actually fresh" → at worst one extra Read) over false
       // negatives ("shown fresh, actually stale" → misleads the agent).
       for (const [filePath, info] of this.pendingFiles) {
-        if (info.lastSeenMs <= this.syncStartedMs) {
+        if (info.seq <= this.syncStartSeq) {
           this.pendingFiles.delete(filePath);
         }
       }
@@ -1135,7 +1163,7 @@ export class FileWatcher {
         path: filePath,
         firstSeenMs: info.firstSeenMs,
         lastSeenMs: info.lastSeenMs,
-        indexing: this.syncing && this.syncStartedMs >= info.lastSeenMs,
+        indexing: this.syncing && info.seq <= this.syncStartSeq,
       });
     }
     return result;

@@ -32,6 +32,17 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Opening a project after an interrupted index no longer repeats the same slow repair on every start: the repair is skipped while another process is still indexing, runs in the background so the server stays responsive, and keeps what it finished if it is stopped partway. (#1887)
+- A first index that was killed partway is detected on the next start and rebuilt cleanly, instead of risking a damaged index file.
+- Background workers now shut down by finishing on their own instead of being stopped from outside, which avoids a rare crash on Windows during long indexes.
+- Re-storing a very large file is now all-or-nothing, so a crash partway through can no longer drop the links other files had into it, and removing a file can no longer leave stray references behind.
+- A disk-full or I/O error during a write is now reported as itself instead of as a confusing "no transaction is active" error.
+- Replacing a symbol in the index no longer leaves stale entries behind in the search index.
+- Editing `tsconfig.json` paths, `package.json` workspaces, `go.mod` or `compile_commands.json` now takes effect on the next sync, without restarting your agent session.
+- Files saved as UTF-16 or with a byte-order mark are now indexed correctly and no longer show as permanently out of date.
+- A file whose parse failed partway is retried on the next sync instead of being kept with only some of its symbols, and a language parser that fails to load once is retried before being given up on.
+- An edit saved in the same instant a sync started is no longer missed.
+- Very deep call chains no longer crash callers, callees, impact or circular-dependency queries, and long-running servers keep their memory bounded.
 - If you said no to the Claude Code front-load prompt hook when installing, `codegraph upgrade` no longer turns it back on.
 - `codegraph upgrade` on a standalone install no longer reports success when downloading the installer failed.
 - `codegraph upgrade` now warns when a `CODEGRAPH_VERSION` left in your environment is pinning it to an old release.

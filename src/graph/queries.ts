@@ -228,35 +228,42 @@ export class GraphQueryManager {
     const cycles: string[][] = [];
     const visited = new Set<string>();
     const recursionStack = new Set<string>();
+    // Iterative DFS (R-MCP10): the recursive version copied the whole path
+    // array at every step (O(depth²)) and could overflow the call stack on a
+    // long import chain. `path` is the shared current DFS path; visit order and
+    // the reported cycles are the same as the recursive walk's.
+    const path: string[] = [];
 
-    const dfs = (filePath: string, path: string[]): void => {
-      if (recursionStack.has(filePath)) {
-        // Found a cycle
-        const cycleStart = path.indexOf(filePath);
-        if (cycleStart !== -1) {
-          cycles.push(path.slice(cycleStart));
+    const dfs = (start: string): void => {
+      visited.add(start);
+      recursionStack.add(start);
+      path.push(start);
+      const stack: Array<{ deps: string[]; i: number }> = [{ deps: this.getFileDependencies(start), i: 0 }];
+      while (stack.length > 0) {
+        const frame = stack[stack.length - 1]!;
+        if (frame.i >= frame.deps.length) {
+          stack.pop();
+          recursionStack.delete(path.pop()!);
+          continue;
         }
-        return;
+        const dep = frame.deps[frame.i++]!;
+        if (recursionStack.has(dep)) {
+          // Found a cycle
+          const cycleStart = path.indexOf(dep);
+          if (cycleStart !== -1) cycles.push(path.slice(cycleStart));
+          continue;
+        }
+        if (visited.has(dep)) continue;
+        visited.add(dep);
+        recursionStack.add(dep);
+        path.push(dep);
+        stack.push({ deps: this.getFileDependencies(dep), i: 0 });
       }
-
-      if (visited.has(filePath)) {
-        return;
-      }
-
-      visited.add(filePath);
-      recursionStack.add(filePath);
-
-      const dependencies = this.getFileDependencies(filePath);
-      for (const dep of dependencies) {
-        dfs(dep, [...path, filePath]);
-      }
-
-      recursionStack.delete(filePath);
     };
 
     for (const file of files) {
       if (!visited.has(file.path)) {
-        dfs(file.path, []);
+        dfs(file.path);
       }
     }
 

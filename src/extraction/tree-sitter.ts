@@ -706,11 +706,15 @@ export class TreeSitterExtractor {
         throw error;
       }
 
+      // Whatever visitNode collected before the throw is a partial parse:
+      // flag it so the next sync re-parses this file rather than trusting
+      // the stored result under the file's content hash (R-DB11).
       this.errors.push({
         message: `Parse error: ${msg}`,
         filePath: this.filePath,
         severity: 'error',
         code: 'parse_error',
+        incomplete: true,
       });
     } finally {
       // Free tree-sitter WASM memory immediately — trees hold native heap memory

@@ -98,3 +98,70 @@ export function collectBeforeExit(): boolean {
     return false;
   }
 }
+
+/**
+ * In a worker: collect garbage, then exit with `code` — the only safe way for
+ * a worker to end itself (see the table above). `deps` exists for tests.
+ */
+export function exitAfterCollect(
+  code: number,
+  deps: { collect?: () => unknown; exit?: (code: number) => void } = {}
+): void {
+  (deps.collect ?? collectBeforeExit)();
+  (deps.exit ?? ((c: number) => process.exit(c)))(code);
+}
+
+/**
+ * The same full collection as {@link collectBeforeExit}, as source text for a
+ * worker created with `{ eval: true }` (which cannot require this module).
+ * Defines `__collectBeforeExit()`; never throws.
+ */
+export const COLLECT_BEFORE_EXIT_SOURCE = `
+function __collectBeforeExit() {
+  try {
+    const v8 = require('node:v8');
+    v8.setFlagsFromString('--expose-gc');
+    let gc;
+    try { gc = require('node:vm').runInNewContext('gc'); }
+    finally { v8.setFlagsFromString('--no-expose-gc'); }
+    gc();
+    return true;
+  } catch { return false; }
+}
+`;
+
+/**
+ * Longest an owner waits for a worker that has finished its work to exit by
+ * itself before terminating it. A worker that collects and exits takes a few
+ * milliseconds to tens of milliseconds; the cap only bounds a wedged one.
+ */
+export const WORKER_EXIT_GRACE_MS = 5_000;
+
+/**
+ * Settles once `worker` has exited by itself, or — if it hasn't within
+ * `graceMs` — after terminating it. Resolves `true` when the worker exited on
+ * its own, `false` when the fallback terminate was needed. Never rejects.
+ * Call it once the worker has started (it has posted a message), never while
+ * it is still loading.
+ */
+export function awaitExitOrTerminate(
+  worker: Pick<Worker, 'terminate' | 'once' | 'off'>,
+  graceMs = WORKER_EXIT_GRACE_MS
+): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let timer: NodeJS.Timeout | undefined;
+    const onExit = (): void => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    worker.once('exit', onExit);
+    timer = setTimeout(() => {
+      worker.off('exit', onExit);
+      Promise.resolve()
+        .then(() => worker.terminate())
+        .catch(() => { /* already gone */ })
+        .then(() => resolve(false));
+    }, graceMs);
+    timer.unref?.();
+  });
+}
