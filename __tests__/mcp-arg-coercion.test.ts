@@ -178,13 +178,19 @@ describe('ToolHandler — coercion, guidance and projectPath', () => {
   });
 
   it('projectPath naming a FILE resolves from its parent directory', async () => {
-    const res = await new ToolHandler(null).execute('codegraph_search', {
-      query: 'alpha',
-      projectPath: path.join(dir, 'src', 'a.ts'),
-    });
-    expect(text(res)).not.toMatch(/not a directory/);
-    expect(res.isError).toBeFalsy();
-    expect(text(res)).toMatch(/alpha/);
+    const other = new ToolHandler(null);
+    try {
+      const res = await other.execute('codegraph_search', {
+        query: 'alpha',
+        projectPath: path.join(dir, 'src', 'a.ts'),
+      });
+      expect(text(res)).not.toMatch(/not a directory/);
+      expect(res.isError).toBeFalsy();
+      expect(text(res)).toMatch(/alpha/);
+    } finally {
+      // Release the project it opened, or Windows can't delete the temp dir.
+      await other.closeAll();
+    }
   });
 });
 

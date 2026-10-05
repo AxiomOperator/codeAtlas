@@ -211,6 +211,11 @@ export function worktreeMismatchNotice(m: WorktreeIndexMismatch): string {
 /** Resolve symlinks where possible so tmp/realpath quirks don't break equality. */
 function realpath(p: string): string {
   try {
+    // On Windows the JS realpath keeps 8.3 short names (`RUNNER~1`) while git
+    // reports long ones (`runneradmin`), so the same directory compared
+    // unequal and worktree detection silently never fired. The native call
+    // expands them; both sides of every comparison go through here.
+    if (process.platform === 'win32') return fs.realpathSync.native(path.resolve(p));
     return fs.realpathSync(path.resolve(p));
   } catch {
     return path.resolve(p);
