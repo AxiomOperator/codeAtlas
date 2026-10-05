@@ -31,3 +31,6 @@ Language support is automatic from the file extension — there's nothing to con
 | Lua | `.lua` | Full support (functions, methods, locals, `require` imports, call edges) |
 | R | `.R`, `.r` | Full support (functions, S4/R5/R6 classes with methods, `library`/`require` imports, `source()` file references, call edges) |
 | Luau | `.luau` | Full support (Lua, plus typed signatures, `type` aliases, Roblox `require`) |
+| Bash / Shell | `.sh`, `.bash`, `.zsh` | Full support (functions, top-level variables and exports, `source`/`.` file references, call edges, `trap` and zsh hook handlers; extensionless scripts aren't detected by shebang yet) |
+| Elixir | `.ex`, `.exs` | Full support (modules, multi-clause functions, macros, protocols/impls, structs, `alias`-aware remote calls, `import`/`use` edges, ExUnit tests) |
+| Zig | `.zig` | Full support (functions, structs/enums/unions with methods and fields, generic type functions, `test` blocks, `@import` edges, calls through imports and typed receivers) |

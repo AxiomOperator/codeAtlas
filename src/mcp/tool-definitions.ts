@@ -6,6 +6,7 @@
 
 import type { AnswerFile } from './answer-freshness';
 import type { ExploreEmission } from './explore-session-state';
+import type { StructuredOutput } from './structured-output';
 
 /**
  * MCP Tool definition
@@ -81,6 +82,8 @@ export interface ToolResult {
   _cgExploreEmission?: ExploreEmission;
   /** Internal structured provenance, preserved by query workers and stripped by execute. */
   _cgAnswerFiles?: AnswerFile[];
+  /** Internal structured (JSON) payload for the CLI's --json; stripped by execute for every other caller. */
+  _cgStructured?: StructuredOutput;
 }
 
 /**
@@ -138,6 +141,10 @@ export const tools: ToolDefinition[] = [
           type: 'number',
           description: 'Maximum results (default: 10)',
           default: 10,
+        },
+        path: {
+          type: 'string',
+          description: 'Optional: only search files under this path (substring like "src/api", or a glob like "packages/*/src/**")',
         },
         projectPath: projectPathProperty,
       },
@@ -276,6 +283,10 @@ export const tools: ToolDefinition[] = [
           type: 'number',
           description: 'Maximum number of files to include source code from (default: 12)',
           default: 12,
+        },
+        maxChars: {
+          type: 'number',
+          description: 'Optional cap on the response size in characters. Omit it for the default (sized to the project). Only lowers the default, never raises it; values below 2000 are treated as 2000.',
         },
         projectPath: projectPathProperty,
       },

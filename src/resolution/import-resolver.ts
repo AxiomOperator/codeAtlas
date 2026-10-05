@@ -13,6 +13,8 @@ import { extractLocalExportAliases } from './alias-binding';
 import { resolveWorkspaceImport } from './workspace-packages';
 import { stripCommentsForRegex } from './strip-comments';
 import { contextGoModules, goImportPackageDir } from './go-module';
+import { bashLiteralTail } from '../extraction/languages/bash';
+import { extractZigImports } from './zig';
 import {
   resolveMethodOnType,
   resolveObjectLiteralMember,
@@ -896,6 +898,64 @@ export function isCobolCopybookRef(ref: UnresolvedRef): boolean {
 }
 
 /**
+ * Is this a shell `source FILE` / `. FILE` reference? It names a FILE, so it
+ * resolves through resolveBashSourcePath or not at all — never to a symbol.
+ */
+export function isBashSourceRef(ref: UnresolvedRef): boolean {
+  return ref.language === 'bash' && ref.referenceKind === 'imports';
+}
+
+/**
+ * Resolve the path a shell script sources to a project-relative file.
+ *
+ * Scripts locate their libraries three ways, tried in this order:
+ *   1. a literal path, relative to the sourcing script (`. ./lib.sh`) or to
+ *      the project root the script is run from (`source scripts/lib.sh`);
+ *   2. a script-dir prefix — `$(dirname "$0")/lib.sh`, `${BASH_SOURCE%/*}/x.sh`,
+ *      `"$DIR/x.sh"` — whose literal tail is tried against the script's own
+ *      directory and the root;
+ *   3. failing both, the ONE project file whose path ends with that tail
+ *      (`$NVM_DIR/nvm.sh` → `nvm.sh`). An ambiguous tail stays unresolved: a
+ *      wrong file edge is worse than none.
+ * `~` and absolute paths are outside the project.
+ */
+export function resolveBashSourcePath(
+  spec: string,
+  fromFile: string,
+  context: ResolutionContext
+): { path: string; exact: boolean } | null {
+  if (spec.startsWith('~') || spec.startsWith('/')) return null;
+  const tail = bashLiteralTail(spec);
+  if (tail === null) return null;
+  const dynamic = tail !== spec;
+  const rel = dynamic ? tail.replace(/^\/+/, '') : tail;
+  if (!rel || rel.endsWith('/')) return null;
+
+  const projectRoot = context.getProjectRoot();
+  const fromDir = path.dirname(path.join(projectRoot, fromFile));
+  for (const base of [fromDir, projectRoot]) {
+    const candidate = path.relative(projectRoot, path.resolve(base, rel)).replace(/\\/g, '/');
+    if (candidate && !candidate.startsWith('..') && context.fileExists(candidate)) {
+      return { path: candidate, exact: true };
+    }
+  }
+
+  // Unique-suffix fallback. `getNodesByName` is the name index the resolver
+  // already keeps hot, so this costs one lookup, not a file-system walk. A
+  // bare file name is too weak a signal — `${fzf_base}/key-bindings.zsh` is
+  // fzf's install dir, not whichever project file shares the name — so the
+  // tail must carry a directory too (`dnsapi/dns_ali.sh`).
+  const suffix = rel.replace(/^(?:\.\.?\/)+/, '');
+  if (!suffix.includes('/')) return null;
+  const basename = suffix.split('/').pop();
+  if (!basename) return null;
+  const matches = context
+    .getNodesByName(basename)
+    .filter((n) => n.kind === 'file' && (n.filePath === suffix || n.filePath.endsWith('/' + suffix)));
+  return matches.length === 1 ? { path: matches[0]!.filePath, exact: false } : null;
+}
+
+/**
  * Resolve a PHP include/require path to a project-relative file path.
  *
  * PHP resolves includes relative to the including file's directory (the
@@ -952,6 +1012,8 @@ export function extractImportMappings(
     mappings.push(...extractPHPImports(content));
   } else if (language === 'c' || language === 'cpp') {
     mappings.push(...extractCppImports(content));
+  } else if (language === 'zig') {
+    mappings.push(...extractZigImports(content));
   }
 
   return mappings;
@@ -1719,6 +1781,24 @@ export function resolveViaImport(
     // name-matcher, which would mis-connect e.g. "inc/db.php" to an unrelated
     // db.php elsewhere in the tree — a wrong edge is worse than a missing one.
     return null;
+  }
+
+  // Shell `source` / `.` paths resolve to file nodes only (see
+  // resolveBashSourcePath); an unplaceable path stays unresolved.
+  if (isBashSourceRef(ref)) {
+    const resolved = resolveBashSourcePath(ref.referenceName, ref.filePath, context);
+    if (!resolved) return null;
+    const basename = resolved.path.split('/').pop()!;
+    const fileNode = context
+      .getNodesByName(basename)
+      .find((n) => n.kind === 'file' && n.filePath === resolved.path);
+    if (!fileNode) return null;
+    return {
+      original: ref,
+      targetNodeId: fileNode.id,
+      confidence: resolved.exact ? 0.9 : 0.7,
+      resolvedBy: 'import',
+    };
   }
 
   // Nix static project-path imports (`import ./x.nix`, `builtins.import ./dir`,

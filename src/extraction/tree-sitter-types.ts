@@ -10,6 +10,7 @@ import { Node as SyntaxNode } from 'web-tree-sitter';
 import {
   Node,
   NodeKind,
+  ReferenceKind,
   UnresolvedReference,
 } from '../types';
 
@@ -312,6 +313,15 @@ export interface LanguageExtractor {
    * Returns the callee name if this node is a bare call, or undefined if not.
    */
   extractBareCall?: (node: SyntaxNode, source: string) => string | undefined;
+
+  /**
+   * Own call-site reference extraction entirely. When set, every `callTypes`
+   * node is handed here instead of the core's generic call heuristics, and the
+   * returned refs are emitted from the enclosing symbol as-is. Used by
+   * languages whose call syntax the generic receiver/member logic would
+   * misread (Elixir `Mod.fun` alias expansion, Zig import-bound receivers).
+   */
+  callRefs?: (node: SyntaxNode, source: string) => Array<{ name: string; kind: ReferenceKind }>;
 
   /**
    * Node types representing a file-level package/namespace declaration

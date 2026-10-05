@@ -493,6 +493,52 @@
       "question": "How does a PUBLISH packet from an MQTT client reach the sessions of matching subscribers? Trace the flow from the connection/channel layer through the broker's routing to session delivery."
     }
   ],
+  "Elixir": [
+    {
+      "name": "plug",
+      "repo": "https://github.com/elixir-plug/plug",
+      "size": "Small",
+      "files": "~80",
+      "question": "How does a request flow through a Plug.Router pipeline — from the router's call/2 through match and dispatch to the matched route's body? Trace the path through Plug.Router and Plug.Builder."
+    },
+    {
+      "name": "phoenix",
+      "repo": "https://github.com/phoenixframework/phoenix",
+      "size": "Medium",
+      "files": "~210",
+      "question": "When a client joins a channel over a websocket, how does the join message get from Phoenix.Socket to the channel module's join/3 callback? Trace the path through the socket and channel server."
+    },
+    {
+      "name": "elixir",
+      "repo": "https://github.com/elixir-lang/elixir",
+      "size": "Large",
+      "files": "~570",
+      "question": "How does `mix test` start ExUnit and run a test module's tests? Trace the path from Mix.Tasks.Test through ExUnit's runner to the test function."
+    }
+  ],
+  "Zig": [
+    {
+      "name": "zig-clap",
+      "repo": "https://github.com/Hejsil/zig-clap",
+      "size": "Small",
+      "files": "~12",
+      "question": "How does clap.parse turn command-line arguments into a parsed result? Trace the path through the streaming parser and the value parsers."
+    },
+    {
+      "name": "zls",
+      "repo": "https://github.com/zigtools/zls",
+      "size": "Medium",
+      "files": "~90",
+      "question": "How does a textDocument/hover request reach the analyser that resolves the hovered symbol's type? Trace the path from the server's request dispatch through the hover feature to the analysis code."
+    },
+    {
+      "name": "tigerbeetle",
+      "repo": "https://github.com/tigerbeetle/tigerbeetle",
+      "size": "Large",
+      "files": "~240 .zig",
+      "question": "How does a create_transfers request from a client reach the state machine that applies it? Trace the path through the replica's commit pipeline to the state machine's execute."
+    }
+  ],
   "Solidity": [
     {
       "name": "solmate",
@@ -606,6 +652,29 @@
       "size": "Large",
       "files": "~3390",
       "question": "How does programs.git.enable produce the final git config file in the user's home directory? Trace the flow from the git program module to the home-files machinery that links generated files into place."
+    }
+  ],
+  "Bash": [
+    {
+      "name": "nvm",
+      "repo": "https://github.com/nvm-sh/nvm",
+      "size": "Small",
+      "files": "~6",
+      "question": "When a user runs `nvm install 20`, how is the version string resolved to a concrete remote version and downloaded? Trace the flow from the nvm install command through version resolution to the download helper."
+    },
+    {
+      "name": "ohmyzsh",
+      "repo": "https://github.com/ohmyzsh/ohmyzsh",
+      "size": "Medium",
+      "files": "~402",
+      "question": "How does the web-search plugin turn `google foo bar` into an opened browser URL? Trace the flow from the alias to the URL encoding helper and the command that opens the browser."
+    },
+    {
+      "name": "acme.sh",
+      "repo": "https://github.com/acmesh-official/acme.sh",
+      "size": "Large",
+      "files": "~287",
+      "question": "During a DNS-01 issuance with the Cloudflare DNS API, how does acme.sh add the TXT record? Trace the flow from the issue command to the dns_cf_add hook and the HTTP request helper it uses."
     }
   ]
 }

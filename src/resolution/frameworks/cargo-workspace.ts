@@ -14,7 +14,8 @@ const GLOB_CHARS = /[*?[\]{}!]/;
 const SKIP_DIRS = new Set(['target', 'node_modules', '.git', 'dist', 'build']);
 const MAX_GLOB_WALK_DEPTH = 5;
 
-function getSection(content: string, sectionName: string): string | null {
+/** Body of a top-level `[sectionName]` TOML table (up to the next table header), or null. */
+export function getSection(content: string, sectionName: string): string | null {
   const lines = content.split('\n');
   let inSection = false;
   const sectionLines: string[] = [];

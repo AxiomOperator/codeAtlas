@@ -89,10 +89,12 @@ import { resolve as resolvePath } from 'path';
 // imports them from.
 export { normalizeQuerySpelling } from './explore-query';
 import { filesDefiningSymbol, normalizeQuerySpelling, pathIsProjectFile } from './explore-query';
-export { getExploreBudget, getExploreOutputBudget } from './explore-budget';
+export { getExploreBudget, getExploreOutputBudget, exploreCharCap, EXPLORE_MIN_CHAR_CAP } from './explore-budget';
 export type { ExploreOutputBudget } from './explore-budget';
 import {
   type ExploreOutputBudget,
+  applyExploreCharCap,
+  exploreCharCap,
   getExploreBudget,
   getExploreOutputBudget,
 } from './explore-budget';
@@ -171,11 +173,15 @@ export {
   formatRecoveringBanner,
 } from './response-decorators';
 import {
+  describeIndexBuild,
   formatDegradedBanner,
+  formatIndexVersionNotice,
   formatRecoveringBanner,
   formatStaleBanner,
   formatStaleFooter,
 } from './response-decorators';
+// A dependency-free constant module — does not pull extraction onto the MCP path.
+import { EXTRACTION_VERSION } from '../extraction/extraction-version';
 export { tools, getStaticTools } from './tool-definitions';
 export type { ToolDefinition, ToolAnnotations, ToolResult } from './tool-definitions';
 import {
@@ -187,7 +193,18 @@ import {
 } from './tool-definitions';
 export { coerceToolArgs } from './tool-args';
 import { coerceToolArgs, describeArgValue } from './tool-args';
-import { buildBlastRadiusSection, buildFlowFromNamedSymbols, formatTrail } from './explore-sections';
+import { buildBlastRadiusSection, buildFlowFromNamedSymbols, computeBlastRadius, formatTrail } from './explore-sections';
+import {
+  STRUCTURED_ARG,
+  STRUCTURED_RESULT_KEY,
+  STRUCTURED_SCHEMA_VERSION,
+  blastRadiusJson,
+  flowJson,
+  symbolJson,
+  type ExploreFileJson,
+  type NodeJson,
+  type NodeSymbolJson,
+} from './structured-output';
 import { computeGraphRelevance } from './explore-allocation';
 import {
   buildContainerOutline,
@@ -238,6 +255,14 @@ const CONTAINER_NODE_KINDS = new Set<NodeKind>([
  * Supports cross-project queries via the projectPath parameter.
  * Other projects are opened on-demand and cached for performance.
  */
+/** Per-call options for {@link ToolHandler.execute}. */
+export interface ExecuteOptions {
+  /** Build the structured (JSON) payload the CLI's `--json` prints (#1280). */
+  structured?: boolean;
+  /** Set false to suppress the stale-extraction-version notice (#1852), e.g. for the prompt hook. */
+  indexVersionNotice?: boolean;
+}
+
 export class ToolHandler {
   // Project resolution + lifetime (default project, explicit-projectPath
   // cache, catch-up gates, memoized git checks) — see ProjectRegistry.
@@ -484,12 +509,49 @@ export class ToolHandler {
     const mismatch = this.projects.worktreeMismatchFor(projectPath);
     if (!mismatch) return result;
 
-    const notice = worktreeMismatchNotice(mismatch);
+    return this.prefixNotice(result, worktreeMismatchNotice(mismatch));
+  }
+
+  /** Prepend a notice to a result's text (and to its structured notices, if any). */
+  private prefixNotice(result: ToolResult, notice: string): ToolResult {
     const [first, ...rest] = result.content;
-    if (first && first.type === 'text') {
-      return { ...result, content: [{ type: 'text', text: `${notice}\n\n${first.text}` }, ...rest] };
+    if (!first || first.type !== 'text') return result;
+    const structured = result[STRUCTURED_RESULT_KEY];
+    if (structured) structured.notices = [notice, ...structured.notices];
+    return { ...result, content: [{ type: 'text', text: `${notice}\n\n${first.text}` }, ...rest] };
+  }
+
+  /**
+   * Once per session per project (#1852): when the project's index was built
+   * by an older extraction engine than this one, prefix a compact notice
+   * telling the user to run `codegraph index`. The answer is still served —
+   * never blocked, never `isError`. Purely local (two metadata reads).
+   *
+   * With no session state (one-shot CLI calls) every call is its own session,
+   * so the notice shows each time. `codegraph_status` never comes through
+   * here; it always reports the build details itself.
+   */
+  private withIndexVersionNotice(
+    result: ToolResult,
+    project: CodeGraph,
+    sessionState: ExploreSessionState | undefined,
+  ): ToolResult {
+    if (result.isError) return result;
+    let stale = false;
+    let root = '';
+    let info: { version: string | null; extractionVersion: number | null } = { version: null, extractionVersion: null };
+    try {
+      stale = project.isIndexStale?.() ?? false;
+      if (stale) {
+        root = project.getProjectRoot();
+        info = project.getIndexBuildInfo();
+      }
+    } catch {
+      return result; // a bookkeeping read must never fail a served answer
     }
-    return result;
+    if (!stale) return result;
+    if (sessionState && !sessionState.claimNotice('index-version', root)) return result;
+    return this.prefixNotice(result, formatIndexVersionNotice(info, EXTRACTION_VERSION, root));
   }
 
   /**
@@ -684,6 +746,20 @@ export class ToolHandler {
     toolName: string,
     rawArgs: unknown,
     sessionState?: ExploreSessionState,
+    options: ExecuteOptions = {},
+  ): Promise<ToolResult> {
+    const result = await this.executeInner(toolName, rawArgs, sessionState, options);
+    // The structured payload (#1280) is for the CLI's --json only; nothing else
+    // — least of all an MCP client — ever sees it.
+    if (!options.structured) delete result[STRUCTURED_RESULT_KEY];
+    return result;
+  }
+
+  private async executeInner(
+    toolName: string,
+    rawArgs: unknown,
+    sessionState: ExploreSessionState | undefined,
+    options: ExecuteOptions,
   ): Promise<ToolResult> {
     if (this.projects.closing) return this.textResult('This MCP session is closing; retry with a connected session.');
     this.projects.activeCalls++;
@@ -698,6 +774,9 @@ export class ToolHandler {
       // handler. Throws ToolInputError (→ success-shaped guidance) only for an
       // enum value it can't map.
       const args = coerceToolArgs(toolName, rawArgs);
+      // The structured-output switch is internal: never honored from the wire.
+      delete args[STRUCTURED_ARG];
+      if (options.structured) args[STRUCTURED_ARG] = true;
       // Block the first tool call on the engine's post-open reconcile so we
       // never serve rows for files deleted/edited while no MCP server was
       // running. The wait is time-boxed (#905): a huge-repo reconcile takes
@@ -819,7 +898,10 @@ export class ToolHandler {
       // caller passed session state.
       const result = this.takeExploreEmission(raw, sessionState);
       const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
-      return this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
+      const withVersion = options.indexVersionNotice === false
+        ? withWorktree
+        : this.withIndexVersionNotice(withWorktree, project, sessionState);
+      return this.withStalenessNotice(withVersion, args.projectPath as string | undefined);
     } catch (err) {
       // One classifier for every path (see ./error-classifier): expected
       // conditions (not indexed, rebuild running, bad arguments, WSL shared
@@ -939,9 +1021,15 @@ export class ToolHandler {
     const rawLimit = Number(args.limit) || 10;
     const limit = clamp(rawLimit, 1, 100);
 
+    // Optional path scope (glob or substring), applied in SQL before the limit.
+    const pathScope = typeof args.path === 'string' && args.path.trim() ? [args.path.trim()] : undefined;
     const results = cg.searchNodes(query, {
       limit,
       kinds: kind ? [kind as NodeKind] : undefined,
+      includePatterns: pathScope,
+      // Copies of one symbol (scaffolds, vendored code) would otherwise fill
+      // the page; the formatter lists the collapsed locations on one line.
+      dedupe: true,
     });
 
     if (results.length === 0) {
@@ -1247,6 +1335,10 @@ export class ToolHandler {
     } catch {
       budget = getExploreOutputBudget(Infinity);
     }
+    // Caller's character cap (#1282 / #1701): only ever LOWERS the tier's
+    // budget — never raises it — so the tier table above stays the ceiling.
+    const charCap = exploreCharCap(args.maxChars, budget);
+    if (charCap !== null) budget = applyExploreCharCap(budget, charCap);
     const maxFiles = clamp((args.maxFiles as number) || budget.defaultMaxFiles, 1, 20);
 
     // File paths named in the query become PINNED files: guaranteed admission,
@@ -1325,6 +1417,10 @@ export class ToolHandler {
     // spent". Re-recording them refreshes them inside the retained-call window,
     // so a file pointed at across many calls doesn't age out of the history and
     // get re-served for no reason.
+    // The rendered source block per file, kept only for the CLI's structured
+    // output (#1280) — never consulted by the markdown render.
+    const wantStructured = args[STRUCTURED_ARG] === true;
+    const renderedBodies = new Map<string, { body: string; lang: string }>();
     const emittedByFile = new Map<
       string,
       { ranges: ExploreLineRange[]; bytes: number; fingerprint?: string }
@@ -2437,7 +2533,11 @@ export class ToolHandler {
     // tool-result limit (~25K chars): above it the result is externalized to a
     // file the agent Reads back (a 35K vscode explore did exactly this in the
     // n=4 A/B).
-    const hardCeiling = Math.min(Math.round(budget.maxOutputChars * 1.5), 25000);
+    const hardCeiling = Math.min(
+      Math.round(budget.maxOutputChars * 1.5),
+      25000,
+      charCap ?? Infinity,
+    );
     // What the epilogue is OWED — the part of it the loop must not spend (CG-26).
     // Not a flat margin: the old 600 was neither the epilogue's size (1,064 on
     // gin, 2,231 on excalidraw) nor a bound on it, so the loop budgeted for a
@@ -2917,6 +3017,7 @@ export class ToolHandler {
           diag?.recordRender(filePath, opts.mode, body.length, opts.clipped || opts.covered.length > 0);
           if (opts.covered.length > 0) diag?.recordDedup(filePath, coveredChars(opts.covered), opts.covered);
           noteEmitted(filePath, [...ranges, ...opts.covered], body.length, fingerprint);
+          if (wantStructured) renderedBodies.set(filePath, { body, lang });
           renderedFilePaths.push(filePath);
           filesIncluded++;
           return;
@@ -4446,6 +4547,9 @@ export class ToolHandler {
         filesIncluded++;
         const idx = backReferencedFiles.indexOf(restore.filePath);
         if (idx >= 0) backReferencedFiles.splice(idx, 1);
+        if (wantStructured) {
+          renderedBodies.set(restore.filePath, { body: restore.section[3] ?? '', lang: (restore.section[2] ?? '').slice(3) });
+        }
         emittedByFile.set(restore.filePath, {
           ranges: [...restore.ranges],
           bytes: restore.sourceChars,
@@ -4716,6 +4820,49 @@ export class ToolHandler {
       sourceBytes,
       responseBytes: finalText.length,
     };
+    if (wantStructured) {
+      // The same answer as data (#1280): built from the values the markdown was
+      // rendered from, restricted to what SURVIVED the final cut.
+      const survivorSet = new Set(survivors);
+      const relevant = (nodes: readonly Node[]) =>
+        nodes.filter((n) => n.kind !== 'import' && n.kind !== 'export' && n.kind !== 'file');
+      const files: ExploreFileJson[] = survivors.map((fp) => {
+        const group = fileGroups.get(fp);
+        const rendered = renderedBodies.get(fp);
+        const emitted = emittedByFile.get(fp);
+        return {
+          path: fp,
+          language: rendered?.lang || group?.nodes[0]?.language || '',
+          symbols: relevant(group?.nodes ?? [])
+            .sort((a, b) => a.startLine - b.startLine)
+            .map((n) => symbolJson(n, true)),
+          ranges: rendered ? (emitted?.ranges ?? []).map((r) => ({ start: r.start, end: r.end })) : [],
+          source: rendered?.body ?? '',
+        };
+      });
+      const omittedFiles = sortedFiles
+        .filter(([fp]) => !survivorSet.has(fp))
+        .slice(0, 30)
+        .map(([fp, group]) => ({ path: fp, symbols: relevant(group.nodes).map((n) => n.name).slice(0, 12) }));
+      const flowData = flowJson(cg, matchQuery);
+      let blast: ReturnType<typeof blastRadiusJson> = [];
+      try { blast = blastRadiusJson(computeBlastRadius(cg, subgraph, exactNodeIds)); } catch { /* optional */ }
+      result[STRUCTURED_RESULT_KEY] = {
+        schemaVersion: STRUCTURED_SCHEMA_VERSION,
+        command: 'explore',
+        query,
+        projectRoot,
+        summary: summaryLine,
+        notices: [],
+        namedSymbols: flowData.named,
+        flow: flowData.steps,
+        flowText: flow.text,
+        blastRadius: blast,
+        files,
+        omittedFiles,
+        budget: { maxChars: hardCeiling, outputChars: finalText.length },
+      };
+    }
     return result;
   }
 
@@ -4732,6 +4879,7 @@ export class ToolHandler {
     const limit = typeof args.limit === 'number' && args.limit > 0 ? Math.floor(args.limit) : undefined;
     const symbolsOnly = args.symbolsOnly === true;
     const symbolRaw = typeof args.symbol === 'string' ? args.symbol.trim() : '';
+    const wantJson = args[STRUCTURED_ARG] === true;
 
     // FILE READ MODE: a `file` with no `symbol` reads that file like the Read
     // tool — its current on-disk source with line numbers, narrowable with
@@ -4739,7 +4887,7 @@ export class ToolHandler {
     // header (which files depend on it). `symbolsOnly` returns just the
     // structural map instead. Backed by the index: same bytes Read gives you.
     if (!symbolRaw && fileHint) {
-      return this.handleFileView(cg, fileHint, { offset, limit, symbolsOnly });
+      return this.handleFileView(cg, fileHint, { offset, limit, symbolsOnly, structured: wantJson });
     }
 
     const symbol = this.validateString(args.symbol, 'symbol');
@@ -4758,7 +4906,11 @@ export class ToolHandler {
           '_These are suggestions, not answers — call codegraph_node again with the exact name you want._',
         );
       }
-      return this.textResult(lines.join('\n'));
+      return this.withNodeJson(this.textResult(lines.join('\n')), wantJson, {
+        mode: 'not-found',
+        message: lines[0],
+        suggestions,
+      });
     }
 
     // Disambiguate a heavily-overloaded name to a specific definition the caller
@@ -4786,7 +4938,12 @@ export class ToolHandler {
 
     // Single definition — the common case.
     if (matches.length === 1) {
-      return this.textResult(this.truncateOutput(await this.renderNodeSection(cg, matches[0]!, includeCode)));
+      const single = this.textResult(this.truncateOutput(await this.renderNodeSection(cg, matches[0]!, includeCode)));
+      return this.withNodeJson(single, wantJson, {
+        mode: 'symbol',
+        symbols: wantJson ? [await this.nodeSymbolJson(cg, matches[0]!, includeCode)] : [],
+        otherDefinitions: [],
+      });
     }
 
     // Multiple definitions share this name — overloads, or same-named methods on
@@ -4800,9 +4957,14 @@ export class ToolHandler {
     const header = `**${matches.length} definitions named "${symbol}"**`;
     if (!includeCode) {
       const list = matches.map((n) => `- \`${n.name}\` (${n.kind}) — ${n.filePath}:${n.startLine}`);
-      return this.textResult(this.truncateOutput(
+      const listResult = this.textResult(this.truncateOutput(
         [header, '', 'Re-query with `includeCode: true` to get every body in one call — no need to pick one first.', '', ...list].join('\n'),
       ));
+      return this.withNodeJson(listResult, wantJson, {
+        mode: 'symbol',
+        symbols: wantJson ? await Promise.all(matches.map((n) => this.nodeSymbolJson(cg, n, false))) : [],
+        otherDefinitions: [],
+      });
     }
 
     const BODY_BUDGET = 12000; // leaves room under MAX_OUTPUT_LENGTH for the header + list
@@ -4812,6 +4974,7 @@ export class ToolHandler {
     // bodiless list. Only a set of many LARGE bodies hits the char budget first.
     const HARD_CAP = 16;
     const rendered: string[] = [];
+    const renderedNodes: Node[] = [];
     const listed: Node[] = [];
     let used = 0;
     for (const n of matches) {
@@ -4820,6 +4983,7 @@ export class ToolHandler {
       // Always emit the first; emit the rest only while within the char budget.
       if (rendered.length === 0 || used + section.length <= BODY_BUDGET) {
         rendered.push(section);
+        renderedNodes.push(n);
         used += section.length;
       } else {
         listed.push(n);
@@ -4846,7 +5010,11 @@ export class ToolHandler {
         `> Need one of these in full? Call codegraph_node again with \`file\` (e.g. \`"${listed[0]!.filePath.split('/').pop()}"\`) or \`line\` — do NOT Read it.`,
       );
     }
-    return this.textResult(this.truncateOutput(out.join('\n')));
+    return this.withNodeJson(this.textResult(this.truncateOutput(out.join('\n'))), wantJson, {
+      mode: 'symbol',
+      symbols: wantJson ? await Promise.all(renderedNodes.map((n) => this.nodeSymbolJson(cg, n, true))) : [],
+      otherDefinitions: listed.map((n) => symbolJson(n)),
+    });
   }
 
   /**
@@ -4865,11 +5033,18 @@ export class ToolHandler {
   private async handleFileView(
     cg: CodeGraph,
     fileArg: string,
-    opts: { offset?: number; limit?: number; symbolsOnly?: boolean } = {},
+    opts: { offset?: number; limit?: number; symbolsOnly?: boolean; structured?: boolean } = {},
   ): Promise<ToolResult> {
+    // `node --json` (#1280): every answer below also carries its data.
+    const want = opts.structured === true;
+    const asJson = (result: ToolResult, data: Omit<NodeJson, 'schemaVersion' | 'command' | 'notices'>): ToolResult =>
+      this.withNodeJson(result, want, data);
     const normalize = (p: string) => p.replace(/\\/g, '/').replace(/^(?:\.?\/+)+/, '').replace(/\/+$/, '');
     const allFiles = cg.getFiles();
-    if (allFiles.length === 0) return this.textResult('No files indexed. Run `codegraph index` first.');
+    if (allFiles.length === 0) {
+      const msg = 'No files indexed. Run `codegraph index` first.';
+      return asJson(this.textResult(msg), { mode: 'not-found', message: msg });
+    }
 
     // Resolve ONE spelling of the path against the index: exact, then
     // suffix-of-path, then substring — narrowing to a single file or handing
@@ -4923,15 +5098,18 @@ export class ToolHandler {
       }
     }
     if (!resolved && candidates.length > 1) {
-      return this.textResult(
+      return asJson(this.textResult(
         [`"${shownArg}" matches ${candidates.length} indexed files — pass a longer path:`, '',
           ...candidates.slice(0, 25).map((f) => `- ${f.path}`)].join('\n'),
-      );
+      ), {
+        mode: 'not-found',
+        message: `"${shownArg}" matches ${candidates.length} indexed files — pass a longer path`,
+        suggestions: candidates.slice(0, 25).map((f) => f.path),
+      });
     }
     if (!resolved) {
-      return this.textResult(
-        `No indexed file matches "${fileArg}". Codegraph indexes source files; configs/docs it doesn't parse won't appear — Read those directly.`,
-      );
+      const msg = `No indexed file matches "${fileArg}". Codegraph indexes source files; configs/docs it doesn't parse won't appear — Read those directly.`;
+      return asJson(this.textResult(msg), { mode: 'not-found', message: msg });
     }
 
     const filePath = resolved.path;
@@ -4939,6 +5117,16 @@ export class ToolHandler {
       .filter((n) => n.kind !== 'file' && n.kind !== 'import' && n.kind !== 'export')
       .sort((a, b) => a.startLine - b.startLine);
     const dependents = cg.getFileDependents(filePath);
+    const fileJson = (extra: { totalLines?: number | null; startLine?: number | null; endLine?: number | null; source?: string | null } = {}): NodeJson['file'] => ({
+      path: filePath,
+      language: resolved!.language,
+      totalLines: extra.totalLines ?? null,
+      dependents,
+      symbols: nodes.map((n) => symbolJson(n, true)),
+      startLine: extra.startLine ?? null,
+      endLine: extra.endLine ?? null,
+      source: extra.source ?? null,
+    });
 
     // Compact, one-line blast radius (codegraph's value-add over a plain Read).
     const depSummary = dependents.length
@@ -4962,7 +5150,7 @@ export class ToolHandler {
       if (nodes.length) out.push(...symbolMap('**Symbols**'));
       else out.push('_No indexed symbols in this file._');
       out.push('', '> Drop `symbolsOnly` (or pass `offset`/`limit`) to read the source, like Read.');
-      return this.textResult(this.truncateOutput(out.join('\n')));
+      return asJson(this.textResult(this.truncateOutput(out.join('\n'))), { mode: 'file', file: fileJson() });
     }
 
     // SECURITY (#383): never dump a raw config/data file — a yaml/properties
@@ -4971,7 +5159,11 @@ export class ToolHandler {
       const out = [`**${filePath}** — configuration/data file, ${depSummary}`, ''];
       if (nodes.length) out.push(...symbolMap('**Keys (values withheld for safety)**'));
       out.push('', '> Values may be secrets, so codegraph indexes keys only. Read the file directly if you need a value.');
-      return this.textResult(this.truncateOutput(out.join('\n')));
+      return asJson(this.textResult(this.truncateOutput(out.join('\n'))), {
+        mode: 'file',
+        file: fileJson(),
+        message: 'configuration/data file: values withheld (keys only)',
+      });
     }
 
     // Read the current bytes from disk through the security chokepoint
@@ -4985,7 +5177,11 @@ export class ToolHandler {
       const out = [`**${filePath}** — could not read from disk (it may have moved since indexing). ${depSummary}`, ''];
       if (nodes.length) out.push(...symbolMap('**Symbols**'));
       out.push('', `> Read \`${filePath}\` directly for its current content.`);
-      return this.textResult(this.truncateOutput(out.join('\n')));
+      return asJson(this.textResult(this.truncateOutput(out.join('\n'))), {
+        mode: 'file',
+        file: fileJson(),
+        message: 'could not read the file from disk (it may have moved since indexing)',
+      });
     }
 
     // Split exactly as Read does — keep the trailing empty line a final newline
@@ -5002,7 +5198,10 @@ export class ToolHandler {
     const DEFAULT_LIMIT = 2000;
     const offset = Math.max(1, opts.offset ?? 1);
     if (offset > total) {
-      return this.textResult(`**${filePath}** has ${total} line${total === 1 ? '' : 's'} — offset ${offset} is past the end. ${depSummary}`);
+      return asJson(
+        this.textResult(`**${filePath}** has ${total} line${total === 1 ? '' : 's'} — offset ${offset} is past the end. ${depSummary}`),
+        { mode: 'file', file: fileJson({ totalLines: total }), message: `offset ${offset} is past the end of the file` },
+      );
     }
     const maxLines = Math.max(1, opts.limit ?? DEFAULT_LIMIT);
     const start = offset - 1; // 0-based
@@ -5029,7 +5228,69 @@ export class ToolHandler {
       );
     }
     // Self-bounded to CHAR_BUDGET — do NOT route through truncateOutput (15k).
-    return this.textResult(out.join('\n'));
+    return asJson(this.textResult(out.join('\n')), {
+      mode: 'file',
+      file: fileJson({
+        totalLines: total,
+        startLine: numbered.length > 0 ? offset : null,
+        endLine: numbered.length > 0 ? shownEnd : null,
+        source: numbered.length > 0 ? fileLines.slice(start, shownEnd).join('\n') : null,
+      }),
+    });
+  }
+
+  /**
+   * One symbol as data for the CLI's `node --json` (#1280): the same body /
+   * outline / drift decision as {@link renderNodeSection}, plus its direct
+   * callers and callees (deduped, capped like a generous trail).
+   */
+  private async nodeSymbolJson(cg: CodeGraph, node: Node, includeCode: boolean): Promise<NodeSymbolJson> {
+    const TRAIL_CAP = 50;
+    const neighbours = (edges: Array<{ node: Node }>) => {
+      const seen = new Set<string>([node.id]);
+      const out: ReturnType<typeof symbolJson>[] = [];
+      for (const e of edges) {
+        if (!e?.node || seen.has(e.node.id)) continue;
+        seen.add(e.node.id);
+        out.push(symbolJson(e.node));
+        if (out.length >= TRAIL_CAP) break;
+      }
+      return out;
+    };
+    let source: string | null = null;
+    let sourceKind: NodeSymbolJson['sourceKind'] = 'none';
+    if (includeCode) {
+      if (this.isFileStaleOnDisk(cg, node.filePath)) {
+        sourceKind = 'omitted-stale';
+      } else {
+        const outline = CONTAINER_NODE_KINDS.has(node.kind) ? buildContainerOutline(cg, node) : null;
+        if (outline) {
+          source = outline;
+          sourceKind = 'outline';
+        } else {
+          source = await cg.getCode(node.id);
+          sourceKind = source == null ? 'none' : 'body';
+        }
+      }
+    }
+    let callers: ReturnType<typeof symbolJson>[] = [];
+    let callees: ReturnType<typeof symbolJson>[] = [];
+    try { callers = neighbours(cg.getCallers(node.id)); } catch { /* optional */ }
+    try { callees = neighbours(cg.getCallees(node.id)); } catch { /* optional */ }
+    return { ...symbolJson(node, true), source, sourceKind, callers, callees };
+  }
+
+  /** Attach a `node --json` payload to a result when the caller asked for one. */
+  private withNodeJson(result: ToolResult, want: boolean, data: Omit<NodeJson, 'schemaVersion' | 'command' | 'notices'>): ToolResult {
+    if (want) {
+      result[STRUCTURED_RESULT_KEY] = {
+        schemaVersion: STRUCTURED_SCHEMA_VERSION,
+        command: 'node',
+        notices: [],
+        ...data,
+      };
+    }
+    return result;
   }
 
   /** Render one symbol: details + (optional) body/outline + its caller/callee trail. */
@@ -5195,6 +5456,19 @@ export class ToolHandler {
     if (updateNotice) {
       lines.push(`**Update available:** ${updateNotice}`);
     }
+
+    // Which engine built this index, and whether a rebuild is recommended
+    // (#1852) — always reported here; the read tools carry only a once-per-
+    // session one-liner. Purely local metadata; never triggers a re-index.
+    try {
+      if (lastIndexedAt != null) {
+        const buildInfo = cg.getIndexBuildInfo();
+        lines.push(`**Index built with:** ${describeIndexBuild(buildInfo)} (running engine: extraction v${EXTRACTION_VERSION})`);
+        lines.push(cg.isIndexStale()
+          ? `**Re-index recommended:** ⚠ yes — the index predates this engine's extraction, so it lacks symbols and links newer extraction adds. Ask the user to run \`codegraph index\` in ${cg.getProjectRoot()}.`
+          : '**Re-index recommended:** no — the index matches this engine\'s extraction version');
+      }
+    } catch { /* build stamp unreadable — status still answers */ }
 
     // Non-zero at rest means a resolution pass was interrupted mid-run, so
     // some files' call/impact edges are missing until the next sync sweeps

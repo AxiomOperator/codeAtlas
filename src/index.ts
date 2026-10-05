@@ -57,7 +57,8 @@ import { Mutex, FileLock } from './utils';
 import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 import { EXTRACTION_VERSION } from './extraction/extraction-version';
 import { getCodeGraphDir } from './directory';
-import { deriveProjectNameTokens } from './search/query-utils';
+import { deriveProjectNameTokens, isTestPath } from './search/query-utils';
+import { findOwningManifest, toProjectRelative, OwningManifest, ManifestCache } from './resolution/owning-manifest';
 import ignore from 'ignore';
 import { loadDeprioritizePatterns } from './project-config';
 import { CodeGraphPackageVersion } from './mcp/version';
@@ -104,6 +105,8 @@ export {
 export { Mutex, FileLock, processInBatches, debounce, throttle, MemoryMonitor } from './utils';
 export { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 export { MCPServer } from './mcp';
+export { isTestPath } from './search/query-utils';
+export { findOwningManifest, OwningManifest, ManifestKind, OWNING_MANIFEST_FILES } from './resolution/owning-manifest';
 
 /**
  * Options for initializing a new CodeGraph project
@@ -2118,6 +2121,44 @@ export class CodeGraph {
    */
   getFiles(): FileRecord[] {
     return this.queries.getAllFiles();
+  }
+
+  /**
+   * Is `filePath` a test suite? (#1877) The same predicate search ranking,
+   * `codegraph affected` and the MCP tools use — the filename and directory
+   * conventions every ecosystem uses for tests (`test_foo.py`, `foo_test.go`,
+   * `foo.test.ts`, `FooTest.kt`, `tests/`, `__tests__/`, …). Examples,
+   * fixtures and benchmarks are NOT tests. A pure path check: the file need
+   * not be indexed. Accepts a project-relative or absolute path.
+   */
+  isTestPath(filePath: string): boolean {
+    const rel = toProjectRelative(this.projectRoot, filePath) ?? filePath.replace(/\\/g, '/');
+    return isTestPath(rel);
+  }
+
+  /**
+   * The package that owns `filePath` (#1871): the nearest manifest at or above
+   * its directory (never above the project root) that declares a name —
+   * `package.json`, `Cargo.toml`, `go.mod`, `pyproject.toml`, `composer.json`,
+   * `pubspec.yaml`, `Package.swift`, `pom.xml`. Monorepo members resolve to
+   * their own manifest; a nameless workspace-root manifest is skipped. Null
+   * when nothing up the chain names a package, or the path is outside the
+   * project. Read from the working tree on each call.
+   */
+  getOwningManifest(filePath: string): OwningManifest | null {
+    return findOwningManifest(this.projectRoot, filePath);
+  }
+
+  /**
+   * {@link getOwningManifest} for many files at once, sharing one
+   * per-directory cache so each directory's manifests are read once. Keys
+   * are the paths exactly as passed.
+   */
+  getOwningManifests(filePaths: Iterable<string>): Map<string, OwningManifest | null> {
+    const cache: ManifestCache = new Map();
+    const out = new Map<string, OwningManifest | null>();
+    for (const p of filePaths) out.set(p, findOwningManifest(this.projectRoot, p, cache));
+    return out;
   }
 
   /**

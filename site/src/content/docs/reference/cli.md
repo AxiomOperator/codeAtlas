@@ -15,8 +15,8 @@ codegraph status [path]           # Show statistics (--json)
 codegraph ui [path]               # Open the browser viewer (not released yet — see below)
 codegraph unlock [path]           # Remove a stale lock file that's blocking indexing
 codegraph query <search>          # Search symbols (--kind, --limit, --json)
-codegraph explore <query>         # Relevant symbols' source + call paths in one shot (same output as the codegraph_explore MCP tool)
-codegraph node <symbol|file>      # One symbol's source + callers, or read a file with line numbers (same output as codegraph_node)
+codegraph explore <query>         # Relevant symbols' source + call paths in one shot (--max-files, --max-chars, --json)
+codegraph node <symbol|file>      # One symbol's source + callers, or read a file with line numbers (--file, --offset, --limit, --symbols-only, --json)
 codegraph files [path]            # Show file structure (--format, --filter, --pattern, --max-depth, --json)
 codegraph callers <symbol>        # Find what calls a function/method (--limit, --json)
 codegraph callees <symbol>        # Find what a function/method calls (--limit, --json)
@@ -46,6 +46,54 @@ codegraph impact AuthMiddleware --depth 3
 ```
 
 `explore` and `node` are the CLI faces of the `codegraph_explore` and `codegraph_node` MCP tools — same output — so subagents and non-MCP harnesses can reach the graph from a shell.
+
+### Bounding `explore`
+
+`--max-files` caps how many files contribute source; `--max-chars <n>` caps the whole answer in characters (the MCP tool takes the same cap as `maxChars`). The cap only ever lowers the size CodeGraph would pick for the project — a value above it changes nothing — and values below 2000 are treated as 2000. Under a tighter cap, fewer files and shorter windows of each are shown, trailing sections are dropped whole where possible, and trimmed spots name the symbols to explore next.
+
+```bash
+codegraph explore "loginUser saveSession" --max-chars 6000
+```
+
+### JSON output for `explore` and `node`
+
+With `--json`, both commands print the same answer as structured data, so a pipeline can keep the call path and blast radius and drop the source bodies (or route them elsewhere) without parsing markdown. The shape carries `"schemaVersion": 1`; fields may be added in later releases, never renamed or removed without a version bump.
+
+Every symbol reference has the same fields:
+
+```json
+{ "name": "loginUser", "qualifiedName": "loginUser", "kind": "function",
+  "file": "src/auth.ts", "startLine": 2, "endLine": 6 }
+```
+
+`codegraph explore --json`:
+
+| Field | Meaning |
+|---|---|
+| `query`, `projectRoot` | What was asked, and of which project |
+| `summary` | The "Found N symbols across M files." line |
+| `notices` | Warnings the text output prints above the answer (e.g. the index predates this engine — run `codegraph index`) |
+| `namedSymbols` | Symbols the query named that resolved in the index |
+| `flow` | The call path among the named symbols, in order: symbol references plus `via` (the edge kind into this step, `null` on the first), `synthesizedBy` (set on a dynamic-dispatch hop) and `callLine` (where this step calls the next) |
+| `flowText` | The flow section's markdown narrative (dynamic-dispatch links, boundaries), or `""` |
+| `blastRadius` | For the entry symbols: `{ symbol, callers, callerFiles, testFiles }` |
+| `files` | Files whose source the answer includes, in rank order: `{ path, language, symbols, ranges, source }`. `source` is exactly the block the text shows — line-numbered `<n>\t<line>`, with gap markers between non-adjacent spans; `ranges` are the 1-based line spans it covers |
+| `omittedFiles` | Relevant files that did not fit: `{ path, symbols }` (names only) |
+| `budget` | `{ maxChars, outputChars }`: the character cap applied and the size of the markdown answer |
+| `message` | Present instead of an answer when nothing matched (all arrays are then empty) |
+
+`codegraph node --json`:
+
+| Field | Meaning |
+|---|---|
+| `mode` | `"symbol"`, `"file"`, or `"not-found"` |
+| `notices` | As for `explore` |
+| `symbols` | Symbol mode: every definition returned in full (overloads included) — a symbol reference plus `signature`, `source`, `sourceKind` (`"body"`, `"outline"` for a class-like container, `"none"`, or `"omitted-stale"` when the file changed since it was indexed), and `callers` / `callees` as symbol references |
+| `otherDefinitions` | Symbol mode: further definitions that did not fit, as symbol references |
+| `file` | File mode: `{ path, language, totalLines, dependents, symbols, startLine, endLine, source }` — `source` is the raw (un-numbered) lines `startLine`–`endLine`, or `null` with `--symbols-only` or for a config file whose values are withheld |
+| `message`, `suggestions` | Not-found guidance and close names |
+
+An error prints `{ "error": "…" }` and exits non-zero.
 
 ## affected
 

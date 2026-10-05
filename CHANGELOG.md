@@ -18,6 +18,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `codegraph status` now tells you when indexed files are missing their symbols, and `codegraph sync` repairs them.
 - Indexing large Python projects is fast again.
 - Much more accurate VB.NET and C# results: structure members, property bodies, initializers and typed receiver calls are now linked, and constants no longer stand in for classes.
+- Three new languages: Bash/Shell, Elixir and Zig.
 - Many languages link more of your code: Vue templates, plain JavaScript objects, Go modules in subfolders, Rust enum variants, Dart getters, VB.NET shared members and C++ operators.
 - Re-index your projects after upgrading (`codegraph index`) to pick up the new links.
 
@@ -31,6 +32,13 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `codegraph upgrade <version>` only accepts a plain version number like `1.6.2`, so nothing else can reach the shell command that installs it.
 
 ### New Features
+
+- New languages: Bash/Shell (`.sh`, `.bash`, `.zsh` — functions, exports, `source` links, calls and `trap`/zsh hook handlers), Elixir (modules, multi-clause functions, macros, protocols, `alias`-aware calls, `import`/`use` links, ExUnit tests) and Zig (functions, structs/enums/unions with methods, `@import` links, calls through imports and typed receivers). (#1068, #1203, #1899, #1219, #1060)
+- When a project's index was built by an older version of CodeGraph, read tools now say so once per session and suggest `codegraph index`, and `codegraph_status` always shows which version built the index. (#1852)
+- `codegraph explore --json` and `codegraph node --json` print structured output for scripts. (#1280)
+- `codegraph_explore` takes an optional `maxChars` (CLI: `--max-chars`) to make an answer smaller than the default for the project's size. (#1282, #1701)
+- Search now finds names by their parts — `request` finds `DataRequest` and `parse_request` — ranks names containing every word of a multi-word query first, applies path filters before the result limit, and can collapse identical copies; `codegraph_search` takes an optional `path`, and `codegraph query` gains `--include`, `--exclude` and `--no-dedupe`. (#1520)
+- The library API adds `isTestPath(file)` and `getOwningManifest(file)` (the nearest named `package.json`, `Cargo.toml`, `go.mod`, `pyproject.toml` and others), and `codegraph files --json` reports `isTest` and `package` for each file; `codegraph files` gains `--tests` / `--no-tests`. (#1877, #1871)
 
 - `codegraph install --personal` sets up Claude Code just for you in a shared project: the MCP server goes in your own `~/.claude.json` project entry and the hook and instruction files in `.claude/settings.local.json` and `CLAUDE.local.md`, instead of team-shared files. (#243)
 - `codegraph init --force-hooks-path` lets CodeGraph add its git sync hook to a `core.hooksPath` directory that is committed (like `.husky/`) or shared outside the repository; without it, those are left alone.

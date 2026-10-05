@@ -573,6 +573,7 @@ export class ContextBuilder {
         // Fetch more results since popular prefixes have many matches
         const prefixResults = this.queries.searchNodes(titleCased, {
           limit: 30,
+          subwords: false,
           kinds: definitionKinds,
         });
         const matched: SearchResult[] = [];
@@ -693,6 +694,7 @@ export class ContextBuilder {
         for (const term of searchTerms) {
           const termResults = this.queries.searchNodes(term, {
             limit: opts.searchLimit * 2,
+            subwords: false,
             kinds: searchKinds,
           });
           for (const r of termResults) {

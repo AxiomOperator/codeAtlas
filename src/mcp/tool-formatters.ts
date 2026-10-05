@@ -141,6 +141,11 @@ export function formatSearchResults(results: SearchResult[]): string {
     lines.push(`**${node.name}** (${node.kind})`);
     lines.push(`${node.filePath}${location}`);
     if (node.signature) lines.push(`\`${node.signature}\``);
+    if (result.duplicates && result.duplicates.length > 0) {
+      const shown = result.duplicates.slice(0, 3).map((d) => `${d.filePath}${d.startLine ? `:${d.startLine}` : ''}`);
+      const more = result.duplicates.length - shown.length;
+      lines.push(`(identical copies: ${shown.join(', ')}${more > 0 ? `, +${more} more` : ''})`);
+    }
     lines.push('');
   }
 

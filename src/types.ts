@@ -107,6 +107,7 @@ export const LANGUAGES = [
   'r',
   'solidity',
   'nix',
+  'bash',
   'yaml',
   'twig',
   'xml',
@@ -117,6 +118,8 @@ export const LANGUAGES = [
   'cobol',
   'vbnet',
   'erlang',
+  'elixir',
+  'zig',
   'terraform',
   'unknown',
 ] as const;
@@ -461,10 +464,17 @@ export interface SearchOptions {
   /** Languages to include */
   languages?: Language[];
 
-  /** File path patterns to include */
+  /**
+   * Restrict results to files whose path matches ANY of these patterns. A
+   * pattern containing a glob character (`*`, `?`, `[`) is matched as a glob
+   * against the project-relative path (`**` and `*` both cross `/`; case-
+   * sensitive); any other pattern is a case-insensitive path substring
+   * (`src/db` matches everything under it). Applied in SQL, so it scopes the
+   * candidate set before the result limit — not a post-filter.
+   */
   includePatterns?: string[];
 
-  /** File path patterns to exclude */
+  /** Drop results whose file path matches ANY of these patterns (same syntax as `includePatterns`). */
   excludePatterns?: string[];
 
   /** Maximum results to return */
@@ -475,6 +485,22 @@ export interface SearchOptions {
 
   /** Whether search is case-sensitive */
   caseSensitive?: boolean;
+
+  /**
+   * Collapse near-duplicate hits — the same symbol copied into several places
+   * (scaffolded projects, vendored copies): same kind, name, qualified name,
+   * signature and body length in different files. The best-ranked copy is
+   * kept and the rest are listed on its `duplicates`. Default false.
+   */
+  dedupe?: boolean;
+
+  /**
+   * Sub-word recall: also match symbols whose camelCase / PascalCase /
+   * snake_case NAME contains the query's words as identifier segments
+   * (`request` finds `DataRequest`, `test path` finds `isTestPath`), which
+   * the full-text index alone can't reach. Default true.
+   */
+  subwords?: boolean;
 }
 
 /**
@@ -494,6 +520,12 @@ export interface SearchResult {
 
   /** Matched text snippets for highlighting */
   highlights?: string[];
+
+  /**
+   * Other copies of this symbol collapsed into this result by
+   * `SearchOptions.dedupe` (absent when nothing was collapsed).
+   */
+  duplicates?: Array<{ id: string; filePath: string; startLine: number }>;
 }
 
 /**

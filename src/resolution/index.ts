@@ -27,9 +27,11 @@ import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
 import { clearVbnetReceiverMemos, isVbMemberAccessRef, matchVbMemberAccess } from './vbnet-receivers';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, clearCppIncludeDirCache, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isJsPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, clearCppIncludeDirCache, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBashSourceRef, isJsPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
+import { resolveElixirReference } from './elixir';
+import { resolveZigReference } from './zig';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
@@ -1178,6 +1180,12 @@ export class ReferenceResolver {
     // resolves ONLY to a constructor of the lexically nearest `T` (#1839).
     if (isCppConstructorRef(ref)) return matchCppConstructor(ref, this.context);
 
+    // Elixir and Zig resolve through their own complete rulebooks: the
+    // extractor emits alias-expanded / binding-rooted paths, and anything the
+    // rulebook can't follow stays unresolved rather than name-matched.
+    if (ref.language === 'elixir') return this.gateLanguage(resolveElixirReference(ref, this.context), ref);
+    if (ref.language === 'zig') return this.gateLanguage(resolveZigReference(ref, this.context), ref);
+
     // A Dart getter read (`x.area`, #2338) resolves ONLY through the
     // receiver's declared type — never by name alone.
     if (isDartPropertyReadRef(ref)) return this.gateLanguage(matchDartPropertyRead(ref, this.context), ref);
@@ -1236,6 +1244,7 @@ export class ReferenceResolver {
     const preFilterPass =
       isNixPathImportRef(ref) ||
       isJsPathImportRef(ref) ||
+      isBashSourceRef(ref) ||
       this.hasAnyPossibleMatch(existenceName) ||
       // PHP, Pascal, CFML, COBOL and VB.NET names ignore case: `formatprice()`
       // calls `FormatPrice`, which the exact-name set never lists.
@@ -1383,7 +1392,8 @@ export class ReferenceResolver {
     // qualified-name fallback would only ever add wrong cross-module edges.
     // Nix static path imports are file references for the same reason —
     // falling through would let "./x.nix" name-match an unrelated node.
-    if (isPhpIncludePathRef(ref) || isCobolCopybookRef(ref) || isNixPathImportRef(ref) || ref.language === 'terraform') {
+    // Shell `source` paths likewise name a file, never a symbol.
+    if (isPhpIncludePathRef(ref) || isCobolCopybookRef(ref) || isNixPathImportRef(ref) || isBashSourceRef(ref) || ref.language === 'terraform') {
       return candidates.length > 0
         ? candidates.reduce((best, curr) =>
             curr.confidence > best.confidence ? curr : best
@@ -1448,6 +1458,18 @@ export class ReferenceResolver {
         if (!target || target.filePath !== ref.filePath) {
           return null;
         }
+      } else if (ref.language === 'bash') {
+        // A shell command names a shell function (or an external program,
+        // which never matches). It can't call into another language's
+        // symbols, so only a bash function — or, for `trap`, the handler
+        // function — is a valid target.
+        if (!target || target.language !== 'bash' || target.kind !== 'function') {
+          return null;
+        }
+      } else if (target && target.language === 'bash') {
+        // And nothing in another language calls a shell function by name: a
+        // Python `deploy()` must not land on `deploy() { … }` in a .sh file.
+        return null;
       } else if (target && target.language === 'nix') {
         // The reverse direction is just as impossible: no other language can
         // symbolically call into a .nix binding (interop is eval/CLI, never a

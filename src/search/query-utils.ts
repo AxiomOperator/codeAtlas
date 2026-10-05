@@ -7,6 +7,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { Node } from '../types';
+import { splitIdentifierSegments } from './identifier-segments';
 
 /** Normalize a name to a comparable token: lowercase, alphanumerics only. */
 export function normalizeNameToken(raw: string): string {
@@ -400,6 +401,26 @@ export function nameMatchBonus(nodeName: string, query: string): number {
   // Exact match on a query token: "CacheBuilder build" and node name is "build"
   if (queryTokens.length > 1 && queryTokens.includes(nameLower)) return 60;
 
+  // Identifier-segment coverage (#1520): a multi-word query whose every word is
+  // a camelCase/snake_case segment of the name ("test path" → isTestPath,
+  // "query parser" → parseQuery) names THAT symbol, and must beat a symbol
+  // that matches just one of the words exactly (`path`, 60). Each segment the
+  // query left unexplained costs 2, so the tightest cover ranks first.
+  const queryWords = splitIdentifierSegments(query);
+  if (queryWords.length > 1) {
+    const nameSegments = splitIdentifierSegments(nodeName);
+    const covered = new Set<string>();
+    const allCovered = queryWords.every((w) => {
+      const seg = nameSegments.find((s) => segmentMatchesWord(s, w));
+      if (seg) covered.add(seg);
+      return seg !== undefined;
+    });
+    if (allCovered) {
+      const unexplained = nameSegments.length - covered.size;
+      return 64 - Math.min(14, 2 * unexplained);
+    }
+  }
+
   // Name starts with query — scale by length ratio so "Pod"→"Pod" (exact, handled above)
   // scores much higher than "Pod"→"PodGCControllerOptions" (ratio 0.125).
   if (nameLower.startsWith(queryLower)) {
@@ -417,6 +438,18 @@ export function nameMatchBonus(nodeName: string, query: string): number {
   if (nameLower.includes(queryLower)) return 10;
 
   return 0;
+}
+
+/**
+ * Does a name segment answer a query word? Equal, or the same word stem —
+ * one a prefix of the other differing by at most 3 trailing chars, the
+ * shorter at least 4 long ("parse"/"parser", "package"/"packages",
+ * "synthes"/"synthesizer" is NOT: too far apart).
+ */
+function segmentMatchesWord(segment: string, word: string): boolean {
+  if (segment === word) return true;
+  const [short, long] = segment.length <= word.length ? [segment, word] : [word, segment];
+  return short.length >= 4 && long.length - short.length <= 3 && long.startsWith(short);
 }
 
 /**

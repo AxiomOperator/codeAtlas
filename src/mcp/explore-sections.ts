@@ -575,6 +575,61 @@ export function boundaryCandidates(site: BoundarySite): string {
   return `candidates for key \`${site.key}\`: ${list.join(', ')}`;
 }
 
+export interface BlastRadiusEntry {
+  root: Node;
+  /** Distinct direct callers. */
+  callers: Node[];
+  /** Project-relative non-test files among the direct callers. */
+  callerFiles: string[];
+  /** Project-relative test files among the direct callers. */
+  testFiles: string[];
+}
+
+/**
+ * The data behind {@link buildBlastRadiusSection}: for up to five entry
+ * symbols that have at least one caller, who calls them and from where.
+ * Shared with the CLI's `--json` output so both describe the same roots.
+ */
+export function computeBlastRadius(
+  cg: CodeGraph,
+  subgraph: Subgraph,
+  leadingIds: Iterable<string> = [],
+): BlastRadiusEntry[] {
+  const ROOT_CAP = 5; // only the symbols the query actually targeted
+  const MEANINGFUL = new Set<string>([
+    'function', 'method', 'class', 'interface', 'struct', 'union', 'trait', 'protocol',
+    'enum', 'type_alias', 'component', 'constant', 'variable', 'property', 'field',
+  ]);
+  const rel = (p: string) => p.replace(/\\/g, '/');
+
+  const roots = [...new Set([...leadingIds, ...subgraph.roots])]
+    .map((id) => subgraph.nodes.get(id))
+    .filter((n): n is Node => !!n && MEANINGFUL.has(n.kind))
+    .slice(0, ROOT_CAP);
+
+  const entries: BlastRadiusEntry[] = [];
+  for (const root of roots) {
+    let callers: Array<{ node: Node }> = [];
+    try { callers = cg.getCallers(root.id) as Array<{ node: Node }>; } catch { /* skip this root */ }
+
+    const seen = new Set<string>();
+    const uniq: Node[] = [];
+    for (const c of callers) {
+      if (c?.node && !seen.has(c.node.id)) { seen.add(c.node.id); uniq.push(c.node); }
+    }
+    if (uniq.length === 0) continue; // no blast radius → nothing to flag
+
+    const files = [...new Set(uniq.map((n) => rel(n.filePath)))];
+    entries.push({
+      root,
+      callers: uniq,
+      callerFiles: files.filter((f) => !isTestFile(f)),
+      testFiles: files.filter((f) => isTestFile(f)),
+    });
+  }
+  return entries;
+}
+
 /**
  * Compact "blast radius" for the entry symbols of an explore result: who
  * depends on each (callers) and which test files cover it — LOCATIONS ONLY,
@@ -594,36 +649,11 @@ export function buildBlastRadiusSection(
    */
   leadingIds: Iterable<string> = [],
 ): string {
-  const ROOT_CAP = 5; // only the symbols the query actually targeted
   const FILE_CAP = 4; // caller files listed per symbol before "+N more"
-  const MEANINGFUL = new Set<string>([
-    'function', 'method', 'class', 'interface', 'struct', 'union', 'trait', 'protocol',
-    'enum', 'type_alias', 'component', 'constant', 'variable', 'property', 'field',
-  ]);
   const rel = (p: string) => p.replace(/\\/g, '/');
 
-  const roots = [...new Set([...leadingIds, ...subgraph.roots])]
-    .map((id) => subgraph.nodes.get(id))
-    .filter((n): n is Node => !!n && MEANINGFUL.has(n.kind))
-    .slice(0, ROOT_CAP);
-  if (roots.length === 0) return '';
-
   const entries: string[] = [];
-  for (const root of roots) {
-    let callers: Array<{ node: Node }> = [];
-    try { callers = cg.getCallers(root.id) as Array<{ node: Node }>; } catch { /* skip this root */ }
-
-    const seen = new Set<string>();
-    const uniq: Node[] = [];
-    for (const c of callers) {
-      if (c?.node && !seen.has(c.node.id)) { seen.add(c.node.id); uniq.push(c.node); }
-    }
-    if (uniq.length === 0) continue; // no blast radius → nothing to flag
-
-    const callerFiles = [...new Set(uniq.map((n) => rel(n.filePath)))];
-    const testFiles = callerFiles.filter((f) => isTestFile(f));
-    const nonTest = callerFiles.filter((f) => !isTestFile(f));
-
+  for (const { root, callers: uniq, callerFiles: nonTest, testFiles } of computeBlastRadius(cg, subgraph, leadingIds)) {
     const shown = nonTest.slice(0, FILE_CAP).map((f) => `\`${f}\``).join(', ');
     const more = nonTest.length > FILE_CAP ? ` +${nonTest.length - FILE_CAP} more` : '';
     const where = nonTest.length > 0 ? ` in ${shown}${more}` : '';

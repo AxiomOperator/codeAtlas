@@ -157,3 +157,34 @@ export function getExploreOutputBudget(fileCount: number): ExploreOutputBudget {
     includeBudgetNote: true,
   };
 }
+
+/** Smallest `maxChars` honored: below this not even one section fits. */
+export const EXPLORE_MIN_CHAR_CAP = 2000;
+
+/** The absolute response ceiling a tier allows (the inline tool-result limit). */
+export function exploreTierCeiling(budget: ExploreOutputBudget): number {
+  return Math.min(Math.round(budget.maxOutputChars * 1.5), 25000);
+}
+
+/**
+ * Resolve a caller-supplied `maxChars` (#1282 / #1701) against a tier.
+ * Returns the effective cap, or `null` when there is nothing to apply — no
+ * value, a non-finite / non-positive one, or one at or above the tier's own
+ * ceiling. The cap can only LOWER a tier's budget, never raise it, so the
+ * tier table above (and its monotonicity invariant) stays the ceiling.
+ */
+export function exploreCharCap(raw: unknown, budget: ExploreOutputBudget): number | null {
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return null;
+  const ceiling = exploreTierCeiling(budget);
+  const cap = Math.max(EXPLORE_MIN_CHAR_CAP, Math.round(raw));
+  return cap >= ceiling ? null : cap;
+}
+
+/** A tier budget lowered to a resolved char cap (see {@link exploreCharCap}). */
+export function applyExploreCharCap(budget: ExploreOutputBudget, cap: number): ExploreOutputBudget {
+  return {
+    ...budget,
+    maxOutputChars: Math.min(budget.maxOutputChars, cap),
+    maxCharsPerFile: Math.min(budget.maxCharsPerFile, cap),
+  };
+}

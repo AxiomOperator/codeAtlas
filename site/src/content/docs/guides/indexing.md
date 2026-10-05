@@ -96,6 +96,8 @@ codegraph status
 
 Reports node/edge/file counts, the active SQLite backend, and the journal mode. In an agent session, the MCP-side `codegraph_status` additionally surfaces the `### Pending sync:` block described above.
 
+Both also say which CodeGraph version built the index and whether a full re-index is recommended. After an upgrade that improves what CodeGraph extracts, an older index still works but misses what the new version would add. In an agent session, the first answer CodeGraph gives for such a project opens with a one-line warning (once per session, per project) asking you to run `codegraph index`. The check is local: nothing is downloaded, and CodeGraph never re-indexes on its own.
+
 ## What gets indexed
 
 Every file whose extension maps to a [supported language](/codegraph/reference/languages/), minus dependency/build directories excluded by default (`node_modules`, `vendor`, `dist`, …), anything your `.gitignore` excludes, and files over 1 MB. See [Configuration](/codegraph/getting-started/configuration/).

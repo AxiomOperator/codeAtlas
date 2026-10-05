@@ -222,6 +222,19 @@ describe('Language Detection', () => {
     expect(isSourceFile('default.nix')).toBe(true);
   });
 
+  it('should detect shell scripts as bash (fuller coverage in bash.test.ts)', () => {
+    expect(detectLanguage('scripts/deploy.sh')).toBe('bash');
+    expect(detectLanguage('lib/common.bash')).toBe('bash');
+    expect(detectLanguage('plugins/git/git.plugin.zsh')).toBe('bash');
+    expect(isSourceFile('install.sh')).toBe(true);
+  });
+
+  it('should detect Elixir and Zig files', () => {
+    expect(detectLanguage('lib/my_app/accounts.ex')).toBe('elixir');
+    expect(detectLanguage('test/my_app_test.exs')).toBe('elixir');
+    expect(detectLanguage('src/main.zig')).toBe('zig');
+  });
+
   it('should detect a .h whose only C++ signal is an export-macro class as cpp', () => {
     // Lean Unreal-Engine style header: the class is annotated with an export
     // macro and carries no explicit `public:`/`virtual`/`namespace`/`template`,
@@ -324,6 +337,8 @@ describe('Language Support', () => {
     expect(languages).toContain('dart');
     expect(languages).toContain('solidity');
     expect(languages).toContain('nix');
+    expect(languages).toContain('elixir');
+    expect(languages).toContain('zig');
   });
 });
 

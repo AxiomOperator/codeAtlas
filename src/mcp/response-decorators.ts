@@ -64,6 +64,45 @@ export function formatDegradedBanner(reason: string | null): string {
   );
 }
 
+/** Build stamp of an index, as `CodeGraph.getIndexBuildInfo()` reports it. */
+export interface IndexBuildStamp {
+  version: string | null;
+  extractionVersion: number | null;
+}
+
+/** "CodeGraph v1.5.0, extraction v27" — or a not-recorded note for a pre-stamp index. */
+export function describeIndexBuild(info: IndexBuildStamp): string {
+  if (info.version == null && info.extractionVersion == null) {
+    return 'an older CodeGraph (build version not recorded)';
+  }
+  const parts: string[] = [];
+  if (info.version != null) parts.push(`CodeGraph v${info.version}`);
+  parts.push(info.extractionVersion != null
+    ? `extraction v${info.extractionVersion}`
+    : 'extraction version not recorded');
+  return parts.join(', ');
+}
+
+/**
+ * Compact once-per-session notice prefixed to a read tool's answer when the
+ * project's index was built by an older extraction engine (#1852). The answer
+ * itself is still served — the index is structurally fine, just missing what
+ * the newer extractor adds — so this never blocks or errors; it tells the
+ * agent to pass the re-index step to the user (indexing is the user's call).
+ */
+export function formatIndexVersionNotice(
+  info: IndexBuildStamp,
+  currentExtractionVersion: number,
+  projectRoot: string,
+): string {
+  return (
+    `⚠️ This project's CodeGraph index was built by ${describeIndexBuild(info)}; the running engine is ` +
+    `extraction v${currentExtractionVersion}, so the index lacks symbols and links newer extraction adds and ` +
+    `answers may be incomplete. Tell the user to run \`codegraph index\` in ${projectRoot} to rebuild it. ` +
+    `(Shown once per session; \`codegraph_status\` has the details.)`
+  );
+}
+
 /** Re-armed watches are not proof of freshness until their full scan commits. */
 export function formatRecoveringBanner(): string {
   return (

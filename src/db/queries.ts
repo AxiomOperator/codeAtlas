@@ -23,6 +23,7 @@ import { kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-u
 import { parseQuery, boundedEditDistance } from '../search/query-parser';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { splitIdentifierSegments } from '../search/identifier-segments';
+import { NodeScope, nodeScopeSql, dedupeSearchResults } from '../search/search-scope';
 
 /**
  * Files that should not be candidates for "dominant file" detection: test/spec
@@ -1502,9 +1503,18 @@ export class QueryBuilder {
    * Search nodes by name using FTS with fallback to LIKE for better matching
    *
    * Search strategy:
-   * 1. Try FTS5 prefix match (query*) for word-start matching
-   * 2. If no results, try LIKE for substring matching (e.g., "signIn" finds "signInWithGoogle")
-   * 3. Score results based on match quality
+   * 1. FTS5 prefix match (query*) over name / qualified name / docstring /
+   *    signature, column-weighted (name ≫ qualified name > signature >
+   *    docstring; the opaque `id` column is never matched).
+   * 2. Sub-word recall (#1520): names whose camelCase / snake_case SEGMENTS
+   *    carry the query words (`request` → `DataRequest`), via the
+   *    name_segment_vocab table — the FTS tokenizer keeps `DataRequest` as one
+   *    opaque token, so step 1 can't reach it.
+   * 3. If still nothing, LIKE substring search, then a bounded fuzzy sweep.
+   * 4. Multi-signal rescoring (kind, path, name match), optional dedupe of
+   *    copied symbols, then the limit.
+   *
+   * Kind / language / path scoping is applied inside every candidate query.
    */
   searchNodes(query: string, options: SearchOptions = {}): SearchResult[] {
     const { limit = 100, offset = 0 } = options;
@@ -1532,18 +1542,48 @@ export class QueryBuilder {
     const kinds = mergedKinds;
     const languages = mergedLanguages;
 
+    // `path:` query filters are substring patterns, so they push into the SQL
+    // scope as an extra include group (ANDed with options.includePatterns: a
+    // node must satisfy both when both are given).
+    const scope: NodeScope = {
+      kinds,
+      languages,
+      includePatterns: options.includePatterns,
+      excludePatterns: options.excludePatterns,
+    };
+    const scopeFor = (alias: string) => {
+      const base = nodeScopeSql(alias, scope);
+      if (pathFilters.length === 0) return base;
+      const extra = nodeScopeSql(alias, { includePatterns: pathFilters });
+      return { sql: base.sql + extra.sql, params: [...base.params, ...extra.params] };
+    };
+
     // First try FTS5 with prefix matching (skip if FTS5 not available, #1532)
     let results = text
-      ? (this._fts5Available !== false ? this.searchNodesFTS(text, { kinds, languages, limit, offset }) : [])
+      ? (this._fts5Available !== false ? this.searchNodesFTS(text, scopeFor('nodes'), limit, offset) : [])
       // Over-fetch by 5× when running filter-only (no text). The
       // post-scoring path: + name: filters can be very selective, so
       // a smaller multiplier risks returning fewer than `limit`
       // results despite the DB having plenty of matches.
-      : this.searchAllByFilters({ kinds, languages, limit: limit * 5 });
+      : this.searchAllByFilters(scopeFor('nodes'), limit * 5);
+
+    // Sub-word recall: add names whose identifier segments carry the query
+    // words. Supplemental — FTS hits keep their scores; new candidates enter
+    // just below the strongest FTS hit and the rescoring below ranks them.
+    if (text && options.subwords !== false && offset === 0) {
+      const existingIds = new Set(results.map((r) => r.node.id));
+      const base = results.length > 0 ? Math.max(...results.map((r) => r.score)) * 0.5 : 1;
+      for (const r of this.searchNodesBySegments(text, scopeFor('n'), Math.max(limit * 5, 100), base)) {
+        if (!existingIds.has(r.node.id)) {
+          results.push(r);
+          existingIds.add(r.node.id);
+        }
+      }
+    }
 
     // If no FTS results, try LIKE-based substring search
     if (results.length === 0 && text.length >= 2) {
-      results = this.searchNodesLike(text, { kinds, languages, limit, offset });
+      results = this.searchNodesLike(text, scopeFor('nodes'), limit, offset);
     }
 
     // Final fuzzy fallback: scan all known names and keep those within
@@ -1551,7 +1591,7 @@ export class QueryBuilder {
     // returned nothing AND there's a text portion long enough to be
     // worth fuzzing (1-char queries would match too much).
     if (results.length === 0 && text.length >= 3) {
-      results = this.searchNodesFuzzy(text, { kinds, languages, limit });
+      results = this.searchNodesFuzzy(text, scopeFor('nodes'), limit);
     }
 
     // Supplement: ensure exact name matches are always candidates.
@@ -1573,23 +1613,18 @@ export class QueryBuilder {
     // Lowering the parameter in SQL rather than in JS is deliberate: SQLite's
     // `lower()` and NOCASE both fold ASCII only, while JS `.toLowerCase()`
     // folds Unicode, which would silently stop matching non-ASCII names.
-    if (results.length > 0 && query) {
+    //
+    // Terms come from the TEXT portion: a `kind:function` filter token is not
+    // a name to look up.
+    if (results.length > 0 && text) {
       const existingIds = new Set(results.map(r => r.node.id));
       const maxFtsScore = Math.max(...results.map(r => r.score));
-      const terms = query.split(/\s+/).filter(t => t.length >= 2);
+      const terms = text.split(/\s+/).filter(t => t.length >= 2);
+      const nodeScope = scopeFor('nodes');
       for (const term of terms) {
-        let sql = 'SELECT * FROM nodes WHERE lower(name) = lower(?) ORDER BY file_path, start_line, id';
-        const params: (string | number)[] = [term];
-        if (kinds && kinds.length > 0) {
-          sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
-          params.push(...kinds);
-        }
-        if (languages && languages.length > 0) {
-          sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
-          params.push(...languages);
-        }
-        sql += ' LIMIT 20';
-        const rows = this.db.prepare(sql).all(...params) as NodeRow[];
+        const rows = this.db.prepare(
+          `SELECT * FROM nodes WHERE lower(name) = lower(?)${nodeScope.sql} ORDER BY file_path, start_line, id LIMIT 20`
+        ).all(term, ...nodeScope.params) as NodeRow[];
         for (const row of rows) {
           if (!existingIds.has(row.id)) {
             results.push({ node: rowToNode(row), score: maxFtsScore });
@@ -1621,23 +1656,10 @@ export class QueryBuilder {
         };
       });
       results.sort((a, b) => b.score - a.score);
-      // Trim to requested limit after rescoring
-      if (results.length > limit) {
-        results = results.slice(0, limit);
-      }
     }
 
-    // Apply path: + name: filters AFTER scoring. Scoring already uses
-    // path/name as a soft signal; the explicit filters here are a hard
-    // gate. Done last so the FTS limit fetched plenty of candidates to
-    // narrow from.
-    if (pathFilters.length > 0) {
-      const lowered = pathFilters.map((p) => p.toLowerCase());
-      results = results.filter((r) => {
-        const fp = r.node.filePath.toLowerCase();
-        return lowered.some((p) => fp.includes(p));
-      });
-    }
+    // `path:` is already in the SQL scope; `name:` is a hard gate applied
+    // here, BEFORE the limit, so a selective name filter still fills the page.
     if (nameFilters.length > 0) {
       const lowered = nameFilters.map((n) => n.toLowerCase());
       results = results.filter((r) => {
@@ -1646,7 +1668,73 @@ export class QueryBuilder {
       });
     }
 
+    if (options.dedupe) results = dedupeSearchResults(results);
+
+    // Trim to requested limit after rescoring
+    if (results.length > limit) {
+      results = results.slice(0, limit);
+    }
+
     return results;
+  }
+
+  /**
+   * Sub-word candidates (#1520): nodes whose NAME has the query's words as
+   * identifier segments — `request` → `DataRequest` / `parse_request`,
+   * `test path` → `isTestPath`. Reads name_segment_vocab (segment → name,
+   * maintained on every node write; healed by `sync` on databases indexed
+   * before it existed), so no FTS schema change is needed.
+   *
+   * Each query word (≥3 chars) matches a segment exactly or as a prefix
+   * (`synth` → `synthesizer`), and a name must cover EVERY query word — FTS
+   * already ORs the words, this recall pass is the precise AND (`newFunc`
+   * must not surface `renamedFunc` on `func` alone). Shorter names first;
+   * per-word scans are capped so a ubiquitous segment (`get`) can't turn one
+   * query into a vocab sweep.
+   */
+  private searchNodesBySegments(
+    text: string,
+    scope: { sql: string; params: string[] },
+    limit: number,
+    baseScore: number,
+  ): SearchResult[] {
+    const words = [...new Set(
+      (text.match(/[\p{L}\p{N}]+/gu) ?? [])
+        .flatMap((run) => splitIdentifierSegments(run))
+        .filter((w) => w.length >= 3)
+    )].slice(0, 8);
+    if (words.length === 0) return [];
+
+    const PER_WORD_CAP = 5000;
+    const branches = words.map(
+      () => `SELECT * FROM (SELECT name, ? AS w FROM name_segment_vocab WHERE segment >= ? AND segment < ? LIMIT ${PER_WORD_CAP})`
+    );
+    const params: (string | number)[] = [];
+    for (const w of words) params.push(w, w, w + '\u{10FFFF}');
+    let ranked: Array<{ name: string; covered: number }>;
+    try {
+      ranked = this.db.prepare(
+        `SELECT name, COUNT(DISTINCT w) AS covered FROM (${branches.join(' UNION ALL ')})
+         GROUP BY name HAVING covered = ? ORDER BY length(name) ASC, name LIMIT ?`
+      ).all(...params, words.length, limit) as Array<{ name: string; covered: number }>;
+    } catch {
+      return []; // vocab table missing (pre-v7 database mid-migration) — no recall boost
+    }
+    if (ranked.length === 0) return [];
+
+    const out: SearchResult[] = [];
+    for (let i = 0; i < ranked.length && out.length < limit; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const names = ranked.slice(i, i + SQLITE_PARAM_CHUNK_SIZE).map((r) => r.name);
+      const rows = this.db.prepare(
+        `SELECT n.* FROM nodes n WHERE n.name IN (${names.map(() => '?').join(',')})
+         AND n.kind NOT IN ('file', 'import')${scope.sql}
+         ORDER BY n.file_path, n.start_line, n.id LIMIT ?`
+      ).all(...names, ...scope.params, limit - out.length) as NodeRow[];
+      for (const row of rows) {
+        out.push({ node: rowToNode(row), score: baseScore });
+      }
+    }
+    return out;
   }
 
   /**
@@ -1655,25 +1743,9 @@ export class QueryBuilder {
    * candidates ordered by name; the caller's filter pass narrows to
    * what was asked for.
    */
-  private searchAllByFilters(options: {
-    kinds?: NodeKind[];
-    languages?: Language[];
-    limit: number;
-  }): SearchResult[] {
-    const { kinds, languages, limit } = options;
-    let sql = 'SELECT * FROM nodes WHERE 1=1';
-    const params: (string | number)[] = [];
-    if (kinds && kinds.length > 0) {
-      sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
-      params.push(...kinds);
-    }
-    if (languages && languages.length > 0) {
-      sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
-      params.push(...languages);
-    }
-    sql += ' ORDER BY name LIMIT ?';
-    params.push(limit);
-    const rows = this.db.prepare(sql).all(...params) as NodeRow[];
+  private searchAllByFilters(scope: { sql: string; params: string[] }, limit: number): SearchResult[] {
+    const sql = `SELECT * FROM nodes WHERE 1=1${scope.sql} ORDER BY name LIMIT ?`;
+    const rows = this.db.prepare(sql).all(...scope.params, limit) as NodeRow[];
     return rows.map((row) => ({ node: rowToNode(row), score: 1 }));
   }
 
@@ -1687,9 +1759,9 @@ export class QueryBuilder {
    */
   private searchNodesFuzzy(
     text: string,
-    options: { kinds?: NodeKind[]; languages?: Language[]; limit: number }
+    scope: { sql: string; params: string[] },
+    limit: number,
   ): SearchResult[] {
-    const { kinds, languages, limit } = options;
     const lowered = text.toLowerCase();
     const maxDist = lowered.length <= 4 ? 1 : 2;
 
@@ -1715,20 +1787,10 @@ export class QueryBuilder {
 
     const results: SearchResult[] = [];
     const seen = new Set<string>();
+    const stmt = this.db.prepare(`SELECT * FROM nodes WHERE name = ?${scope.sql} LIMIT 5`);
     for (const c of cappedCandidates) {
       if (results.length >= limit) break;
-      let sql = 'SELECT * FROM nodes WHERE name = ?';
-      const params: (string | number)[] = [c.name];
-      if (kinds && kinds.length > 0) {
-        sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
-        params.push(...kinds);
-      }
-      if (languages && languages.length > 0) {
-        sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
-        params.push(...languages);
-      }
-      sql += ' LIMIT 5';
-      const rows = this.db.prepare(sql).all(...params) as NodeRow[];
+      const rows = stmt.all(c.name, ...scope.params) as NodeRow[];
       for (const row of rows) {
         if (seen.has(row.id)) continue;
         seen.add(row.id);
@@ -1789,9 +1851,12 @@ export class QueryBuilder {
   /**
    * FTS5 search with prefix matching
    */
-  private searchNodesFTS(query: string, options: SearchOptions): SearchResult[] {
-    const { kinds, languages, limit = 100, offset = 0 } = options;
-
+  private searchNodesFTS(
+    query: string,
+    scope: { sql: string; params: string[] },
+    limit: number,
+    offset: number,
+  ): SearchResult[] {
     // Add prefix wildcard for better matching (e.g., "auth" matches "AuthService", "authenticate")
     // Escape special FTS5 characters and add prefix wildcard.
     //
@@ -1799,19 +1864,23 @@ export class QueryBuilder {
     // so treat it as whitespace before the strip step. Otherwise queries
     // like `stage_apply::run` collapse to `stage_applyrun` (the colons
     // are stripped without splitting) and find nothing. See #173.
-    const ftsQuery = query
+    const terms = query
       .replace(/::/g, ' ') // Rust/C++/Ruby qualifier separator
-      .replace(/['"*():^]/g, '') // Remove FTS5 special chars
+      .replace(/['"*():^{}]/g, '') // Remove FTS5 special chars
       .split(/\s+/)
       .filter(term => term.length > 0)
       // Strip FTS5 boolean operators to prevent query manipulation
       .filter(term => !/^(AND|OR|NOT|NEAR)$/i.test(term))
-      .map(term => `"${term}"*`) // Prefix match each term
-      .join(' OR ');
+      .map(term => `"${term}"*`); // Prefix match each term
 
-    if (!ftsQuery) {
+    if (terms.length === 0) {
       return [];
     }
+    // Column filter: never match the `id` column. Node ids are
+    // `<kind>:<hash>`, so without this the word "function" or "component"
+    // matched every node of that kind through its id (#1520) — weight 0 in
+    // bm25 kept them low, but they still filled the candidate pool.
+    const ftsQuery = `{name qualified_name docstring signature} : (${terms.join(' OR ')})`;
 
     // BM25 column weights: id=0, name=20, qualified_name=5, docstring=1, signature=2
     // Heavy name weight ensures exact/prefix name matches rank above incidental
@@ -1820,30 +1889,16 @@ export class QueryBuilder {
     // nameMatchBonus) can promote results that BM25 alone undervalues.
     const ftsLimit = Math.max(limit * 5, 100);
 
-    let sql = `
+    const sql = `
       SELECT nodes.*, bm25(nodes_fts, 0, 20, 5, 1, 2) as score
       FROM nodes_fts
       JOIN nodes ON nodes_fts.id = nodes.id
-      WHERE nodes_fts MATCH ?
+      WHERE nodes_fts MATCH ?${scope.sql}
+      ORDER BY score LIMIT ? OFFSET ?
     `;
 
-    const params: (string | number)[] = [ftsQuery];
-
-    if (kinds && kinds.length > 0) {
-      sql += ` AND nodes.kind IN (${kinds.map(() => '?').join(',')})`;
-      params.push(...kinds);
-    }
-
-    if (languages && languages.length > 0) {
-      sql += ` AND nodes.language IN (${languages.map(() => '?').join(',')})`;
-      params.push(...languages);
-    }
-
-    sql += ' ORDER BY score LIMIT ? OFFSET ?';
-    params.push(ftsLimit, offset);
-
     try {
-      const rows = this.db.prepare(sql).all(...params) as (NodeRow & { score: number })[];
+      const rows = this.db.prepare(sql).all(ftsQuery, ...scope.params, ftsLimit, offset) as (NodeRow & { score: number })[];
       return rows.map((row) => ({
         node: rowToNode(row),
         score: Math.abs(row.score), // bm25 returns negative scores
@@ -1858,10 +1913,13 @@ export class QueryBuilder {
    * LIKE-based substring search for cases where FTS doesn't match
    * Useful for camelCase matching (e.g., "signIn" finds "signInWithGoogle")
    */
-  private searchNodesLike(query: string, options: SearchOptions): SearchResult[] {
-    const { kinds, languages, limit = 100, offset = 0 } = options;
-
-    let sql = `
+  private searchNodesLike(
+    query: string,
+    scope: { sql: string; params: string[] },
+    limit: number,
+    offset: number,
+  ): SearchResult[] {
+    const sql = `
       SELECT nodes.*,
         CASE
           WHEN name = ? THEN 1.0
@@ -1875,7 +1933,8 @@ export class QueryBuilder {
         name LIKE ? OR
         qualified_name LIKE ? OR
         name LIKE ?
-      )
+      )${scope.sql}
+      ORDER BY score DESC, length(name) ASC LIMIT ? OFFSET ?
     `;
 
     // Pattern variants for better matching
@@ -1891,20 +1950,10 @@ export class QueryBuilder {
       contains,       // WHERE: name contains
       contains,       // WHERE: qualified_name contains
       startsWith,     // WHERE: name starts with
+      ...scope.params,
+      limit,
+      offset,
     ];
-
-    if (kinds && kinds.length > 0) {
-      sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
-      params.push(...kinds);
-    }
-
-    if (languages && languages.length > 0) {
-      sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
-      params.push(...languages);
-    }
-
-    sql += ' ORDER BY score DESC, length(name) ASC LIMIT ? OFFSET ?';
-    params.push(limit, offset);
 
     const rows = this.db.prepare(sql).all(...params) as (NodeRow & { score: number })[];
 

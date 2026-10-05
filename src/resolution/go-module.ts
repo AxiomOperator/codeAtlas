@@ -35,6 +35,18 @@ export function loadGoModule(projectRoot: string): GoModule | null {
   return loadGoModuleAt(projectRoot, '');
 }
 
+/** The `module` path a go.mod declares, or null. */
+export function parseGoModulePath(content: string): string | null {
+  // `module <path>` is the first non-comment directive in any valid go.mod.
+  // Strip line comments so a `// module foo` doesn't false-match.
+  const stripped = content.replace(/\/\/[^\n]*/g, '');
+  const match = stripped.match(/^\s*module\s+(\S+)\s*$/m);
+  if (!match) return null;
+  // Strip optional quoting around the module path.
+  const modulePath = match[1]!.replace(/^["']|["']$/g, '');
+  return modulePath || null;
+}
+
 function loadGoModuleAt(projectRoot: string, relDir: string): GoModule | null {
   const dir = relDir ? path.join(projectRoot, relDir) : projectRoot;
   const goModPath = path.join(dir, 'go.mod');
@@ -44,13 +56,7 @@ function loadGoModuleAt(projectRoot: string, relDir: string): GoModule | null {
   } catch {
     return null;
   }
-  // `module <path>` is the first non-comment directive in any valid go.mod.
-  // Strip line comments so a `// module foo` doesn't false-match.
-  const stripped = content.replace(/\/\/[^\n]*/g, '');
-  const match = stripped.match(/^\s*module\s+(\S+)\s*$/m);
-  if (!match) return null;
-  // Strip optional quoting around the module path.
-  const modulePath = match[1]!.replace(/^["']|["']$/g, '');
+  const modulePath = parseGoModulePath(content);
   if (!modulePath) return null;
   // relDir is omitted for the root module so its shape (and the stored
   // resolution-config fingerprint) matches pre-#2322 indexes.

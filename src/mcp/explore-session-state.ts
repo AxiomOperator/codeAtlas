@@ -275,9 +275,30 @@ export class ExploreSessionState {
     };
   }
 
+  /**
+   * Once-per-session notices (e.g. the stale-extraction-version warning,
+   * #1852), keyed by notice kind + project. Bounded: a session that touches
+   * an absurd number of projects just re-shows a notice, never grows forever.
+   */
+  private readonly shownNotices = new Set<string>();
+
+  /**
+   * True the FIRST time a notice of `kind` is claimed for `projectRoot` in
+   * this session; false on every later call. The caller shows the notice only
+   * on true.
+   */
+  claimNotice(kind: string, projectRoot: string): boolean {
+    const key = `${kind}\0${exploreProjectKey(projectRoot)}`;
+    if (this.shownNotices.has(key)) return false;
+    if (this.shownNotices.size >= 256) this.shownNotices.clear();
+    this.shownNotices.add(key);
+    return true;
+  }
+
   /** Drop everything. Used by tests; a real session just goes away instead. */
   clear(): void {
     this.projects.clear();
+    this.shownNotices.clear();
   }
 
   /**

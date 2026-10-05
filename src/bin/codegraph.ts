@@ -1300,6 +1300,11 @@ program
     }
   });
 
+/** Commander collector for a repeatable string option (`--include a --include b`). */
+function collectOption(value: string, previous: string[]): string[] {
+  return [...previous, value];
+}
+
 /**
  * codegraph query <search>
  */
@@ -1309,8 +1314,14 @@ program
   .option('-p, --path <path>', 'Project path')
   .option('-l, --limit <number>', 'Maximum results', '10')
   .option('-k, --kind <kind>', 'Filter by node kind (function, class, etc.)')
+  .option('--include <pattern>', 'Only search files matching this path substring or glob (repeatable)', collectOption, [])
+  .option('--exclude <pattern>', 'Skip files matching this path substring or glob (repeatable)', collectOption, [])
+  .option('--no-dedupe', 'Keep identical copies of a symbol as separate results')
   .option('-j, --json', 'Output as JSON')
-  .action(async (search: string, options: { path?: string; limit?: string; kind?: string; json?: boolean }) => {
+  .action(async (search: string, options: {
+    path?: string; limit?: string; kind?: string; json?: boolean;
+    include?: string[]; exclude?: string[]; dedupe?: boolean;
+  }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
@@ -1328,6 +1339,9 @@ program
         // long-standing bare-array contract of `query --json` (#1639).
         limit: limit + 1,
         kinds: options.kind ? [options.kind as any] : undefined,
+        includePatterns: options.include?.length ? options.include : undefined,
+        excludePatterns: options.exclude?.length ? options.exclude : undefined,
+        dedupe: options.dedupe !== false,
       });
 
       // Mirror the MCP search down-rank so the CLI also surfaces the
@@ -1369,6 +1383,11 @@ program
             if (node.signature) {
               console.log(chalk.dim(`  ${node.signature}`));
             }
+            if (result.duplicates && result.duplicates.length > 0) {
+              console.log(chalk.dim(`  + ${result.duplicates.length} identical cop${result.duplicates.length === 1 ? 'y' : 'ies'}: ` +
+                result.duplicates.slice(0, 3).map((d) => `${d.filePath}:${d.startLine}`).join(', ') +
+                (result.duplicates.length > 3 ? ', …' : '')));
+            }
             console.log();
           }
           if (truncated) console.log(chalk.dim(truncationMessage));
@@ -1381,6 +1400,36 @@ program
       process.exit(1);
     }
   });
+
+/**
+ * Print a tool result for `explore` / `node`: the markdown as-is, or — with
+ * `--json` — its structured payload (#1280). A result without one (guidance
+ * such as "nothing matched") prints the same top-level shape with the text in
+ * `message`; an error prints `{ "error": … }`.
+ */
+function printToolResult(
+  result: import('../mcp/tool-definitions').ToolResult,
+  json: { command: 'explore' | 'node'; query?: string } | null,
+): void {
+  const text = result.content[0]?.text ?? '';
+  if (!json) {
+    console.log(text);
+    return;
+  }
+  if (result.isError) {
+    printStructuredError(text);
+    return;
+  }
+  // Lazy: only --json pays for loading the shape helpers.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { structuredFallback } = require('../mcp/structured-output') as typeof import('../mcp/structured-output');
+  const payload = result._cgStructured ?? structuredFallback(json.command, text, json.query);
+  console.log(JSON.stringify(payload, null, 2));
+}
+
+function printStructuredError(message: string): void {
+  console.log(JSON.stringify({ error: message }, null, 2));
+}
 
 /**
  * codegraph explore <query...>
@@ -1396,11 +1445,17 @@ program
   .description('Explore an area: relevant symbols\' source + call paths in one shot (same output as the codegraph_explore MCP tool)')
   .option('-p, --path <path>', 'Project path')
   .option('--max-files <number>', 'Maximum number of files to include source from')
-  .action(async (queryParts: string[], options: { path?: string; maxFiles?: string }) => {
+  .option('--max-chars <number>', 'Cap the output size in characters (lowers the default budget; never raises it; minimum 2000)')
+  .option('-j, --json', 'Output as JSON (symbols, flow, blast radius and source blocks as separate fields)')
+  .action(async (queryParts: string[], options: { path?: string; maxFiles?: string; maxChars?: string; json?: boolean }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
       if (!isInitialized(projectPath)) {
+        if (options.json) {
+          printStructuredError(`CodeGraph isn't available here — no .codegraph/ index exists in ${projectPath}.`);
+          process.exit(1);
+        }
         error(`CodeGraph isn't available here — no .codegraph/ index exists in ${projectPath}. If you are an AI agent: continue with your usual tools; indexing is the user's decision, do not run it yourself. (The project owner can enable CodeGraph with 'codegraph init'.)`);
         process.exit(1);
       }
@@ -1412,12 +1467,17 @@ program
 
       const args: Record<string, unknown> = { query: queryParts.join(' ') };
       if (options.maxFiles) args.maxFiles = parseInt(options.maxFiles, 10);
-      const result = await handler.execute('codegraph_explore', args);
+      if (options.maxChars) args.maxChars = parseInt(options.maxChars, 10);
+      const result = await handler.execute('codegraph_explore', args, undefined, { structured: !!options.json });
 
-      console.log(result.content[0]?.text ?? '');
+      printToolResult(result, options.json ? { command: 'explore', query: args.query as string } : null);
       cg.destroy();
       if (result.isError) process.exit(1);
     } catch (err) {
+      if (options.json) {
+        printStructuredError(`Explore failed: ${err instanceof Error ? err.message : String(err)}`);
+        process.exit(1);
+      }
       error(`Explore failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
@@ -1579,7 +1639,9 @@ program
           if (keyworded || tokenVerified) {
             const { ToolHandler } = await import('../mcp/tools');
             const handler = new ToolHandler(cg);
-            const result = await handler.execute('codegraph_explore', { query: prompt });
+            // The stale-index notice is for agent sessions and the CLI, not
+            // for an injection that repeats on every prompt.
+            const result = await handler.execute('codegraph_explore', { query: prompt }, undefined, { indexVersionNotice: false });
             const text = result.content[0]?.text ?? '';
             if (!result.isError && text.trim()) {
               // Cap the injection so a large-repo explore can't flood the prompt.
@@ -1719,7 +1781,8 @@ program
   .option('--offset <number>', 'File mode: 1-based start line')
   .option('--limit <number>', 'File mode: maximum lines')
   .option('--symbols-only', 'File mode: just the symbol map + dependents')
-  .action(async (name: string | undefined, options: { path?: string; file?: string; offset?: string; limit?: string; symbolsOnly?: boolean }) => {
+  .option('-j, --json', 'Output as JSON (each definition or the file window as separate fields)')
+  .action(async (name: string | undefined, options: { path?: string; file?: string; offset?: string; limit?: string; symbolsOnly?: boolean; json?: boolean }) => {
     // Need a symbol (positional) OR a file (--file / a path-like positional).
     // With [name] optional, a bare `codegraph node` reaches here with neither
     // and must be told what to pass, rather than crashing downstream.
@@ -1767,12 +1830,16 @@ program
       if (options.limit) args.limit = parseInt(options.limit, 10);
       if (options.symbolsOnly) args.symbolsOnly = true;
 
-      const result = await handler.execute('codegraph_node', args);
+      const result = await handler.execute('codegraph_node', args, undefined, { structured: !!options.json });
 
-      console.log(result.content[0]?.text ?? '');
+      printToolResult(result, options.json ? { command: 'node' } : null);
       cg.destroy();
       if (result.isError) process.exit(1);
     } catch (err) {
+      if (options.json) {
+        printStructuredError(`Node lookup failed: ${err instanceof Error ? err.message : String(err)}`);
+        process.exit(1);
+      }
       error(`Node lookup failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
@@ -1790,7 +1857,9 @@ program
   .option('--format <format>', 'Output format (tree, flat, grouped)', 'tree')
   .option('--max-depth <number>', 'Maximum directory depth for tree format')
   .option('--no-metadata', 'Hide file metadata (language, symbol count)')
-  .option('-j, --json', 'Output as JSON')
+  .option('--tests', 'Only test files')
+  .option('--no-tests', 'Exclude test files')
+  .option('-j, --json', 'Output as JSON (includes isTest and the owning package per file)')
   .action(async (options: {
     path?: string;
     filter?: string;
@@ -1798,6 +1867,7 @@ program
     format?: string;
     maxDepth?: string;
     metadata?: boolean;
+    tests?: boolean;
     json?: boolean;
   }) => {
     const projectPath = resolveProjectPath(options.path);
@@ -1830,6 +1900,13 @@ program
         files = files.filter(f => regex.test(f.path));
       }
 
+      // --tests / --no-tests: the same test-suite predicate search and
+      // `affected` use (#1877). Neither flag → no filtering.
+      if (options.tests !== undefined) {
+        const want = options.tests;
+        files = files.filter(f => cg.isTestPath(f.path) === want);
+      }
+
       if (files.length === 0) {
         info('No files found matching the criteria.');
         cg.destroy();
@@ -1838,20 +1915,30 @@ program
 
       // JSON output
       if (options.json) {
-        const output = files.map(f => ({
-          path: f.path,
-          language: f.language,
-          nodeCount: f.nodeCount,
-          size: f.size,
-          // What extraction recorded for the file — a parse error, a skip
-          // reason — so a health check needn't read the database (#2336).
-          errors: (f.errors ?? []).map((e) => ({
-            severity: e.severity,
-            code: e.code,
-            message: e.message,
-            line: e.line,
-          })),
-        }));
+        const owners = cg.getOwningManifests(files.map(f => f.path));
+        const output = files.map(f => {
+          const owner = owners.get(f.path) ?? null;
+          return {
+            path: f.path,
+            language: f.language,
+            nodeCount: f.nodeCount,
+            size: f.size,
+            // Is this file a test suite (#1877), and which package owns it —
+            // the nearest named manifest above it, or null (#1871).
+            isTest: cg.isTestPath(f.path),
+            package: owner
+              ? { name: owner.name, kind: owner.kind, manifest: owner.manifestPath, dir: owner.dir }
+              : null,
+            // What extraction recorded for the file — a parse error, a skip
+            // reason — so a health check needn't read the database (#2336).
+            errors: (f.errors ?? []).map((e) => ({
+              severity: e.severity,
+              code: e.code,
+              message: e.message,
+              line: e.line,
+            })),
+          };
+        });
         console.log(JSON.stringify(output, null, 2));
         cg.destroy();
         return;

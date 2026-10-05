@@ -47,10 +47,13 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   cobol: 'tree-sitter-cobol.wasm',
   vbnet: 'tree-sitter-vbnet.wasm',
   erlang: 'tree-sitter-erlang.wasm',
+  elixir: 'tree-sitter-elixir.wasm',
+  zig: 'tree-sitter-zig.wasm',
   solidity: 'tree-sitter-solidity.wasm',
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  bash: 'tree-sitter-bash.wasm',
 };
 
 /**
@@ -142,6 +145,12 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.cu': 'cpp',
   '.cuh': 'cpp',
   '.nix': 'nix',
+  // Shell scripts. tree-sitter-bash reads POSIX sh and most of zsh's
+  // script-level syntax (functions, `source`, assignments) well enough to
+  // extract; zsh-only expansions just recover as local ERROR nodes.
+  '.sh': 'bash',
+  '.bash': 'bash',
+  '.zsh': 'bash',
   // XML: file-level tracking; the MyBatis extractor matches `<mapper namespace="...">`
   // shape and emits SQL-statement nodes (other XML returns empty).
   '.xml': 'xml',
@@ -163,6 +172,13 @@ export const EXTENSION_MAP: Record<string, Language> = {
   // (`.app`/`.app.src` resource files route via isErlangAppFile below: their
   // last-dot extension is too generic for this map.)
   '.escript': 'erlang',
+  // Elixir: modules (.ex) and scripts (.exs — mix.exs, tests, config).
+  // Vendored elixir-lang/tree-sitter-elixir grammar.
+  '.ex': 'elixir',
+  '.exs': 'elixir',
+  // Zig: vendored tree-sitter-grammars/tree-sitter-zig grammar. (`.zon`
+  // package manifests are data, not code — not indexed.)
+  '.zig': 'zig',
   // Spring config: `application.properties` / `application-*.properties`. Same
   // shape as the `.yml` variants — the YAML/properties extractor emits one node
   // per leaf key, and the Spring resolver links `@Value("${k}")` references.
@@ -353,6 +369,17 @@ export async function initGrammars(): Promise<void> {
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
   'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
+  // Elixir: the prebuilt tree-sitter-elixir.wasm from the tree-sitter-elixir
+  // 0.3.5 npm package (elixir-lang/tree-sitter-elixir, Apache-2.0, ABI 14) —
+  // byte-identical to the tarball's artifact (sha256 ed99093c…). tree-sitter-
+  // wasms ships an older 0.1.x build behind an unpinned range.
+  // Zig: the prebuilt tree-sitter-zig.wasm from @tree-sitter-grammars/
+  // tree-sitter-zig 1.1.2 (MIT, ABI 14) — byte-identical to the tarball's
+  // artifact (sha256 54b3b83d…). tree-sitter-wasms pulls it in through an
+  // unpinned `^1.0.0`; vendoring pins it. Known grammar gap: an EMPTY
+  // container (`struct {}`) recovers with a zero-width MISSING field, which the
+  // Zig extractor ignores.
+  'elixir', 'zig',
   'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
   // R7a (C/C++ kernel port prep): tree-sitter-c v0.24.2 (b780e47) +
   // tree-sitter-cpp v0.23.4 (f41e1a0), parser.c/scanner.c sha-matched against
@@ -402,6 +429,13 @@ const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   // kernel compiles the same-commit vendored C (codegraph-kernel/grammars/
   // dart); crates.io tree-sitter-dart is a different-lineage fork (rejected).
   'dart',
+  // Bash: the tree-sitter-wasms build is unusable — its external scanner
+  // imports a libc symbol web-tree-sitter 0.25 doesn't export, so the first
+  // parse throws (`resolved is not a function`). Vendored instead: the
+  // prebuilt tree-sitter-bash.wasm from the tree-sitter-bash 0.25.1 npm
+  // package (tree-sitter/tree-sitter-bash, MIT), ABI 15 — byte-identical to
+  // the tarball's artifact (sha256 8292919c…). Not in the kernel; wasm only.
+  'bash',
 ]);
 
 /** Absolute path of a language's grammar WASM (vendored or tree-sitter-wasms). */
@@ -903,6 +937,7 @@ export function getLanguageDisplayName(language: Language): string {
     objc: 'Objective-C',
     solidity: 'Solidity',
     nix: 'Nix',
+    bash: 'Bash',
     yaml: 'YAML',
     twig: 'Twig',
     xml: 'XML',
@@ -913,6 +948,8 @@ export function getLanguageDisplayName(language: Language): string {
     cobol: 'COBOL',
     vbnet: 'Visual Basic .NET',
     erlang: 'Erlang',
+    elixir: 'Elixir',
+    zig: 'Zig',
     terraform: 'Terraform',
     arkts: 'ArkTS',
     unknown: 'Unknown',

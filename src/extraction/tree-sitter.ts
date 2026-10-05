@@ -23,6 +23,7 @@ import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
 import { stripCppTemplateArgs, isCppConstructorDeclaration } from './languages/c-cpp';
 import { rustImplTypeName } from './languages/rust';
+import { BASH_BUILTINS, BASH_COMMAND_WRAPPERS, BASH_FUNCTION_NAME_RE, bashHandlerArgument, bashSourceSpec } from './languages/bash';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -4366,11 +4367,95 @@ export class TreeSitterExtractor {
     });
   }
 
+  /**
+   * One shell `command` node. Its `name: command_name` decides what it is:
+   *   - `source FILE` / `. FILE` → an import node plus an `imports` ref the
+   *     resolver places on the sourced FILE (never a symbol);
+   *   - `trap HANDLER SIG…` → a `references` ref to the handler function (the
+   *     registration site depends on it; the shell calls it later);
+   *   - `command f` / `exec f` / `time f` → a call of `f`;
+   *   - a builtin (`echo`, `cd`, `[`) → nothing;
+   *   - a dynamic name (`$cmd`, `"${fn}"`, `./script.sh`) → nothing: no static
+   *     target to link;
+   *   - any other word → a `calls` ref by name. External programs (`grep`)
+   *     simply never match a definition and drop out at resolution.
+   * Arguments are walked by the caller's normal recursion, so a nested
+   * `$(helper)` still records its own call.
+   */
+  private extractBashCommand(node: SyntaxNode, callerId: string): void {
+    const nameNode = getChildByField(node, 'name');
+    const word = nameNode?.namedChild(0);
+    if (!nameNode || !word || word.type !== 'word' || nameNode.namedChildCount !== 1) return;
+    // `\cmd` is `cmd` with alias expansion suppressed (`\. "$DIR/nvm.sh"`).
+    let name = getNodeText(word, this.source).replace(/^\\/, '');
+    const args = node.childrenForFieldName('argument').filter((a): a is SyntaxNode => !!a);
+    const line = node.startPosition.row + 1;
+    const column = node.startPosition.column;
+
+    if (name === 'source' || name === '.') {
+      const arg = args[0];
+      if (!arg) return;
+      const spec = bashSourceSpec(arg, this.source);
+      if (!spec) return;
+      this.createNode('import', spec, node, {
+        signature: getNodeText(node, this.source).split('\n', 1)[0]!.trim().slice(0, 100),
+      });
+      this.unresolvedReferences.push({
+        fromNodeId: callerId,
+        referenceName: spec,
+        referenceKind: 'imports',
+        line,
+        column,
+      });
+      return;
+    }
+
+    const handler = bashHandlerArgument(name, args, this.source);
+    if (handler !== undefined) {
+      // A handler registration — `trap cleanup EXIT`, zsh's `add-zsh-hook
+      // precmd fn`, `zle -N widget fn`, `compdef _fn cmd`. The shell calls the
+      // function later; the registration site depends on it. A quoted command
+      // string with arguments (`trap 'rm -f $tmp' EXIT`) has no single target.
+      const text = handler === null ? '' : getNodeText(handler, this.source).replace(/^(["'])(.*)\1$/s, '$2').trim();
+      if (text && BASH_FUNCTION_NAME_RE.test(text) && !BASH_BUILTINS.has(text)) {
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: text,
+          referenceKind: 'references',
+          line,
+          column,
+        });
+      }
+      return;
+    }
+
+    if (BASH_COMMAND_WRAPPERS.has(name)) {
+      const target = args.find((a) => !getNodeText(a, this.source).startsWith('-'));
+      if (!target || target.type !== 'word') return;
+      name = getNodeText(target, this.source);
+    }
+
+    if (BASH_BUILTINS.has(name) || !BASH_FUNCTION_NAME_RE.test(name)) return;
+    this.unresolvedReferences.push({
+      fromNodeId: callerId,
+      referenceName: name,
+      referenceKind: 'calls',
+      line,
+      column,
+    });
+  }
+
   private extractCall(node: SyntaxNode): void {
     if (this.nodeStack.length === 0) return;
 
     const callerId = this.nodeStack[this.nodeStack.length - 1];
     if (!callerId) return;
+
+    // Shell: every invocation is a `command` — see extractBashCommand.
+    if (this.language === 'bash') {
+      this.extractBashCommand(node, callerId);
+      return;
+    }
 
     // VB.NET: `foo(args)` is syntactically ambiguous between a call and an
     // index read, so the grammar parses non-empty parens as
@@ -4410,6 +4495,20 @@ export class TreeSitterExtractor {
           fromNodeId: callerId,
           referenceName: calleeName,
           referenceKind: 'calls',
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column,
+        });
+      }
+      return;
+    }
+
+    // A language that owns its call-site refs (Elixir, Zig) — see callRefs.
+    if (this.extractor?.callRefs) {
+      for (const ref of this.extractor.callRefs(node, this.source)) {
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: ref.name,
+          referenceKind: ref.kind,
           line: node.startPosition.row + 1,
           column: node.startPosition.column,
         });
