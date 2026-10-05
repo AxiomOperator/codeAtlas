@@ -2,8 +2,11 @@ import { createDatabase, rollbackIfActive, type SqliteDatabase } from './sqlite-
 import { QueryBuilder } from './queries';
 import { createYielder } from '../resolution/cooperative-yield';
 
+import { SYNTHESIZED_EDGE } from './schema-ddl';
+
 // Ownership is independent of provenance: Go method containment is structural.
-export const SYNTHESIZED_EDGE = "CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.synthesizedBy') END IS NOT NULL";
+// The predicate lives in schema-ddl.ts so it matches the partial index verbatim.
+export { SYNTHESIZED_EDGE };
 
 /** A private edge overlay: passes see base edges plus their new Go prerequisites. */
 export class SynthesisStage {

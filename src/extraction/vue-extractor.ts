@@ -2,7 +2,8 @@ import { Node, Edge, ExtractionResult, ExtractionError, UnresolvedReference, Lan
 import { generateNodeId } from './tree-sitter-helpers';
 import { TreeSitterExtractor } from './tree-sitter';
 import { isLanguageSupported } from './grammars';
-import { foldScriptResult, sfcFileNode } from './sfc-script';
+import { foldScriptResult } from './sfc-script';
+import { buildFileNode } from './file-node';
 import { vueOptionsMembers } from './vue-options-api';
 
 /**
@@ -19,6 +20,19 @@ const VUE_BUILTIN_COMPONENTS = new Set([
   'Component',
   'Slot',
 ]);
+
+/** Words that look like a call in an expression (`if (`, `typeof (`) but aren't one. */
+const TEMPLATE_NON_CALLS = new Set([
+  'if', 'for', 'while', 'switch', 'catch', 'function', 'return', 'typeof', 'void',
+  'delete', 'in', 'of', 'instanceof', 'await', 'new',
+]);
+
+/** `{{ expr }}` interpolations. */
+const TEMPLATE_INTERPOLATION_RE = /\{\{([\s\S]*?)\}\}/g;
+/** Bound attributes and directives — `:to`, `v-bind:x`, `@click`, `v-on:x`, `v-if`, `#slot` — and their value. */
+const TEMPLATE_BOUND_ATTR_RE = /(?<=[\s<])(?::|@|#|v-)[\w.:\-[\]]*\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+/** A callee: an identifier or a member path, not itself the tail of another expression. */
+const TEMPLATE_CALL_RE = /(?<![\w$.\]])([A-Za-z_$][\w$]*(?:\??\.[A-Za-z_$][\w$]*)*)\s*\(/g;
 
 /** `my-component` → `MyComponent` (Vue allows either form in templates). */
 function kebabToPascal(name: string): string {
@@ -58,7 +72,7 @@ export class VueExtractor {
 
     try {
       // The file, holding the component the .vue file is
-      this.nodes.push(sfcFileNode(this.filePath, this.source, 'vue'));
+      this.nodes.push(buildFileNode(this.filePath, this.source, 'vue'));
       const componentNode = this.createComponentNode();
       this.edges.push({ source: `file:${this.filePath}`, target: componentNode.id, kind: 'contains' });
 
@@ -74,6 +88,9 @@ export class VueExtractor {
       // markup (incl. through a barrel import) is invisible to callers /
       // impact (#629 follow-up).
       this.extractTemplateComponents(componentNode.id);
+      // Calls written in template expressions — `{{ useBar(link) }}`,
+      // `:to="localePath(link.location)"`, `@click="save(item)"` (#2340).
+      this.extractTemplateCalls(componentNode.id);
     } catch (error) {
       this.errors.push({
         message: `Vue extraction error: ${error instanceof Error ? error.message : String(error)}`,
@@ -262,6 +279,65 @@ export class VueExtractor {
       { filePath: this.filePath, componentNodeId, lineOffset: block.startLine, language: 'vue', perInstance: block.isSetup },
       { nodes: this.nodes, edges: this.edges, unresolvedReferences: this.unresolvedReferences, errors: this.errors }
     );
+  }
+
+  /**
+   * Calls written in the template's expressions — interpolations and bound
+   * attributes / directives — as `calls` references from the component (#2340).
+   * A composable or helper used only in markup (`{{ useBar(link) }}`,
+   * `:to="localePath(x)"`) otherwise had no caller at all. `$`-prefixed Vue
+   * globals (`$t`, `$emit`) and string contents are skipped; a member chain
+   * deeper than `obj.fn` names nothing a static resolver can follow.
+   */
+  private extractTemplateCalls(componentNodeId: string): void {
+    // Blank <script>/<style> blocks and HTML comments, keeping offsets and lines.
+    const blank = (m: string) => m.replace(/[^\n]/g, ' ');
+    const text = this.source
+      .replace(/<(script|style)(\s[^>]*)?>[\s\S]*?<\/\1>/g, blank)
+      .replace(/<!--[\s\S]*?-->/g, blank);
+    const lineStarts = [0];
+    for (let i = 0; i < text.length; i++) if (text[i] === '\n') lineStarts.push(i + 1);
+    const position = (offset: number): { line: number; column: number } => {
+      let lo = 0;
+      let hi = lineStarts.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (lineStarts[mid]! <= offset) lo = mid;
+        else hi = mid - 1;
+      }
+      return { line: lo + 1, column: offset - lineStarts[lo]! + 1 };
+    };
+    const scan = (expr: string, base: number): void => {
+      // Blank string-literal contents so `'fmt(x)'` is not a call.
+      const code = expr.replace(/(['"`])(?:\\.|(?!\1)[^\\])*\1/g, blank);
+      TEMPLATE_CALL_RE.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = TEMPLATE_CALL_RE.exec(code))) {
+        const name = m[1]!.replace(/\?\./g, '.');
+        const parts = name.split('.');
+        if (parts.length > 2 || name.startsWith('$') || TEMPLATE_NON_CALLS.has(parts[0]!)) continue;
+        if (/\bnew\s+$/.test(code.slice(0, m.index))) continue;
+        const { line, column } = position(base + m.index);
+        this.unresolvedReferences.push({
+          fromNodeId: componentNodeId,
+          referenceName: name,
+          referenceKind: 'calls',
+          line,
+          column,
+          filePath: this.filePath,
+          language: 'vue',
+        });
+      }
+    };
+    let m: RegExpExecArray | null;
+    TEMPLATE_INTERPOLATION_RE.lastIndex = 0;
+    while ((m = TEMPLATE_INTERPOLATION_RE.exec(text))) scan(m[1]!, m.index + 2);
+    TEMPLATE_BOUND_ATTR_RE.lastIndex = 0;
+    while ((m = TEMPLATE_BOUND_ATTR_RE.exec(text))) {
+      const value = m[1] ?? m[2] ?? '';
+      // The value sits just before the closing quote.
+      scan(value, m.index + m[0].length - 1 - value.length);
+    }
   }
 
   /**

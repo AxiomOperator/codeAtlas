@@ -1191,13 +1191,14 @@ export const exported = { handler: () => target() };
     });
 
     it('a non-exported object literal contributes calls (it was skipped outright)', () => {
-      // `exported`'s members are minted as their own function nodes, so its
-      // arrow's call comes from `handler`; the non-exported ones attribute to
-      // the declared constant.
+      // An object literal's function members are minted as their own nodes
+      // whether or not it is exported (#2300), so each `handler` arrow's call
+      // comes from `handler`; a data member's call (`plain: target()`) and the
+      // array's arrow attribute to the declared constant.
       expect(callersOf('target')).toEqual([
         'constant:list',
         'constant:obj',
-        'constant:obj',
+        'function:handler',
         'function:handler',
       ]);
     });

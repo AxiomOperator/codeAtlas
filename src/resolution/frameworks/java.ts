@@ -8,17 +8,313 @@ import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 import { pickByNameAndKind } from './name-heuristic';
+import { lineOfIndex } from '../synth-utils';
+
+// ---------------------------------------------------------------------------
+// ANNOTATION-SCANNED BEAN JOIN (v1.1 V3-scanJoin)
+// ---------------------------------------------------------------------------
+// The resolution-side bridge for `SpringBeansExtractor`'s bean→bean `ref=`
+// channel: `ref="userService"` names no `<bean id="userService">` anywhere in
+// the XML, but in real Spring apps it overwhelmingly names a Java class
+// stereotype-annotated `@Service`/`@Component`/`@Repository`/`@Controller`,
+// whose EFFECTIVE bean name is either the annotation's explicit value
+// (`@Service("userService")`) or, absent one, the decapitalized simple class
+// name (`UserService` → `userService`, Spring's own default-naming rule).
+// Real-world validation found ~52% of dangling Spring-beans-XML refs were
+// exactly this.
+//
+// Design choice — resolution-time regex scan over class source, NOT a
+// `decorates`-edge lookup: `extractDecoratorsFor` (tree-sitter.ts) already
+// emits a `decorates` UnresolvedReference from an annotated class to the
+// annotation's bare name (`Service`), which looks like the obvious signal to
+// query post-resolution. It isn't usable here: Spring's own `@Service` et al.
+// are framework-external (never declared in-repo), so that `decorates` ref
+// itself never resolves to anything — like every other unresolved reference,
+// it gets DELETED from the unresolved_references table at the end of the
+// very same batch that failed to resolve it (see `resolveAndPersistBatched`'s
+// "both resolved and unresolved refs are deleted" cleanup), with no ordering
+// guarantee relative to when THIS bridge's own ref is processed. Nor does it
+// carry the annotation's explicit VALUE argument — `extractDecoratorsFor`
+// only records the decorator's plain identifier. A direct regex scan of the
+// class's own source (mirroring this file's existing `@Value`/`@RequestMapping`
+// extraction, and `springResolver.detect()`'s own `context.readFile` use) is
+// therefore both more accurate (captures the value) and unconditionally
+// available, matching the task brief's fallback: "have the JAVA extractor
+// already record the derived bean name somewhere match-able" — done here at
+// resolve time instead of extraction time so it stays a pure resolution-layer
+// concern, costs nothing for non-Spring-XML projects (built lazily, only when
+// an XML bean ref actually needs it), and needs no new node kind.
+//
+// Precision gates (per codegraph's retrieval/precision contract):
+//  - Scoped to unresolved `references` whose SOURCE is a Spring-beans-XML
+//    bean node (`kind: 'variable'`, `language: 'xml'` — SpringBeansExtractor's
+//    node shape; see its class doc) — never touches a same-shaped `references`
+//    ref from any other language/extractor.
+//  - Resolves ONLY when EXACTLY ONE class in the whole project derives that
+//    effective bean name (`buildSpringBeanNameIndex` below) — two classes
+//    landing on the same name (default OR explicit) is genuine ambiguity in a
+//    real Spring app (whichever XML config wins depends on classpath scanning
+//    order, which codegraph can't observe), so it's left unresolved rather
+//    than guessing.
+//  - Stands DOWN entirely (no edge from this join) when an XML-DECLARED bean
+//    (`<bean id="…">`/`name="…"`) with the exact ref name exists
+//    (`xmlDeclaredBeanNameIndexes` below) — an explicit XML bean definition
+//    always outranks a scanned-component guess in Spring semantics, whether
+//    one or several XML files declare that id. Strategy 3 name matching
+//    handles the declared-bean case (incl. its own ambiguity degrade for
+//    profile-split multi-file declarations) once this join stays out of it.
+//  - `claimsReference`'s pre-filter opt-in is gated on the SAME source check
+//    as `resolve()` (both call `isXmlBeanJoinSourceRef`) — the opt-in escape
+//    routes a claimed ref through codegraph's ENTIRE resolution pipeline for
+//    that ref (every other framework, import resolution, `matchFuzzy`), not
+//    just this resolver's own `resolve()`, so a name-shape-only claim (with
+//    no `referenceKind`/`language`/source-node check) would leak unrelated
+//    dangling camelCase refs project-wide into strategies that then resolve
+//    them wrongly.
+//  - Marked like every other framework-synthesized edge here: `resolvedBy:
+//    'framework'` via the normal ResolvedRef→Edge path (`createEdges` in
+//    resolution/index.ts stamps `metadata.{confidence,resolvedBy}` — the same
+//    convention `resolveByNameAndKind`'s Service/Repository/Controller
+//    patterns below already use), no bespoke edge-creation path needed.
+
+/**
+ * Java/Kotlin stereotype annotations that register a bean with Spring's
+ * component scanner. `RestController`/`RestControllerAdvice` are their own
+ * distinct annotations (not merely `@Controller` with a meta-annotation the
+ * plain `Controller` alternative would catch — `@RestController` doesn't
+ * literally start with the text `Controller`), so they need their own
+ * alternatives here; recall win, zero precision risk, since both are
+ * unambiguously component-scanned bean stereotypes just like the other four.
+ */
+const SPRING_STEREOTYPE_ANNOTATIONS = [
+  'Component',
+  'Service',
+  'Repository',
+  'Controller',
+  'RestController',
+  'RestControllerAdvice',
+];
+
+/**
+ * Reused across all four stereotypes: `@Stereotype` optionally followed by
+ * `("value")` / `(value = "value")`, then zero or more OTHER annotations
+ * (any order relative to the stereotype — `@Service @Transactional class X`
+ * and `@Transactional @Service class X` both match, since the regex only
+ * anchors on the stereotype token and the literal class name, not their
+ * relative position) and modifier keywords, then `class <ClassName>`. Built
+ * per-class (the class's own simple name is spliced in as a literal) rather
+ * than once, so a multi-class file resolves each class's OWN annotation only
+ * — never a sibling class's.
+ */
+function stereotypeAnnotationRegex(className: string): RegExp {
+  const escapedClass = className.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const stereotypeAlt = SPRING_STEREOTYPE_ANNOTATIONS.join('|');
+  return new RegExp(
+    `@(?:${stereotypeAlt})\\b` +
+      `(?:\\s*\\(\\s*(?:value\\s*=\\s*)?["']([^"']*)["']\\s*\\))?` +
+      `\\s*(?:@[\\w.]+(?:\\([^)]*\\))?\\s*)*` +
+      `(?:public\\s+|final\\s+|abstract\\s+|static\\s+|sealed\\s+|non-sealed\\s+|open\\s+|data\\s+)*` +
+      `class\\s+${escapedClass}\\b`
+  );
+}
+
+/** `UserService` → `userService` — Spring's own default bean-naming rule. */
+function decapitalize(name: string): string {
+  return name.length > 0 ? name.charAt(0).toLowerCase() + name.slice(1) : name;
+}
+
+/**
+ * This class's EFFECTIVE Spring bean name, or `null` when it carries no
+ * stereotype annotation at all. `context.readFile` + `stripCommentsForRegex`
+ * mirrors `springResolver.extract()`'s own regex approach elsewhere in this
+ * file (comments stripped so a `// @Service` in a docstring never fires;
+ * string-literal CONTENTS are preserved by `stripCommentsForRegex`'s C-style
+ * mode, so the `"userService"` in `@Service("userService")` survives intact).
+ */
+function derivedBeanName(cls: Node, context: ResolutionContext): string | null {
+  const content = context.readFile(cls.filePath);
+  if (!content) return null;
+  // Kotlin shares Java's comment/string syntax; `stripCommentsForRegex` has
+  // no dedicated 'kotlin' mode, and `extract()` below already reuses 'java'
+  // for both languages for the same reason.
+  const safe = stripCommentsForRegex(content, 'java');
+  const match = stereotypeAnnotationRegex(cls.name).exec(safe);
+  if (!match) return null;
+  const explicitValue = match[1]?.trim();
+  return explicitValue ? explicitValue : decapitalize(cls.name);
+}
+
+/**
+ * derived bean name → candidate class node ids, built once per class-node snapshot of a resolution
+ * context (a `WeakMap` keyed by the context object itself — not a module-
+ * level `Map` — so a second `CodeGraph` instance in the same process, e.g.
+ * back-to-back test suites, never sees a stale/foreign project's index; same
+ * pattern as `cics.ts`'s `transidIndexes` and `rust.ts`'s
+ * `cargoWorkspaceMapCache`). Lazily built on first use — a project with no
+ * Spring-beans-XML dangling refs never triggers a single `readFile` here.
+ * Cost is one file read + one regex exec per Java/Kotlin CLASS node,
+ * proportional to project size but paid at most once per resolution pass —
+ * never per-reference, which is what would risk the O(refs × classes)
+ * blow-up the config-key resolution incident (#1180) already burned this
+ * codebase on once.
+ */
+const springBeanNameIndexes = new WeakMap<ResolutionContext, { source: readonly Node[]; index: Map<string, string[]> }>();
+
+function buildSpringBeanNameIndex(context: ResolutionContext): Map<string, string[]> {
+  const index = new Map<string, string[]>();
+  const classes = context
+    .getNodesByKind('class')
+    .filter((n) => n.language === 'java' || n.language === 'kotlin');
+  for (const cls of classes) {
+    const name = derivedBeanName(cls, context);
+    if (!name) continue;
+    const existing = index.get(name);
+    if (existing) existing.push(cls.id);
+    else index.set(name, [cls.id]);
+  }
+  return index;
+}
+
+/**
+ * Names of every XML-DECLARED bean (`<bean id="…">`/`name="…"`, plus the
+ * namespaced-element equivalents — `SpringBeansExtractor.emitBean`/
+ * `emitNamespacedBean`'s `kind: 'variable'`, `language: 'xml'` node shape).
+ * Same lazy-build-once-per-context caching as `springBeanNameIndexes` above.
+ *
+ * Used by the join's ambiguity gate below: Spring semantics say an EXPLICIT
+ * `<bean id="userService">` always overrides a scanned `@Service` component
+ * with the same effective name (whichever XML config actually wins between
+ * several declared beans of that name — e.g. dev/prod profile-split contexts
+ * — is left to the generic name-matcher's own multi-candidate handling,
+ * which this join must stand down for either way).
+ */
+const xmlDeclaredBeanNameIndexes = new WeakMap<ResolutionContext, { source: readonly Node[]; names: Set<string> }>();
+
+function buildXmlDeclaredBeanNameIndex(context: ResolutionContext): Set<string> {
+  const names = new Set<string>();
+  for (const n of context.getNodesByKind('variable')) {
+    if (n.language === 'xml') names.add(n.name);
+  }
+  return names;
+}
+
+/**
+ * Does `ref` come from the Spring-beans-XML bean `ref=` channel this join
+ * bridges — i.e. is this resolver actually entitled to claim/resolve it?
+ * Shared by `claimsReference` (the pre-filter opt-in) and `resolve` (the
+ * actual join) so the two can never diverge: a ref this returns `false` for
+ * must never reach `matchFuzzy`/import-resolution/other frameworks via this
+ * resolver's pre-filter escape, AND must never be joined by `resolve` either.
+ * `kind: 'variable'`, `language: 'xml'` per
+ * SpringBeansExtractor.emitBean/emitNamespacedBean — a `references` ref from
+ * any other xml-language source (MyBatis's extractor also emits
+ * `xml`-language `references` refs, but from method/constant-kind nodes) is
+ * excluded by the node-kind check, not just the language check.
+ */
+function isXmlBeanJoinSourceRef(ref: UnresolvedRef, context?: ResolutionContext): boolean {
+  if (ref.referenceKind !== 'references' || ref.language !== 'xml') return false;
+  const fromNode = context?.getNodeById?.(ref.fromNodeId);
+  // `getNodeById`/`context` unavailable (e.g. minimal test doubles) — fall
+  // back to trusting `language==='xml'` + `referenceKind==='references'`
+  // alone, same as before this was extracted into a shared helper.
+  return !fromNode || (fromNode.kind === 'variable' && fromNode.language === 'xml');
+}
+
+/**
+ * Does `ref` come from the `@Value`/`@ConfigurationProperties` config-key
+ * channel that mints the `:prefix` sentinel (`extractSpringValueBindings`
+ * below) — i.e. is `claimsReference`'s `:prefix` branch actually entitled to
+ * opt this ref through the pre-filter on sentinel shape alone? Same leak
+ * class `isXmlBeanJoinSourceRef` closes for the bean-name-shape claim below
+ * it: a `claimsReference` opt-in keyed on NAME SHAPE alone (here, "ends with
+ * `:prefix`") would otherwise accept a same-shaped name from ANY
+ * language/extractor and route it through the FULL resolution pipeline
+ * (every other framework, import resolution, `matchFuzzy`) — not just this
+ * resolver's own `resolve()`. `extractSpringValueBindings` only ever mints
+ * this sentinel on a `references`-kind ref sourced from Java/Kotlin, so
+ * that's the gate — same referenceKind+language check `isXmlBeanJoinSourceRef`
+ * makes, just scoped to this channel's own actual source (java/kotlin)
+ * instead of the XML bean join's (xml).
+ */
+function isSpringConfigPrefixSourceRef(ref: UnresolvedRef): boolean {
+  return ref.referenceKind === 'references' && (ref.language === 'java' || ref.language === 'kotlin');
+}
+
+/**
+ * A bare identifier shaped like a decapitalized multi-word class name
+ * (`userService`, `dataSourceBean`) — starts lowercase, has at least one
+ * LATER uppercase letter (a genuine camelCase word boundary), and no
+ * separator character. This is the `claimsReference` opt-in for the join
+ * above: the ref's exact name never exists as a declared node (that's WHY
+ * it's dangling — the whole point of this bridge), so the resolver's
+ * name-existence pre-filter drops it before `resolve()` ever runs, same
+ * problem `cics.ts`'s `cics-transid:` prefix and `terraform.ts`'s
+ * `module.M:` prefix solve for their own dangling-by-construction refs. This
+ * bridge has no such extractor-emitted sentinel to key off (the XML
+ * extractor's `ref=` value is deliberately a PLAIN bean name — see
+ * `pushRef`'s doc comment — so ordinary bean→bean XML refs keep resolving via
+ * the generic exact-name matcher unchanged), so the opt-in is a name-SHAPE
+ * heuristic instead. Deliberately narrower than a bare `/^[a-z]\w*$/` shape
+ * (which would additionally claim single-word names like `list`/`service` —
+ * the common shape of a genuinely-dangling call/typo in ANY language, not
+ * just Spring — inflating this escape hatch project-wide): requiring an
+ * internal capital cuts that overlap sharply, since a real single-word
+ * identifier essentially never LOOKS like this, while a decapitalized
+ * multi-word Java class name (the realistic bean-name population validation
+ * found) always does.
+ *
+ * The shape check ALONE is still not a safe opt-in, though: `claimsReference`
+ * only receives a bare `name` from the index-level shape regex, but the
+ * pre-filter escape it feeds (`resolveOne` in resolution/index.ts) routes a
+ * claimed ref through the FULL resolution pipeline for that ref — every
+ * OTHER registered framework, import resolution, and Strategy-3 name
+ * matching including `matchFuzzy` — not just this resolver's own `resolve()`.
+ * A camelCase-shaped name is common far outside Spring XML (external static
+ * imports, library calls, ordinary typos in ANY language), so a shape-only
+ * claim would opt those into `matchFuzzy` too and manufacture wrong edges
+ * project-wide — this is why `claimsReference` also calls
+ * `isXmlBeanJoinSourceRef` (the same source check `resolve()` uses) before
+ * claiming: only a ref that is ACTUALLY the XML-bean-sourced channel this
+ * join bridges gets the escape, so every other camelCase-shaped ref (any
+ * language, any kind) is unaffected, same as before this bridge existed.
+ * Trade-off, accepted deliberately: an explicit `@Service("all-lowercase")`
+ * or `@Service("kebab-case")` value has no internal capital and won't be
+ * claimed by this shape check — recall loss on an unusual naming choice, not
+ * a correctness bug (mirrors this codebase's existing "accepted recall loss"
+ * stance — see `PLACEHOLDER_REF_NO_DEFAULT_RE`'s doc comment in the
+ * extractor for the same kind of documented trade-off).
+ */
+const XML_BEAN_JOIN_NAME_SHAPE_RE = /^[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*$/;
 
 export const springResolver: FrameworkResolver = {
   name: 'spring',
   languages: ['java', 'kotlin', 'yaml', 'properties'],
 
-  claimsReference(name: string): boolean {
+  claimsReference(name: string, ref?: UnresolvedRef, context?: ResolutionContext): boolean {
     // `@ConfigurationProperties(prefix="app.cache")` emits a reference whose
     // name carries the `:prefix` sentinel — there's no declared symbol with
     // that exact spelling, so the resolver's name-existence pre-filter would
-    // drop it. Opt those through.
-    return name.endsWith(':prefix');
+    // drop it. Opt those through — but gated on `ref` actually being that
+    // channel (`isSpringConfigPrefixSourceRef`), not on name shape alone:
+    // `extractSpringValueBindings` only ever mints this sentinel on a
+    // java/kotlin-sourced `references` ref, but nothing stops an unrelated
+    // ref from a DIFFERENT language/channel happening to end in `:prefix`
+    // too, and an ungated claim here would route THAT through the full
+    // resolution pipeline on shape alone — the same leak class
+    // `isXmlBeanJoinSourceRef` closes for the shape claim just below.
+    if (name.endsWith(':prefix')) return !!ref && isSpringConfigPrefixSourceRef(ref);
+    // See `XML_BEAN_JOIN_NAME_SHAPE_RE`'s doc comment above. The shape check
+    // alone is NOT enough to opt a ref in: without `ref`/`context` this
+    // resolver cannot tell a genuinely-dangling XML bean `ref=` apart from
+    // an unrelated dangling camelCase name in ANY language (an external
+    // static-import call, a typo'd method name, …) — and the pre-filter
+    // escape below routes a claimed ref through the FULL resolution
+    // pipeline (every other framework, imports, `matchFuzzy`), not just this
+    // resolver's own `resolve()`. So: no `ref` (a caller not passing it) ⇒
+    // don't claim, conservatively — and with `ref`, only claim when it's
+    // actually the XML-bean-sourced ref this join is scoped to.
+    if (!ref) return false;
+    return XML_BEAN_JOIN_NAME_SHAPE_RE.test(name) && isXmlBeanJoinSourceRef(ref, context);
   },
 
   detect(context: ResolutionContext): boolean {
@@ -59,6 +355,61 @@ export const springResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // ANNOTATION-SCANNED BEAN JOIN (v1.1 V3-scanJoin) — see the module-level
+    // doc comment above for the full design rationale. Gated first (cheap
+    // field checks) so every OTHER ref pays only this one check: a
+    // Spring-beans-XML bean node's `ref=` channel is the ONLY thing that
+    // reaches here — see `isXmlBeanJoinSourceRef`'s doc comment.
+    if (isXmlBeanJoinSourceRef(ref, context)) {
+      // An EXPLICIT XML-declared bean with this exact name/id always
+      // outranks a scanned-component guess in real Spring semantics — the
+      // ambiguity precision gate below only counts COMPETING @Stereotype
+      // classes, so without this check a profile-split `<bean id="userService">`
+      // declared in two XML files (a common real layout) lost to the
+      // annotated class here at 0.85, even though `<bean id>` is a stronger,
+      // explicit signal than a scanned default/annotated name. Stand down
+      // and let Strategy 3 name matching resolve to the declared XML bean(s)
+      // instead (its own ambiguity handling degrades confidence when several
+      // files declare the same id, same as any other multiply-declared name).
+      // The resolver's context outlives a sync; its per-kind node arrays do
+      // not (they are rebuilt after every graph change). Keyed on that array's
+      // identity, as the router tables are, so a class added by a later sync
+      // is seen.
+      const variables = context.getNodesByKind('variable');
+      let declared = xmlDeclaredBeanNameIndexes.get(context);
+      if (!declared || declared.source !== variables) {
+        declared = { source: variables, names: buildXmlDeclaredBeanNameIndex(context) };
+        xmlDeclaredBeanNameIndexes.set(context, declared);
+      }
+      if (!declared.names.has(ref.referenceName)) {
+        const classes = context.getNodesByKind('class');
+        let cachedIndex = springBeanNameIndexes.get(context);
+        if (!cachedIndex || cachedIndex.source !== classes) {
+          cachedIndex = { source: classes, index: buildSpringBeanNameIndex(context) };
+          springBeanNameIndexes.set(context, cachedIndex);
+        }
+        const index = cachedIndex.index;
+        const candidates = index.get(ref.referenceName);
+        if (candidates && candidates.length === 1) {
+          // Heuristic join (the class is named by derivation, not by the
+          // XML): marked so the edge is distinguishable from a literal one.
+          return {
+            original: ref,
+            targetNodeId: candidates[0]!,
+            confidence: 0.85,
+            resolvedBy: 'framework',
+            metadata: { synthesizedBy: 'spring-bean-scan-join', provenance: 'heuristic' },
+          };
+        }
+      }
+      // No unique annotated-class candidate (0 or >1 — the precision gate),
+      // or an XML-declared bean with this name exists (the priority gate
+      // above) — no edge from THIS join, and no other pattern in this
+      // resolver applies to an XML-sourced ref either, so stop here rather
+      // than falling through to the Java/Kotlin-source patterns below.
+      return null;
+    }
+
     // Spring config-key references — `@Value("${key}")` (single leaf) and
     // `@ConfigurationProperties(prefix="X")` (entire subtree, marked with the
     // `:prefix` suffix in extractSpringValueBindings). Lookup goes through
@@ -242,7 +593,7 @@ export const springResolver: FrameworkResolver = {
     while ((match = mappingRegex.exec(safe)) !== null) {
       const method = VERB[match[1]!]!;
       const paths = parseMappingPaths((match[2] || '').replace(/^\(|\)$/g, ''), consts);
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineOfIndex(safe, match.index);
       // Method it decorates: first declared method after (skip stacked annotations;
       // Java puts the return type before the name). Bounded so we don't grab a far one.
       const tail = safe.slice(match.index + match[0].length, match.index + match[0].length + 600);
@@ -290,7 +641,7 @@ export const springResolver: FrameworkResolver = {
       const verbM = args.match(/method\s*=\s*[{\[]?\s*(?:RequestMethod\.)?(\w+)/);
       const method = verbM ? verbM[1]!.toUpperCase() : 'ANY';
       const paths = parseMappingPaths(args, consts);
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineOfIndex(safe, match.index);
       for (const routePath of classPrefixes.flatMap(prefix => paths.map(sub => joinPath(prefix, sub)))) {
         const routeNode: Node = {
           id: `route:${filePath}:${line}:${method}:${routePath}`,
@@ -450,7 +801,7 @@ function extractSpringValueBindings(
   while ((m = valueRe.exec(safe)) !== null) {
     const key = m[1]!.trim();
     if (!key) continue;
-    const line = safe.slice(0, m.index).split('\n').length;
+    const line = lineOfIndex(safe, m.index);
     const bindNode: Node = {
       id: `spring-value:${filePath}:${line}:${key}`,
       kind: 'constant',
@@ -481,7 +832,7 @@ function extractSpringValueBindings(
   while ((m = cpRe.exec(safe)) !== null) {
     const prefix = m[1]!.trim();
     if (!prefix) continue;
-    const line = safe.slice(0, m.index).split('\n').length;
+    const line = lineOfIndex(safe, m.index);
     const bindNode: Node = {
       id: `spring-cp:${filePath}:${line}:${prefix}`,
       kind: 'constant',
@@ -528,15 +879,22 @@ const COMPONENT_DIRS = ['/component/', '/components/', '/config/'];
 const CLASS_KINDS = new Set(['class']);
 const SERVICE_KINDS = new Set(['class', 'interface']);
 
+/** Spring's mapping-path attributes (`@GetMapping(value = …)` / `path = …`). */
+const SPRING_PATH_KEYS = ['value', 'path'] as const;
+
 /** All declared paths; [''] for an omitted path, [] for an unresolved one. */
-function parseMappingPaths(args: string, consts: Map<string, string>): string[] {
+export function parseMappingPaths(
+  args: string,
+  consts: Map<string, string>,
+  pathKeys: readonly string[] = SPRING_PATH_KEYS,
+): string[] {
   const paths: string[] = [];
   let hasPaths = false;
   // Keep Java/Kotlin arrays and quoted URI variables together when separating
   // attributes. Strings in produces/consumes/etc. are never mapping paths.
   const argRe = /(?:^|,)\s*(?:(\w+)\s*=\s*)?(\{(?:[^"'}]|"[^"]*"|'[^']*')*\}|\[(?:[^"'\]]|"[^"]*"|'[^']*')*\]|"[^"]*"|'[^']*'|[^,]+)/g;
   for (const arg of args.matchAll(argRe)) {
-    if (arg[1] && arg[1] !== 'value' && arg[1] !== 'path') continue;
+    if (arg[1] && !pathKeys.includes(arg[1])) continue;
     hasPaths = true;
     const scope = arg[2]!.trim().replace(/^[{\[]|[}\]]$/g, '').trim();
     if (!scope) paths.push(''); // An explicitly empty path array also inherits the prefix.
@@ -549,7 +907,7 @@ function parseMappingPaths(args: string, consts: Map<string, string>): string[] 
 }
 
 /** Join a class-level prefix and a method sub-path into one normalized `/path`. */
-function joinPath(prefix: string, sub: string): string {
+export function joinPath(prefix: string, sub: string): string {
   const parts = [prefix, sub].map((p) => p.replace(/^\/+|\/+$/g, '')).filter(Boolean);
   return '/' + parts.join('/');
 }

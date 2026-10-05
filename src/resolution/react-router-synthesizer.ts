@@ -32,14 +32,13 @@
 import type { Edge, Language } from '../types';
 import type { ResolutionContext } from './types';
 import type { MaybeYield } from './cooperative-yield';
-import { stripCommentsForRegex } from './strip-comments';
 import { isTestPath } from '../search/query-utils';
 import { parseHrefExpression, routesForFile, toHref, type HrefLiteral } from './frameworks/expo-router';
 import { matchBracket } from './frameworks/object-literal';
 import { destinationsForHref } from './frameworks/nextjs';
 import { reactRouterTable } from './frameworks/react-router';
 import { configHrefExpression } from './frameworks/react';
-import { enclosingFn, makeLineAt } from './synth-utils';
+import { linkEdgesPass, linkTagPattern as tagPattern } from './link-edges';
 import { resolveImportPath } from './import-resolver';
 
 const JSX_FILE = /\.(?:[cm]?[jt]sx?|mdx)$/;
@@ -49,8 +48,7 @@ const LINK_TAGS = ['Link', 'NavLink', 'Navigate', 'Redirect', 'LinkContainer', '
 
 /** `<Tag … to=…>` for any of `tags`, the attribute anywhere in the tag. */
 function linkTagPattern(tags: readonly string[]): RegExp {
-  // An attribute before `to` may hold an arrow (`onMouseEnter={() => …}`), whose `>` is not the tag's end.
-  return new RegExp(`<(${tags.map((t) => t.replace(/[$]/g, '\\$&')).join('|')})\\b((?:[^>]|=>)*?)\\bto\\s*=\\s*(?:"([^"]*)"|'([^']*)'|(?=\\{))`, 'g');
+  return tagPattern(tags, `\\bto\\s*=\\s*(?:"([^"]*)"|'([^']*)'|(?=\\{))`);
 }
 
 const LINK_TAG = linkTagPattern(LINK_TAGS);
@@ -111,33 +109,25 @@ function languageOf(file: string): Language {
   return /\.tsx$/.test(file) ? 'tsx' : /\.[cm]?ts$/.test(file) ? 'typescript' : /\.jsx$/.test(file) ? 'jsx' : 'javascript';
 }
 
-/** Links a single component may carry before it is a navigation menu, not a decision. */
-const MAX_LINKS_PER_COMPONENT = 24;
-
 export async function reactRouterLinkEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   const table = reactRouterTable(ctx);
   if (table.byRoot.size === 0) return [];
-  const edges: Edge[] = [];
-  const seen = new Set<string>();
-  const perComponent = new Map<string, number>();
   const wrappers = linkWrappers(ctx);
-  let scanned = 0;
-  for (const file of ctx.getAllFiles()) {
-    if (!JSX_FILE.test(file) || isTestPath(file)) continue;
-    const routes = routesForFile(table, file);
-    if (!routes || routes.exact.size === 0) continue;
-    if ((++scanned & 63) === 0) await onYield();
-    const source = ctx.readFile(file);
-    if (!source || !/\bto\s*=/.test(source)) continue;
-    const tags = linkTagsFor(file, wrappers, ctx);
-    const pattern = tags.length === LINK_TAGS.length ? LINK_TAG : linkTagPattern(tags);
-    if (!new RegExp(`<(?:${tags.join('|')})\\b`).test(source)) continue;
-    const safe = stripCommentsForRegex(source, 'typescript');
-    const nodes = ctx.getNodesInFile(file);
-    const lineOf = makeLineAt(safe, 1);
-    pattern.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = pattern.exec(safe)) !== null) {
+  return linkEdgesPass(ctx, onYield, {
+    synthesizedBy: 'react-router-link',
+    fileFilter: JSX_FILE,
+    routesFor: (file) => {
+      const routes = routesForFile(table, file);
+      return routes && routes.exact.size > 0 ? routes : null;
+    },
+    pattern: (file, source) => {
+      if (!/\bto\s*=/.test(source)) return null;
+      const tags = linkTagsFor(file, wrappers, ctx);
+      if (!new RegExp(`<(?:${tags.join('|')})\\b`).test(source)) return null;
+      return tags.length === LINK_TAGS.length ? LINK_TAG : linkTagPattern(tags);
+    },
+    stripComments: true,
+    site: (m, safe, file, routes) => {
       const tag = m[1]!;
       const quoted: string | null = m[3] ?? m[4] ?? null;
       let href: HrefLiteral | null;
@@ -151,7 +141,7 @@ export async function reactRouterLinkEdges(ctx: ResolutionContext, onYield: Mayb
         // Peeking at the first character instead missed every one of those.
         const at = m.index + m[0].length;
         const close = matchBracket(safe, at);
-        if (close < 0) continue;
+        if (close < 0) return null;
         const expr = safe.slice(at + 1, close);
         href = parseHrefExpression(expr);
         // `to={paths.app.discussion.getHref(id)}`: a route-config object's href.
@@ -162,34 +152,11 @@ export async function reactRouterLinkEdges(ctx: ResolutionContext, onYield: Mayb
       }
       // A relative `to` is resolved against the route this markup renders
       // under — a nesting this scan does not read, so it is not a destination.
-      if (!href || !href.path.startsWith('/')) continue;
-      const line = lineOf(m.index);
-      const component = enclosingFn(nodes, line);
-      if (!component) continue;
-      // A destination written as a choice names one route per arm, and the
-      // user reaches every one of them — each is drawn.
-      for (const { node: route, href: arm } of destinationsForHref(href, routes)) {
-        const key = `${component.id}>${route.id}`;
-        if (seen.has(key)) continue;
-        const count = (perComponent.get(component.id) ?? 0) + 1;
-        perComponent.set(component.id, count);
-        if (count > MAX_LINKS_PER_COMPONENT) continue;
-        seen.add(key);
-        edges.push({
-          source: component.id,
-          target: route.id,
-          kind: 'navigates',
-          line,
-          provenance: 'heuristic',
-          metadata: {
-            synthesizedBy: 'react-router-link',
-            href: arm.display,
-            navMethod: tag === 'Navigate' ? 'navigate' : tag === 'Redirect' ? 'redirect' : 'link',
-            registeredAt: `${file}:${line}`,
-          },
-        });
-      }
-    }
-  }
-  return edges;
+      if (!href || !href.path.startsWith('/')) return null;
+      return {
+        destinations: destinationsForHref(href, routes).map((d) => ({ node: d.node, display: d.href.display })),
+        metadata: { navMethod: tag === 'Navigate' ? 'navigate' : tag === 'Redirect' ? 'redirect' : 'link' },
+      };
+    },
+  });
 }

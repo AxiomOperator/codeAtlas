@@ -8,6 +8,7 @@ import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 import { pickByNameAndKind } from './name-heuristic';
+import { lineOfIndex } from '../synth-utils';
 
 export const goResolver: FrameworkResolver = {
   name: 'go',
@@ -106,7 +107,7 @@ export const goResolver: FrameworkResolver = {
       const methodPrefix = matchGo122MethodPattern(routePath!, rawMethod!);
       if (!routePath!.startsWith('/') && !methodPrefix) continue;
 
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineOfIndex(safe, match.index);
       // "GET /users/{id}" -> method GET, path /users/{id}
       const path = methodPrefix ? routePath!.slice(methodPrefix.length).trimStart() : routePath!;
       const method = methodPrefix

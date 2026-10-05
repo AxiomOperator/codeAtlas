@@ -9,6 +9,14 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { SchemaVersion } from '../types';
 import { runMigrations, getCurrentVersion, CURRENT_SCHEMA_VERSION } from './migrations';
+import {
+  FTS_TRIGGER_NAMES,
+  SYNTHESIS_SITE_INDEX,
+  ftsTriggerDdls,
+  readSchemaSql,
+  schemaIndexDdl,
+  splitSchemaForFts,
+} from './schema-ddl';
 import { getCodeGraphDir, statInode } from '../directory';
 import { awaitExitOrTerminate, COLLECT_BEFORE_EXIT_SOURCE } from '../worker-teardown';
 import { isMainThreadWatchdogArmed } from '../mcp/liveness-watchdog';
@@ -116,26 +124,16 @@ export class DatabaseConnection {
 
     // Run schema initialization, splitting FTS5 from the rest so
     // codegraph still works when Node.js was built without FTS5 (#1532).
-    const schemaPath = path.join(__dirname, 'schema.sql');
-    const schema = fs.readFileSync(schemaPath, 'utf-8');
-
-    const FTS5_MARKER = '-- Full-text search index on node names, docstrings, and signatures';
-    const ftsIdx = schema.indexOf(FTS5_MARKER);
+    const schema = readSchemaSql();
+    const split = splitSchemaForFts(schema);
     let fts5Available = true;
 
-    if (ftsIdx >= 0) {
-      const preFts = schema.slice(0, ftsIdx);
-      // FTS ends after the update trigger; required tables and indexes follow
-      // it in schema.sql and must still be created when FTS5 is unavailable.
-      const ftsSection = schema.slice(ftsIdx).match(
-        /^[\s\S]*?CREATE TRIGGER IF NOT EXISTS nodes_au\b[\s\S]*?END;/
-      )?.[0];
-      if (!ftsSection) throw new Error('schema.sql: FTS5 update trigger not found');
+    if (split) {
       // Execute everything before FTS5 first
-      db.exec(preFts);
+      db.exec(split.pre);
       // Try FTS5; if it fails, skip it and continue with LIKE-only search
       try {
-        db.exec(ftsSection);
+        db.exec(split.fts);
       } catch (err: any) {
         fts5Available = false;
         const msg = err?.message ?? String(err);
@@ -145,7 +143,8 @@ export class DatabaseConnection {
           `For full-text search, use a Node.js build with FTS5 enabled.`
         );
       }
-      db.exec(schema.slice(ftsIdx + ftsSection.length));
+      // Required tables and indexes follow the FTS section.
+      db.exec(split.post);
     } else {
       db.exec(schema);
     }
@@ -275,7 +274,7 @@ export class DatabaseConnection {
    * FTS maintenance triggers dropped/recreated around a bulk load.
    * Names must match schema.sql.
    */
-  private static readonly FTS_TRIGGER_NAMES = ['nodes_ai', 'nodes_ad', 'nodes_au'] as const;
+  private static readonly FTS_TRIGGER_NAMES = FTS_TRIGGER_NAMES;
 
   /**
    * Enter bulk-load mode: drop the per-row FTS sync triggers so mass node
@@ -363,12 +362,8 @@ export class DatabaseConnection {
    * beginBulkEdgeLoad simply re-drops them (DROP IF EXISTS — idempotent).
    */
   async endBulkParseLoad(): Promise<void> {
-    const schemaPath = path.join(__dirname, 'schema.sql');
-    const schema = fs.readFileSync(schemaPath, 'utf-8');
     for (const idx of DatabaseConnection.BULK_PARSE_INDEX_NAMES) {
-      const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
-      if (!m) throw new Error(`schema.sql: parse index ${idx} not found for bulk-load recreation`);
-      this.db.exec(m[0]);
+      this.db.exec(schemaIndexDdl(idx));
       await new Promise((resolve) => setImmediate(resolve));
     }
     await this.endBulkEdgeLoad();
@@ -408,12 +403,8 @@ export class DatabaseConnection {
 
   /** Leave bulk-ref mode: recreate each index in one scan (yield between). */
   async endBulkRefLoad(): Promise<void> {
-    const schemaPath = path.join(__dirname, 'schema.sql');
-    const schema = fs.readFileSync(schemaPath, 'utf-8');
     for (const idx of DatabaseConnection.BULK_REF_INDEX_NAMES) {
-      const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
-      if (!m) throw new Error(`schema.sql: ref index ${idx} not found for bulk-load recreation`);
-      this.db.exec(m[0]);
+      this.db.exec(schemaIndexDdl(idx));
       await new Promise((resolve) => setImmediate(resolve));
     }
   }
@@ -463,13 +454,9 @@ export class DatabaseConnection {
    * stays inside the window.
    */
   async endBulkEdgeLoad(options: { deferSynthesisSite?: boolean } = {}): Promise<void> {
-    const schemaPath = path.join(__dirname, 'schema.sql');
-    const schema = fs.readFileSync(schemaPath, 'utf-8');
     for (const idx of DatabaseConnection.BULK_EDGE_INDEX_NAMES) {
       if (options.deferSynthesisSite && idx === DatabaseConnection.SYNTHESIS_SITE_INDEX) continue;
-      const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
-      if (!m) throw new Error(`schema.sql: edge index ${idx} not found for bulk-load recreation`);
-      this.db.exec(m[0]);
+      this.db.exec(schemaIndexDdl(idx));
       await new Promise((resolve) => setImmediate(resolve));
     }
   }
@@ -482,13 +469,10 @@ export class DatabaseConnection {
    * busy with synthesis rather than on the critical path. Idempotent.
    */
   createSynthesisSiteIndex(): void {
-    const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf-8');
-    const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${DatabaseConnection.SYNTHESIS_SITE_INDEX}\\b[^;]*;`));
-    if (!m) throw new Error(`schema.sql: edge index ${DatabaseConnection.SYNTHESIS_SITE_INDEX} not found`);
-    this.db.exec(m[0]);
+    this.db.exec(schemaIndexDdl(DatabaseConnection.SYNTHESIS_SITE_INDEX));
   }
 
-  private static readonly SYNTHESIS_SITE_INDEX = 'idx_edges_synthesis_site';
+  private static readonly SYNTHESIS_SITE_INDEX = SYNTHESIS_SITE_INDEX;
 
   /**
    * The statements that close every bulk-load window a killed run left open,
@@ -500,8 +484,6 @@ export class DatabaseConnection {
    */
   private bulkLoadHealPlan(): string[] {
     const plan: string[] = [];
-    let schema: string | null = null;
-    const readSchema = (): string => (schema ??= fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf-8'));
 
     if (this.fts5Available) {
       const row = this.db
@@ -512,7 +494,7 @@ export class DatabaseConnection {
       if ((row?.c ?? 0) < DatabaseConnection.FTS_TRIGGER_NAMES.length) {
         plan.push(
           `BEGIN IMMEDIATE;\nINSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');\n` +
-          `${DatabaseConnection.ftsTriggerDdls(readSchema()).join('\n')}\nCOMMIT;`
+          `${ftsTriggerDdls().join('\n')}\nCOMMIT;`
         );
       }
     }
@@ -528,9 +510,7 @@ export class DatabaseConnection {
       .all(...names) as Array<{ name: string }>).map((r) => r.name));
     for (const idx of names) {
       if (present.has(idx)) continue;
-      const m = readSchema().match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
-      if (!m) throw new Error(`schema.sql: index ${idx} not found for crash recovery`);
-      plan.push(m[0]);
+      plan.push(schemaIndexDdl(idx));
     }
     return plan;
   }
@@ -643,19 +623,6 @@ export class DatabaseConnection {
     });
   }
 
-  /** The three FTS sync-trigger DDLs, extracted from schema.sql. */
-  private static ftsTriggerDdls(schema: string): string[] {
-    const triggerDdls = schema.match(
-      /CREATE TRIGGER IF NOT EXISTS nodes_a[idu]\b[\s\S]*?END;/g
-    );
-    if (!triggerDdls || triggerDdls.length !== DatabaseConnection.FTS_TRIGGER_NAMES.length) {
-      throw new Error(
-        `schema.sql: expected ${DatabaseConnection.FTS_TRIGGER_NAMES.length} nodes FTS triggers, found ${triggerDdls?.length ?? 0}`
-      );
-    }
-    return triggerDdls;
-  }
-
   /**
    * Recreate the FTS sync triggers from schema.sql — extracted from the file
    * rather than duplicated here so the DDL cannot drift from the schema.
@@ -663,9 +630,7 @@ export class DatabaseConnection {
    * that are not idempotent, e.g. schema_versions.)
    */
   private recreateFtsTriggers(): void {
-    const schemaPath = path.join(__dirname, 'schema.sql');
-    const schema = fs.readFileSync(schemaPath, 'utf-8');
-    for (const ddl of DatabaseConnection.ftsTriggerDdls(schema)) {
+    for (const ddl of ftsTriggerDdls()) {
       this.db.exec(ddl);
     }
   }

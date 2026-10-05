@@ -18,7 +18,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `codegraph status` now tells you when indexed files are missing their symbols, and `codegraph sync` repairs them.
 - Indexing large Python projects is fast again.
 - Much more accurate VB.NET and C# results: structure members, property bodies, initializers and typed receiver calls are now linked, and constants no longer stand in for classes.
-- Re-index VB.NET and C# projects after upgrading to pick up the new links.
+- Many languages link more of your code: Vue templates, plain JavaScript objects, Go modules in subfolders, Rust enum variants, Dart getters, VB.NET shared members and C++ operators.
+- Re-index your projects after upgrading (`codegraph index`) to pick up the new links.
 
 ### Security
 
@@ -26,6 +27,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `codegraph upgrade <version>` only accepts a plain version number like `1.6.2`, so nothing else can reach the shell command that installs it.
 
 ### New Features
+
+- Micronaut routes: `@Controller` classes with `@Get`, `@Post` and the other verb annotations now appear as routes linked to their handler methods, in Java and Kotlin. (#971)
+- Drupal: class-based `#[Hook]` implementations, plugin attributes and annotations, and services declared in `*.services.yml` are now linked. (#300)
+- Spring `<beans>` XML: beans declared in XML now link to their Java classes and to each other, so classes wired only by XML no longer look unused. Thanks @ESPINS. (#1225)
+
+- Lua projects can list their own module-loader functions in `codegraph.json` (`{ "lua": { "loaderFunctions": ["Require"] } }`) so calls like `Require("path.lua")` link files the way `require` does. (#1617)
 
 - An opt-in search gate for Claude Code: `codegraph install --gate-hook` (or answering yes in the installer) makes Claude ask CodeGraph once before it can fall back to Grep, Glob or a shell search in an indexed project. It is off unless you turn it on, never blocks outside an indexed project, and `CODEGRAPH_NO_GATE_HOOK=1` switches it off. (#2313)
 - A project can add its own notes to the guidance CodeGraph gives agents by writing them in `.codegraph/instructions.md`. (#765)
@@ -37,6 +44,16 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Indexing large Django and other Python-plus-JavaScript projects is about twice as fast again: a check on destructured call results no longer re-scans the whole file for every call. Thanks @bompus for the report. (#2334)
+- In Vue, functions called from template expressions (`{{ }}`, `:prop`, `@event`, `v-*`) and from top-level destructuring like `const { a } = useFoo()` now show those callers, and a component with both `<script>` and `<script setup>` reads both. (#2340)
+- In JavaScript, functions inside an object literal now get their own symbols even when the object isn't exported — plain `const` objects, `window.X = { … }`, `ns.mod = { … }` and objects inside an IIFE — so script-tag code is no longer invisible. (#2300)
+- Navigation links written with an arrow-function attribute before `href`, like `<Link onClick={() => track()} href="/users">`, are now linked in Next.js, TanStack Router, SvelteKit and Vue Router projects.
+- In Go, calls across packages now resolve when `go.mod` lives in a subdirectory or a repository holds several modules, and calls through a struct field resolve when the receiver type is unexported. (#2322, #2323)
+- In Rust, an enum used only through its variants (`Mode::A`, `Mode::B =>` in a `match`) now has those uses as references, and Axum and Actix routes written across several lines (as rustfmt wraps them) now link to their handlers. (#2326, #2328)
+- In Dart, an extension's `on` type, field and top-level variable types and generic arguments now count as references, and getter reads and enum-extension methods now show their callers. (#2327, #2338)
+- In VB.NET, reads and writes of `Shared` fields and properties through the class name (`AppSession.SessionId`) now show as references to the field, the property and the class. (#2305)
+- In C++, `a + b` and `a[i]` now link to the class's overloaded operator when the left operand's declared type defines it. (#1258)
+- Fuzzy name matching now follows the same scope rules as exact matching, route paths with optional parameters like `/users/:id?` match calls without that segment, and tsconfig `${configDir}` paths are supported.
 - `codegraph_node` and `codegraph node` no longer show a different symbol's code when a name is mistyped or partial; they say it wasn't found and suggest the closest names, putting a wrong-case match first. (#1455)
 - In opencode, CodeGraph's tools are no longer listed under doubled names like `codegraph_codegraph_explore`, which models failed to call. (#1267)
 - Invalid tool arguments, unknown tool names and disabled tools now come back as guidance the agent can act on instead of an error that made it stop using CodeGraph, and a non-numeric `depth` or `limit` can no longer make a query run unbounded. (#1403)

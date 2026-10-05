@@ -21,11 +21,11 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isDartPropertyReadRef, matchDartPropertyRead, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
-import { clearVbnetReceiverMemos } from './vbnet-receivers';
+import { clearVbnetReceiverMemos, isVbMemberAccessRef, matchVbMemberAccess } from './vbnet-receivers';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, clearCppIncludeDirCache, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isJsPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
@@ -35,7 +35,7 @@ import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
-import { loadGoModule, type GoModule } from './go-module';
+import { loadGoModule, discoverGoModules, type GoModule } from './go-module';
 import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
 import { lexicalPathWithinRoot } from '../utils';
@@ -333,6 +333,11 @@ export class ReferenceResolver {
   private dirAliases = new Map<string, AliasMap | null>();
   // go.mod module path. Same lazy convention as projectAliases.
   private goModule: GoModule | null | undefined = undefined;
+  // Every go.mod owning an indexed .go file (#2322). Same lazy convention,
+  // plus re-derived whenever the known-file set is rebuilt (a sync that adds a
+  // nested module's first .go file must see that module).
+  private goModules: GoModule[] | undefined = undefined;
+  private goModulesFiles: Set<string> | null = null;
   // Monorepo workspace member packages. Same lazy convention.
   private workspacePackages: WorkspacePackages | null | undefined = undefined;
   /**
@@ -348,6 +353,7 @@ export class ReferenceResolver {
     () => { this.projectAliases = undefined; },
     () => { this.dirAliases.clear(); },
     () => { this.goModule = undefined; },
+    () => { this.goModules = undefined; },
     () => { this.workspacePackages = undefined; },
     () => { this.razorUsingsCache.clear(); },
     () => { clearCppIncludeDirCache(); },
@@ -533,7 +539,12 @@ export class ReferenceResolver {
       out.js = stableConfigJson([ctx.getProjectAliases?.() ?? null, ctx.getWorkspacePackages?.() ?? null]);
     }
     if (has(RESOLUTION_CONFIG_LANGUAGES.go)) {
-      out.go = stableConfigJson(ctx.getGoModule?.() ?? null);
+      const mods = ctx.getGoModules?.() ?? [];
+      // Root-only projects keep their pre-#2322 fingerprint (no spurious re-resolve).
+      out.go = stableConfigJson(
+        mods.every((m) => !m.relDir) ? (ctx.getGoModule?.() ?? null)
+          : mods.map((m) => ({ modulePath: m.modulePath, relDir: m.relDir ?? '' }))
+      );
     }
     if (has(RESOLUTION_CONFIG_LANGUAGES.cpp)) {
       out.cpp = stableConfigJson(loadCppIncludeDirs(this.projectRoot));
@@ -890,6 +901,17 @@ export class ReferenceResolver {
         return this.goModule;
       },
 
+      getGoModules: () => {
+        if (this.goModules === undefined || (this.knownFiles && this.knownFiles !== this.goModulesFiles)) {
+          this.goModulesFiles = this.knownFiles;
+          this.goModules = discoverGoModules(
+            this.projectRoot,
+            this.knownFiles ?? this.queries.getAllFilePaths()
+          );
+        }
+        return this.goModules;
+      },
+
       getWorkspacePackages: () => {
         if (this.workspacePackages === undefined) {
           this.workspacePackages = loadWorkspacePackages(this.projectRoot);
@@ -1113,20 +1135,7 @@ export class ReferenceResolver {
     // translation unit is a macro expansion, not a call — it must never bind
     // to a same-named function in another file (#1838).
     if (isVisibleCppMacro(ref, this.context)) return null;
-    // A Swift type reference never lands on an `extension X {}` node, nor on a
-    // nested type it cannot name bare (see ./swift-type-visibility).
-    // A name a declaration around the reference declares as a type parameter
-    // (`def f[A]`, `class Foo<T>`) is that parameter (see ./type-parameters).
-    const candidate = gateTypeParameter(
-      gateSwiftTypeTarget(this.gateTargetKind(this.resolveOneInner(ref), ref), ref, this.context),
-      ref,
-      this.context,
-    );
-    const scoped = this.gateRustScope(candidate, ref);
-    const resolved = this.gateSuperSelfCall(
-      scoped?.resolvedBy === 'framework' ? this.gateFrameworkLanguage(scoped, ref) : this.gateLanguage(scoped, ref),
-      ref,
-    );
+    const resolved = this.gateResolved(this.resolveOneInner(ref), ref);
     if (!resolved || ref.referenceKind !== 'calls') return resolved;
 
     const target = this.nodeById(resolved.targetNodeId);
@@ -1137,17 +1146,43 @@ export class ReferenceResolver {
     const forwarded = resolveAliasBinding(target, memberName, this.context);
     if (!forwarded || forwarded.id === resolved.targetNodeId) return resolved;
 
-    return this.gateLanguage({
+    // The forward is a new target: it passes every gate the first one did,
+    // and the language gate whatever strategy found the alias.
+    return this.gateLanguage(this.gateResolved({
       ...resolved,
       targetNodeId: forwarded.id,
       confidence: Math.min(resolved.confidence, 0.85),
-    }, ref);
+    }, ref), ref);
+  }
+
+  /** The target gates every strategy's result passes through. */
+  private gateResolved(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
+    // A Swift type reference never lands on an `extension X {}` node, nor on a
+    // nested type it cannot name bare (see ./swift-type-visibility).
+    // A name a declaration around the reference declares as a type parameter
+    // (`def f[A]`, `class Foo<T>`) is that parameter (see ./type-parameters).
+    const candidate = gateTypeParameter(
+      gateSwiftTypeTarget(this.gateTargetKind(result, ref), ref, this.context),
+      ref,
+      this.context,
+    );
+    const scoped = this.gateRustScope(candidate, ref);
+    return this.gateSuperSelfCall(
+      scoped?.resolvedBy === 'framework' ? this.gateFrameworkLanguage(scoped, ref) : this.gateLanguage(scoped, ref),
+      ref,
+    );
   }
 
   private resolveOneInner(ref: UnresolvedRef): ResolvedRef | null {
     // A local C++ object construction (`T obj(args)`, ref `ns::T::T/1`)
     // resolves ONLY to a constructor of the lexically nearest `T` (#1839).
     if (isCppConstructorRef(ref)) return matchCppConstructor(ref, this.context);
+
+    // A Dart getter read (`x.area`, #2338) resolves ONLY through the
+    // receiver's declared type — never by name alone.
+    if (isDartPropertyReadRef(ref)) return this.gateLanguage(matchDartPropertyRead(ref, this.context), ref);
+    // A VB.NET field / property access through a type or typed value (#2305).
+    if (isVbMemberAccessRef(ref)) return this.gateLanguage(matchVbMemberAccess(ref, this.context), ref);
 
     // Skip built-in/external references
     if (this.isBuiltInOrExternal(ref)) {
@@ -1206,7 +1241,7 @@ export class ReferenceResolver {
       // calls `FormatPrice`, which the exact-name set never lists.
       (CASE_INSENSITIVE_LANGUAGES.has(ref.language) && this.hasAnyPossibleMatchIgnoringCase(existenceName)) ||
       this.matchesAnyImport(ref) ||
-      this.frameworks.some((f) => f.claimsReference?.(ref.referenceName));
+      this.frameworks.some((f) => f.claimsReference?.(ref.referenceName, ref, this.context));
     if (this.profileStages) this.stageAdd('preFilter', ref, preFilterPass, tPre);
     if (!preFilterPass) {
       return this.gateLanguage(matchJsStoreBindingCall(ref, this.context), ref);
@@ -1316,7 +1351,13 @@ export class ReferenceResolver {
       CHAIN_SHAPE.test(ref.referenceName) &&
       (ref.language === 'typescript' || ref.language === 'javascript' || ref.language === 'tsx' || ref.language === 'jsx' || ref.language === 'python')
     ) {
-      return this.gateLanguage(matchReference(ref, this.context), ref);
+      // Skips only the import strategy: the name match passes the same gates,
+      // and competes with the framework candidates, as on the normal path.
+      const chained = this.gateNameMatch(this.gateLanguage(matchReference(ref, this.context), ref), ref);
+      if (chained) candidates.push(chained);
+      return candidates.length > 0
+        ? candidates.reduce((best, curr) => curr.confidence > best.confidence ? curr : best)
+        : null;
     }
 
     const tImp = this.profileStages ? process.hrtime.bigint() : 0n;
@@ -1352,34 +1393,8 @@ export class ReferenceResolver {
 
     // Strategy 3: Try name matching
     const tName = this.profileStages ? process.hrtime.bigint() : 0n;
-    let nameResult = this.gateLanguage(matchReference(ref, this.context), ref);
+    const nameResult = this.gateNameMatch(this.gateLanguage(matchReference(ref, this.context), ref), ref);
     if (this.profileStages) this.stageAdd('nameMatch', ref, !!nameResult, tName);
-    // Nix has no ambient cross-file namespace — a callee binds lexically
-    // (same file) or through explicit import/callPackage wiring (the import
-    // path above). A cross-file name match is wrong by construction: every
-    // module `inherit (lib) mkOption`s the same nixpkgs helpers, so the
-    // matcher would link each `mkOption` call to whichever file's inherit
-    // binding it happened to pick. Same-file matches only.
-    if (nameResult) {
-      const target = this.nodeById(nameResult.targetNodeId);
-      // A definition its language makes file-local — a C `static`, a Kotlin
-      // `private fun`, a Go unexported name in another package, a Rust
-      // non-`pub` item outside its module subtree — cannot be what a name in
-      // another file means, whichever strategy chose it (#1730).
-      if (target && !isVisibleAcrossFiles(target, ref, this.context)) {
-        nameResult = null;
-      } else if (ref.language === 'nix') {
-        if (!target || target.filePath !== ref.filePath) {
-          nameResult = null;
-        }
-      } else if (target && target.language === 'nix') {
-        // The reverse direction is just as impossible: no other language can
-        // symbolically call into a .nix binding (interop is eval/CLI, never a
-        // linkable symbol) — without this, a Python script's `split()` lands
-        // on some module's `split = ...` binding as a low-confidence match.
-        nameResult = null;
-      }
-    }
     if (nameResult) {
       candidates.push(nameResult);
     }
@@ -1413,6 +1428,37 @@ export class ReferenceResolver {
     );
   }
 
+  /** Gates on a name match, whichever path asked for it. */
+  private gateNameMatch(nameResult: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
+    // Nix has no ambient cross-file namespace — a callee binds lexically
+    // (same file) or through explicit import/callPackage wiring (the import
+    // path above). A cross-file name match is wrong by construction: every
+    // module `inherit (lib) mkOption`s the same nixpkgs helpers, so the
+    // matcher would link each `mkOption` call to whichever file's inherit
+    // binding it happened to pick. Same-file matches only.
+    if (nameResult) {
+      const target = this.nodeById(nameResult.targetNodeId);
+      // A definition its language makes file-local — a C `static`, a Kotlin
+      // `private fun`, a Go unexported name in another package, a Rust
+      // non-`pub` item outside its module subtree — cannot be what a name in
+      // another file means, whichever strategy chose it (#1730).
+      if (target && !isVisibleAcrossFiles(target, ref, this.context)) {
+        return null;
+      } else if (ref.language === 'nix') {
+        if (!target || target.filePath !== ref.filePath) {
+          return null;
+        }
+      } else if (target && target.language === 'nix') {
+        // The reverse direction is just as impossible: no other language can
+        // symbolically call into a .nix binding (interop is eval/CLI, never a
+        // linkable symbol) — without this, a Python script's `split()` lands
+        // on some module's `split = ...` binding as a low-confidence match.
+        return null;
+      }
+    }
+    return nameResult;
+  }
+
   /**
    * Create edges from resolved references
    */
@@ -1423,72 +1469,81 @@ export class ReferenceResolver {
       // by metadata.resolvedBy === 'function-ref'. callers/impact already
       // traverse `references`, so registration sites surface with no
       // graph-layer changes.
-      let kind: Edge['kind'] =
+      const refKind: Edge['kind'] =
         ref.edgeKind ??
         (ref.original.referenceKind === 'function_ref' ? 'references' : ref.original.referenceKind);
 
-      // Promote "extends" to "implements" when a class/struct targets an interface
-      if (kind === 'extends') {
-        const targetNode = this.nodeById(ref.targetNodeId);
-        if (targetNode && (targetNode.kind === 'interface' || targetNode.kind === 'protocol')) {
-          const sourceNode = this.nodeById(ref.original.fromNodeId);
-          if (sourceNode && sourceNode.kind !== 'interface' && sourceNode.kind !== 'protocol') {
-            kind = 'implements';
+      // Each target's kind is judged by that target: a navigation or call
+      // whose arms reach a class and a function instantiates only the class.
+      const kindFor = (targetNodeId: string): Edge['kind'] => {
+        let kind = refKind;
+        // Promote "extends" to "implements" when a class/struct targets an interface
+        if (kind === 'extends') {
+          const targetNode = this.nodeById(targetNodeId);
+          if (targetNode && (targetNode.kind === 'interface' || targetNode.kind === 'protocol')) {
+            const sourceNode = this.nodeById(ref.original.fromNodeId);
+            if (sourceNode && sourceNode.kind !== 'interface' && sourceNode.kind !== 'protocol') {
+              kind = 'implements';
+            }
           }
         }
-      }
 
-      // Promote "calls" to "instantiates" when the resolved target is a
-      // class/struct/union. Languages without a `new` keyword (Python, Ruby)
-      // express instantiation as `Foo()` — extraction can't tell that
-      // apart from a function call without symbol info, but resolution
-      // can: if `Foo` resolves to a class, the call IS an instantiation.
-      if (kind === 'calls') {
-        const targetNode = this.nodeById(ref.targetNodeId);
-        if (
-          targetNode &&
-          (targetNode.kind === 'class' || targetNode.kind === 'struct' || targetNode.kind === 'union')
-        ) {
-          kind = 'instantiates';
+        // Promote "calls" to "instantiates" when the resolved target is a
+        // class/struct/union. Languages without a `new` keyword (Python, Ruby)
+        // express instantiation as `Foo()` — extraction can't tell that
+        // apart from a function call without symbol info, but resolution
+        // can: if `Foo` resolves to a class, the call IS an instantiation.
+        if (kind === 'calls') {
+          const targetNode = this.nodeById(targetNodeId);
+          if (
+            targetNode &&
+            (targetNode.kind === 'class' || targetNode.kind === 'struct' || targetNode.kind === 'union')
+          ) {
+            kind = 'instantiates';
+          }
         }
-      }
+        return kind;
+      };
 
       // One reference can name several targets — a navigation whose
       // destination is a conditional reaches every arm. Each becomes its own
-      // edge, sharing this resolution's kind and confidence.
+      // edge, sharing this resolution's confidence.
       const targets = [
         { targetNodeId: ref.targetNodeId, metadata: ref.metadata },
         ...(ref.alsoTargets ?? []),
       ];
-      return targets.map((t) => ({
-        source: ref.original.fromNodeId,
-        target: t.targetNodeId,
-        kind,
-        line: ref.original.line,
-        column: ref.original.column,
-        metadata: {
-          ...(t.metadata ?? {}),
-          confidence: ref.confidence,
-          resolvedBy: ref.resolvedBy,
-          // The ORIGINAL reference text (and kind, when edge-kind promotion
-          // rewrote it — calls→instantiates, extends→implements,
-          // function_ref→references). If this edge's target is later removed
-          // by a re-index, the edge is resurrected as exactly this ref and
-          // re-resolved (#1240 removal case) — a faithful resurrection, so
-          // re-resolution can never bind anywhere a full re-index wouldn't.
-          // Reconstruction from the target node's name instead would strip
-          // receiver/qualifier context (`h.greet` → `greet`) and risk a
-          // wrong rebind; edges without refName (pre-#1240, synthesized) are
-          // deliberately NOT resurrected for the same reason.
-          refName: ref.original.referenceName,
-          ...(ref.original.referenceKind !== kind ? { refKind: ref.original.referenceKind } : {}),
-          // Uniform marker for function-as-value edges (#756), regardless of
-          // which strategy resolved them (import vs matchFunctionRef) — lets
-          // tooling label "callback registration" and lets validation diff
-          // exactly the edges this feature added.
-          ...(ref.original.referenceKind === 'function_ref' ? { fnRef: true } : {}),
-        },
-      }));
+      return targets.map((t) => {
+        const kind = kindFor(t.targetNodeId);
+        return {
+          source: ref.original.fromNodeId,
+          target: t.targetNodeId,
+          kind,
+          line: ref.original.line,
+          column: ref.original.column,
+          metadata: {
+            ...(t.metadata ?? {}),
+            confidence: ref.confidence,
+            resolvedBy: ref.resolvedBy,
+            // The ORIGINAL reference text (and kind, when edge-kind promotion
+            // rewrote it — calls→instantiates, extends→implements,
+            // function_ref→references). If this edge's target is later removed
+            // by a re-index, the edge is resurrected as exactly this ref and
+            // re-resolved (#1240 removal case) — a faithful resurrection, so
+            // re-resolution can never bind anywhere a full re-index wouldn't.
+            // Reconstruction from the target node's name instead would strip
+            // receiver/qualifier context (`h.greet` → `greet`) and risk a
+            // wrong rebind; edges without refName (pre-#1240, synthesized) are
+            // deliberately NOT resurrected for the same reason.
+            refName: ref.original.referenceName,
+            ...(ref.original.referenceKind !== kind ? { refKind: ref.original.referenceKind } : {}),
+            // Uniform marker for function-as-value edges (#756), regardless of
+            // which strategy resolved them (import vs matchFunctionRef) — lets
+            // tooling label "callback registration" and lets validation diff
+            // exactly the edges this feature added.
+            ...(ref.original.referenceKind === 'function_ref' ? { fnRef: true } : {}),
+          },
+        };
+      });
     });
   }
 

@@ -45,6 +45,15 @@ impl<'t> Walker<'t> {
             // Still walk the body: module wrappers hold named inner functions
             // and calls that would otherwise be lost (#528).
             if let Some(body) = body_of(node) {
+                // A module-scope IIFE's body is walked as top-level code (#2300).
+                if self.is_module_scope_iife(node, 0) {
+                    for i in 0..body.named_child_count() {
+                        if let Some(stmt) = body.named_child(i) {
+                            self.visit_node(stmt);
+                        }
+                    }
+                    return;
+                }
                 self.visit_function_body(body);
             }
             return;
@@ -395,6 +404,12 @@ impl<'t> Walker<'t> {
                 {
                     self.extract_rtk_hook_bindings(name_node, is_exported);
                 }
+                // The initializer still runs: `const { a } = useFoo(1)` (#2340).
+                if let Some(v) = value {
+                    if v.kind() != "identifier" {
+                        self.visit_function_body(v);
+                    }
+                }
                 continue;
             }
             let name = self.text(name_node).to_string();
@@ -457,8 +472,11 @@ impl<'t> Walker<'t> {
             // create(…)` … `export default useStore` (is_exported_later), the
             // shape most React Native stores are written in. Mirrors
             // TreeSitterExtractor.isExportedLater.
-            let extract_object_methods =
-                (is_exported || self.is_exported_later(&name)) && object_of_fns.is_some() && has_inline_fns;
+            // A DIRECT object value gets its members exported or not (#2300).
+            let direct_object = matches!((object_of_fns, value), (Some(o), Some(v)) if o.id() == v.id());
+            let extract_object_methods = (is_exported || direct_object || self.is_exported_later(&name))
+                && object_of_fns.is_some()
+                && has_inline_fns;
 
             let rtk_endpoints = match value {
                 Some(v) if v.kind() == "call_expression" => self.find_rtk_endpoints_object(v),
@@ -508,6 +526,10 @@ impl<'t> Walker<'t> {
 
             if extract_object_methods {
                 if let Some(obj) = object_of_fns {
+                    if direct_object {
+                        let owner = var_row.map(|row| Scope { row, kind, name: name.clone() });
+                        self.walk_object_literal_data_members(obj, owner);
+                    }
                     self.extract_object_literal_functions(obj);
                 }
             }
@@ -578,6 +600,144 @@ impl<'t> Walker<'t> {
                     self.extract_function(member, Some(name));
                 }
             }
+        }
+    }
+
+    /// walkObjectLiteralDataMembers — the members extract_object_literal_functions
+    /// does not mint (`a: compute()`, `...base()`), walked under the object's node.
+    fn walk_object_literal_data_members(&mut self, obj: Node<'t>, owner: Option<Scope>) {
+        let pushed = owner.is_some();
+        if let Some(scope) = owner {
+            self.stack.push(scope);
+        }
+        for i in 0..obj.named_child_count() {
+            let Some(member) = obj.named_child(i) else { continue };
+            let mut value: Option<Node<'t>> = None;
+            if member.kind() == "pair" {
+                value = member.child_by_field_name("value");
+                if let Some(v) = value {
+                    if matches!(v.kind(), "arrow_function" | "function_expression") {
+                        continue;
+                    }
+                    if v.kind() == "call_expression" {
+                        let fun = v.child_by_field_name("arguments").and_then(|a| a.named_child(0));
+                        if fun.and_then(|f| self.curried_wrapper_bound_name(f)).is_some() {
+                            continue;
+                        }
+                    }
+                }
+            } else if member.kind() == "spread_element" {
+                value = Some(member);
+            }
+            if let Some(v) = value {
+                self.visit_function_body(v);
+            }
+        }
+        if pushed {
+            self.stack.pop();
+        }
+    }
+
+    /// memberAssignedObject — `window.api = {…}` / `ns.mod = {…}` with ≥1
+    /// inline function member; never `module.exports = {…}`.
+    pub(super) fn member_assigned_object(&self, assignment: Node<'t>) -> Option<Node<'t>> {
+        let left = assignment.child_by_field_name("left")?;
+        let right = assignment.child_by_field_name("right")?;
+        if left.kind() != "member_expression" || !matches!(right.kind(), "object" | "object_expression") {
+            return None;
+        }
+        let property = left.child_by_field_name("property")?;
+        if property.kind() != "property_identifier" || self.text(left) == "module.exports" {
+            return None;
+        }
+        if self.object_has_inline_functions(right) {
+            Some(right)
+        } else {
+            None
+        }
+    }
+
+    /// extractMemberAssignedObject — a `variable` named by the property, over
+    /// the assignment, holding the object's function members.
+    pub(super) fn extract_member_assigned_object(&mut self, assignment: Node<'t>) {
+        let Some(obj) = self.member_assigned_object(assignment) else { return };
+        let Some(property) = assignment
+            .child_by_field_name("left")
+            .and_then(|l| l.child_by_field_name("property"))
+        else {
+            return;
+        };
+        let name = self.text(property).to_string();
+        let holder = self.create_node(
+            "variable",
+            &name,
+            assignment,
+            Extra {
+                signature: Some(util::init_signature(self.text(obj))),
+                is_exported: Some(false),
+                ..Extra::default()
+            },
+        );
+        let owner = holder.map(|row| Scope { row, kind: "variable", name: name.clone() });
+        self.walk_object_literal_data_members(obj, owner);
+        self.extract_object_literal_functions(obj);
+    }
+
+    /// isModuleScopeIife — an anonymous function invoked in place as a
+    /// statement of the program (or of another such IIFE's body).
+    pub(super) fn is_module_scope_iife(&self, func: Node<'t>, depth: u32) -> bool {
+        fn same_span(a: Option<Node>, b: Node) -> bool {
+            a.map(|a| a.start_byte() == b.start_byte() && a.end_byte() == b.end_byte()).unwrap_or(false)
+        }
+        if depth > 4 || !matches!(func.kind(), "function_expression" | "arrow_function") {
+            return false;
+        }
+        if func.child_by_field_name("body").map(|b| b.kind()) != Some("statement_block") {
+            return false;
+        }
+        let mut callee = func;
+        while let Some(p) = callee.parent() {
+            if p.kind() != "parenthesized_expression" {
+                break;
+            }
+            callee = p;
+        }
+        let mut call = callee.parent();
+        if let Some(m) = call {
+            if m.kind() == "member_expression" && same_span(m.child_by_field_name("object"), callee) {
+                let prop = m.child_by_field_name("property").map(|p| self.text(p));
+                if !matches!(prop, Some("call") | Some("apply")) {
+                    return false;
+                }
+                callee = m;
+                call = m.parent();
+            }
+        }
+        let Some(call) = call else { return false };
+        if call.kind() != "call_expression" || !same_span(call.child_by_field_name("function"), callee) {
+            return false;
+        }
+        let mut stmt = call.parent();
+        while let Some(s) = stmt {
+            if !matches!(s.kind(), "unary_expression" | "parenthesized_expression") {
+                break;
+            }
+            stmt = s.parent();
+        }
+        let Some(stmt) = stmt else { return false };
+        if stmt.kind() != "expression_statement" {
+            return false;
+        }
+        let Some(scope) = stmt.parent() else { return false };
+        if scope.kind() == "program" {
+            return true;
+        }
+        if scope.kind() != "statement_block" {
+            return false;
+        }
+        match scope.parent() {
+            Some(outer) => self.is_module_scope_iife(outer, depth + 1),
+            None => false,
         }
     }
 

@@ -35,6 +35,22 @@ export function makeLineAt(src: string, baseLine: number): (idx: number) => numb
   };
 }
 
+let lastLineSrc: string | null = null;
+let lastLineAt: ((idx: number) => number) | null = null;
+
+/**
+ * The 1-based line of offset `idx` in `src` — `src.slice(0, idx).split('\n').length`
+ * without its O(source-length) cost per call. Keeps the newline index of the
+ * last source asked about, so a loop over one file's matches builds it once.
+ */
+export function lineOfIndex(src: string, idx: number | undefined): number {
+  if (src !== lastLineSrc || !lastLineAt) {
+    lastLineSrc = src;
+    lastLineAt = makeLineAt(src, 1);
+  }
+  return lastLineAt(idx ?? src.length);
+}
+
 /** Innermost function/method node whose line range contains `line`. */
 export function enclosingFn(nodesInFile: readonly Node[], line: number): Node | null {
   let best: Node | null = null;

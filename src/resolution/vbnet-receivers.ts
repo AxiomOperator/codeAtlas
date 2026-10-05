@@ -1251,6 +1251,41 @@ export function matchVbTypedCall(
   return extensionFor(type, owners, method, ref, context, isStdMethod);
 }
 
+/**
+ * A VB.NET member read or write through a name (#2305) — `AppSession.SessionId`
+ * on a type or `Module`, `session.Name` on a value of a declared project type
+ * — emitted by the extractor as a `references` ref `receiver.member`. Links
+ * the member of that type (or one it inherits), else nothing: the member's
+ * name alone never decides, and an outside type (`Console`, `String`) has no
+ * project member.
+ */
+export function matchVbMemberAccess(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const dot = ref.referenceName.indexOf('.');
+  const receiver = ref.referenceName.slice(0, dot);
+  const member = ref.referenceName.slice(dot + 1);
+  if (!context.getNodesByLowerName(member.toLowerCase()).some((n) => n.language === 'vbnet' && VB_MEMBER_KINDS.has(n.kind))) return null;
+  const type = receiverType(receiver, ref, context, 0);
+  let owners: Node[] | null;
+  let resolvedBy: ResolvedRef['resolvedBy'] = 'instance-method';
+  if (type === undefined) {
+    const named = typesNamedAt({ name: receiver, array: false, file: ref.filePath, line: ref.line }, context);
+    if (named.owners.length === 0 || named.ambiguous) return null;
+    owners = named.owners;
+    resolvedBy = 'qualified-name';
+  } else {
+    if (!type || typeKey(type) === 'object') return null;
+    owners = ownersOf(type, context);
+  }
+  if (!owners || owners.length === 0) return null;
+  const found = memberOn(owners, member, ref, context, true);
+  return found ? { original: ref, targetNodeId: found.node.id, confidence: 0.85, resolvedBy } : null;
+}
+
+/** A VB.NET member-access ref's shape: `receiver.member`, both simple names (see matchVbMemberAccess). */
+export function isVbMemberAccessRef(ref: UnresolvedRef): boolean {
+  return ref.language === 'vbnet' && ref.referenceKind === 'references' && /^[A-Za-z_]\w*\.[A-Za-z_]\w*$/.test(ref.referenceName);
+}
+
 const VB_TYPE_IMPORTS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
 
 /** The last names of a file's `Imports` (a type imported this way lends its shared members; an alias lends none). */

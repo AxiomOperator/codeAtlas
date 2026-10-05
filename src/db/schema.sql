@@ -200,7 +200,8 @@ CREATE INDEX IF NOT EXISTS idx_unresolved_failed_tail ON unresolved_refs(name_ta
 CREATE INDEX IF NOT EXISTS idx_edges_provenance ON edges(provenance);
 -- Sync's third-file wiring lookup must not scan every synthesized edge.
 -- CASE short-circuits malformed metadata; keep these expressions identical
--- in migrations and synthesis queries so SQLite can use the partial index.
+-- in migrations and synthesis queries so SQLite can use the partial index
+-- (all of them build theirs from src/db/schema-ddl.ts; a test pins this text).
 CREATE INDEX IF NOT EXISTS idx_edges_synthesis_site ON edges(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.registeredAt') END)
     WHERE CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.synthesizedBy') END IS NOT NULL;
 

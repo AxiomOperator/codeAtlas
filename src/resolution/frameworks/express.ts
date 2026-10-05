@@ -9,6 +9,7 @@ import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from
 import { stripCommentsForRegex } from '../strip-comments';
 import { resolveImportPath } from '../import-resolver';
 import { dependsOn } from './package-deps';
+import { lineOfIndex } from '../synth-utils';
 
 function extractTailIdent(expr: string): string | null {
   const cleaned = expr.replace(/\s+/g, '').replace(/\(\)$/, '');
@@ -92,7 +93,7 @@ function replyRefs(safe: string, bodyStart: number, bodyEnd: number, fromNodeId:
       fromNodeId,
       referenceName: `${m[1]}.${m[2]}`,
       referenceKind: 'calls',
-      line: safe.slice(0, at).split('\n').length,
+      line: lineOfIndex(safe, at),
       column: at - (safe.lastIndexOf('\n', at - 1) + 1),
       filePath,
       language,
@@ -197,7 +198,7 @@ export const expressResolver: FrameworkResolver = {
       const method = match[2]!;
       const routePath = match[3]!;
       if (method === 'use' && !routePath.startsWith('/')) continue;
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineOfIndex(safe, match.index);
       const routeNode: Node = {
         id: `route:${filePath}:${line}:${method.toUpperCase()}:${routePath}`,
         kind: 'route',
@@ -270,7 +271,7 @@ export const expressResolver: FrameworkResolver = {
         const closeParen = matchDelim(safe, openParen, '(', ')');
         if (closeParen < 0) break;
         const method = link[1]!;
-        const line = safe.slice(0, openParen).split('\n').length;
+        const line = lineOfIndex(safe, openParen);
         const args = safe.slice(openParen + 1, closeParen);
         const routeNode: Node = {
           id: `route:${filePath}:${line}:${method.toUpperCase()}:${routePath}`,

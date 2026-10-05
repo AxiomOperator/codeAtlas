@@ -24,39 +24,25 @@
 import type { Edge } from '../types';
 import type { ResolutionContext } from './types';
 import type { MaybeYield } from './cooperative-yield';
-import { stripCommentsForRegex } from './strip-comments';
-import { isTestPath } from '../search/query-utils';
 import { readStringAt, toHref } from './frameworks/expo-router';
 import { nextRouteTable, destinationsForHref } from './frameworks/nextjs';
-import { enclosingFn, makeLineAt } from './synth-utils';
+import { linkEdgesPass, linkTagPattern } from './link-edges';
 
 const JSX_FILE = /\.(?:[cm]?[jt]sx?|mdx)$/;
 
 /** `<Link … href=…` / `<NextLink … href=…` / `<a … href=…`, the attribute anywhere in the tag. */
-const LINK_TAG = /<(Link|NextLink|a)\b([^>]*?)\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|\{\s*)/g;
-
-/** Links a single component may carry before it is a navigation menu, not a decision. */
-const MAX_LINKS_PER_COMPONENT = 24;
+const LINK_TAG = linkTagPattern(['Link', 'NextLink', 'a'], `\\bhref\\s*=\\s*(?:"([^"]*)"|'([^']*)'|\\{\\s*)`);
 
 export async function nextLinkEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   const table = nextRouteTable(ctx);
   if (table.exact.size === 0) return [];
-  const edges: Edge[] = [];
-  const seen = new Set<string>();
-  const perComponent = new Map<string, number>();
-  let scanned = 0;
-  for (const file of ctx.getAllFiles()) {
-    if (!JSX_FILE.test(file) || isTestPath(file)) continue;
-    if (!table.roots.some((root) => file.startsWith(root))) continue;
-    if ((++scanned & 63) === 0) await onYield();
-    const source = ctx.readFile(file);
-    if (!source || !source.includes('href')) continue;
-    const safe = stripCommentsForRegex(source, 'typescript');
-    const nodes = ctx.getNodesInFile(file);
-    const lineOf = makeLineAt(safe, 1);
-    LINK_TAG.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = LINK_TAG.exec(safe)) !== null) {
+  return linkEdgesPass(ctx, onYield, {
+    synthesizedBy: 'next-link',
+    fileFilter: JSX_FILE,
+    routesFor: (file) => (table.roots.some((root) => file.startsWith(root)) ? table : null),
+    pattern: (_file, source) => (source.includes('href') ? LINK_TAG : null),
+    stripComments: true,
+    site: (m, safe) => {
       const tag = m[1]!;
       let literal: string | null = m[3] ?? m[4] ?? null;
       if (literal === null) {
@@ -72,33 +58,15 @@ export async function nextLinkEdges(ctx: ResolutionContext, onYield: MaybeYield)
           if (head) literal = readStringAt(safe, at + head.index + head[0].length);
         }
       }
-      if (literal === null) continue;
+      if (literal === null) return null;
       // An external `<a href>` is a link out of the site, not a transition.
-      if (tag === 'a' && !literal.startsWith('/')) continue;
+      if (tag === 'a' && !literal.startsWith('/')) return null;
       const href = toHref(literal);
-      if (!href) continue;
-      const line = lineOf(m.index);
-      const component = enclosingFn(nodes, line);
-      if (!component) continue;
-      // A destination written as a choice names one route per arm, and the
-      // user reaches every one of them — each is drawn.
-      for (const { node: page, href: arm } of destinationsForHref(href, table)) {
-        const key = `${component.id}>${page.id}`;
-        if (seen.has(key)) continue;
-        const count = (perComponent.get(component.id) ?? 0) + 1;
-        perComponent.set(component.id, count);
-        if (count > MAX_LINKS_PER_COMPONENT) continue;
-        seen.add(key);
-        edges.push({
-          source: component.id,
-          target: page.id,
-          kind: 'navigates',
-          line,
-          provenance: 'heuristic',
-          metadata: { synthesizedBy: 'next-link', href: arm.display, navMethod: tag === 'a' ? 'a' : 'link', registeredAt: `${file}:${line}` },
-        });
-      }
-    }
-  }
-  return edges;
+      if (!href) return null;
+      return {
+        destinations: destinationsForHref(href, table).map((d) => ({ node: d.node, display: d.href.display })),
+        metadata: { navMethod: tag === 'a' ? 'a' : 'link' },
+      };
+    },
+  });
 }

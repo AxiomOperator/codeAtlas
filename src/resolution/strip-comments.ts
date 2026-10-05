@@ -27,8 +27,11 @@
  * Blank string contents while preserving quotes and offsets. Template
  * interpolations are blanked too; callers checking executable expressions
  * must conservatively inspect those expressions in the original source.
+ * `regexSpans`, when given, receives the start and closing-slash offsets of
+ * every regex literal skipped — the only place the scan looks ahead of the
+ * character it blanks.
  */
-export function blankStringContents(text: string): string {
+export function blankStringContents(text: string, regexSpans?: number[]): string {
   const out = text.split('');
   let i = 0;
   const n = text.length;
@@ -45,7 +48,7 @@ export function blankStringContents(text: string): string {
         if (text[end] === ']') inClass = false;
         if (text[end] === '/' && !inClass) break;
       }
-      if (end < n && text[end] === '/') { i = end + 1; continue; }
+      if (end < n && text[end] === '/') { regexSpans?.push(i, end); i = end + 1; continue; }
     }
     if (c === '"' || c === "'" || c === '`') {
       const quote = c;

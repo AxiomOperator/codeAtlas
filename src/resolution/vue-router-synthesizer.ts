@@ -27,49 +27,40 @@
 import type { Edge, Node } from '../types';
 import type { ResolutionContext } from './types';
 import type { MaybeYield } from './cooperative-yield';
-import { isTestPath } from '../search/query-utils';
 import { readStringAt, routesForFile, toHref } from './frameworks/expo-router';
 import { destinationsForHref } from './frameworks/nextjs';
 import { parseVuePathObject, routeNameInExpression, vueRouteTable } from './frameworks/vue-router';
-import { enclosingFn, makeLineAt } from './synth-utils';
+import { linkEdgesPass, linkTagPattern } from './link-edges';
 
 const TEMPLATE_FILE = /\.(?:vue|[cm]?[jt]sx?)$/;
 
 /** `<router-link … to=` / `<RouterLink … :to=` / `<NuxtLink … to=`, the attribute anywhere in the tag. */
-const LINK_TAG = /<(router-link|RouterLink|NuxtLink|nuxt-link)\b([^>]*?)\s:?to\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+const LINK_TAG = linkTagPattern(
+  ['router-link', 'RouterLink', 'NuxtLink', 'nuxt-link'],
+  `\\s:?to\\s*=\\s*(?:"([^"]*)"|'([^']*)')`
+);
 
 /** A tag this pass could possibly match — the cheap prefilter. */
 const HAS_LINK_TAG = /<(?:router-link|RouterLink|NuxtLink|nuxt-link)\b/;
 
-/** Links a single component may carry before it is a navigation menu, not a decision. */
-const MAX_LINKS_PER_COMPONENT = 24;
-
 export async function vueRouterLinkEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   const table = vueRouteTable(ctx);
   if (table.byRoot.size === 0) return [];
-  const edges: Edge[] = [];
-  const seen = new Set<string>();
-  const perComponent = new Map<string, number>();
-  let scanned = 0;
-  for (const file of ctx.getAllFiles()) {
-    if (!TEMPLATE_FILE.test(file) || isTestPath(file)) continue;
-    const routes = routesForFile(table, file);
-    if (!routes || routes.exact.size === 0) continue;
-    if ((++scanned & 63) === 0) await onYield();
-    const source = ctx.readFile(file);
-    if (!source || !HAS_LINK_TAG.test(source)) continue;
-    const nodes = ctx.getNodesInFile(file);
-    const lineOf = makeLineAt(source, 1);
-    LINK_TAG.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = LINK_TAG.exec(source)) !== null) {
+  return linkEdgesPass(ctx, onYield, {
+    synthesizedBy: 'vue-router-link',
+    fileFilter: TEMPLATE_FILE,
+    routesFor: (file) => {
+      const routes = routesForFile(table, file);
+      return routes && routes.exact.size > 0 ? routes : null;
+    },
+    pattern: (_file, source) => (HAS_LINK_TAG.test(source) ? LINK_TAG : null),
+    stripComments: false,
+    site: (m, _source, _file, routes) => {
       // A bound `:to` holds an expression; a plain `to` holds a literal path.
       const value = (m[3] ?? m[4] ?? '').trim();
-      if (value.length === 0) continue;
-      const line = lineOf(m.index);
-      const component = enclosingFn(nodes, line);
-      if (!component) continue;
-      const bound = m[0].includes(':to');
+      if (value.length === 0) return null;
+      // The `to` attribute itself — what follows `<tag` and the attributes before it.
+      const bound = m[0].slice(1 + m[1]!.length + m[2]!.length).trimStart().startsWith(':');
       const named = bound ? routeNameInExpression(value) : null;
       const byName = named === null ? undefined : routes.byName.get(named);
       // A `{ name }` destination names exactly one route; a path may be
@@ -78,32 +69,16 @@ export async function vueRouterLinkEdges(ctx: ResolutionContext, onYield: MaybeY
       if (byName && named !== null) destinations = [{ node: byName, display: named }];
       else {
         const href = bound ? (parseVuePathObject(value) ?? toHref(readStringAt(value, 0))) : toHref(value);
-        if (!href || !href.path.startsWith('/')) continue;
+        if (!href || !href.path.startsWith('/')) return null;
         destinations = destinationsForHref(href, routes).map((d) => ({ node: d.node, display: d.href.display }));
       }
-      for (const { node: target, display } of destinations) {
-        const key = `${component.id}>${target.id}`;
-        if (seen.has(key)) continue;
-        const count = (perComponent.get(component.id) ?? 0) + 1;
-        perComponent.set(component.id, count);
-        if (count > MAX_LINKS_PER_COMPONENT) continue;
-        seen.add(key);
-        edges.push({
-          source: component.id,
-          target: target.id,
-          kind: 'navigates',
-          line,
-          provenance: 'heuristic',
-          metadata: {
-            synthesizedBy: 'vue-router-link',
-            href: display,
-            navMethod: 'link',
-            ...(named !== null && routes.byName.has(named) ? { by: 'name' } : {}),
-            registeredAt: `${file}:${line}`,
-          },
-        });
-      }
-    }
-  }
-  return edges;
+      return {
+        destinations,
+        metadata: {
+          navMethod: 'link',
+          ...(named !== null && routes.byName.has(named) ? { by: 'name' } : {}),
+        },
+      };
+    },
+  });
 }

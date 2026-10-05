@@ -5,6 +5,7 @@
  */
 
 import { SqliteDatabase } from './sqlite-adapter';
+import { SYNTHESIS_SITE_INDEX, SYNTHESIS_SITE_INDEX_BODY } from './schema-ddl';
 
 /**
  * Current schema version
@@ -187,8 +188,7 @@ const migrations: Migration[] = [
         CREATE TABLE IF NOT EXISTS synthesis_inputs (
           file_path TEXT PRIMARY KEY REFERENCES files(path) ON DELETE CASCADE
         );
-        CREATE INDEX IF NOT EXISTS idx_edges_synthesis_site ON edges(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.registeredAt') END)
-          WHERE CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.synthesizedBy') END IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS ${SYNTHESIS_SITE_INDEX} ${SYNTHESIS_SITE_INDEX_BODY};
         UPDATE edges SET metadata = json_set(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.synthesizedBy', 'go-method-contains')
           WHERE kind = 'contains' AND provenance IS NULL AND EXISTS (
             SELECT 1 FROM nodes s JOIN nodes t ON t.id = edges.target
@@ -209,10 +209,8 @@ const migrations: Migration[] = [
       // Rebuild transactionally; the guarded v10 definition also lets older
       // databases containing malformed metadata reach this migration safely.
       db.exec(`
-        DROP INDEX IF EXISTS idx_edges_synthesis_site;
-        CREATE INDEX idx_edges_synthesis_site
-          ON edges(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.registeredAt') END)
-          WHERE CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.synthesizedBy') END IS NOT NULL;
+        DROP INDEX IF EXISTS ${SYNTHESIS_SITE_INDEX};
+        CREATE INDEX ${SYNTHESIS_SITE_INDEX} ${SYNTHESIS_SITE_INDEX_BODY};
       `);
     },
   },

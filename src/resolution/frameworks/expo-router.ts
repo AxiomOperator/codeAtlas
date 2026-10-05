@@ -45,6 +45,7 @@ import type {
 } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 import { dependsOn } from './package-deps';
+import { lineOfIndex } from '../synth-utils';
 
 // =============================================================================
 // Route files
@@ -764,7 +765,7 @@ export const expoRouterResolver: FrameworkResolver = {
         const method = (m[1] ?? m[2])!;
         if (seen.has(method)) continue;
         seen.add(method);
-        const line = stripped.slice(0, m.index).split('\n').length;
+        const line = lineOfIndex(stripped, m.index);
         const node: Node = {
           id: `route:${filePath}:${line}:${method}:${apiPath}`,
           kind: 'route',
@@ -809,7 +810,7 @@ export const expoRouterResolver: FrameworkResolver = {
         fromNodeId: node.id,
         referenceName: screen.name,
         referenceKind: 'calls',
-        line: stripped.slice(0, screen.index).split('\n').length,
+        line: lineOfIndex(stripped, screen.index),
         column: 0,
         filePath,
         language,

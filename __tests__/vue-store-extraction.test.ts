@@ -111,9 +111,11 @@ export const useChatStore = defineStore('chat', () => {
     cg.close?.();
   });
 
-  it('does not extract a non-exported `const actions = {…}` outside a Vue store file', async () => {
+  it('a non-exported `const actions = {…}` outside a Vue store file is a plain object namespace', async () => {
     // A plain module that happens to hold a non-exported `const actions` object of
-    // functions, but lacks any second Vue-store signal — the gate must not fire.
+    // functions, but lacks any second Vue-store signal. The Vue-store gate does
+    // not fire — but since #2300 any object literal's function members are
+    // nodes, exported or not, so its methods are found like any namespace's.
     fs.writeFileSync(
       path.join(dir, 'commands.js'),
       `const actions = {
@@ -128,8 +130,8 @@ export function run(key) { return actions[key](); }
     await cg.indexAll();
     const db = (cg as any).db.db;
 
-    expect(db.prepare(`SELECT count(*) c FROM nodes WHERE name = 'doThing'`).get().c).toBe(0);
-    expect(db.prepare(`SELECT count(*) c FROM nodes WHERE name = 'doOther'`).get().c).toBe(0);
+    expect(db.prepare(`SELECT count(*) c FROM nodes WHERE name = 'doThing' AND kind='function'`).get().c).toBe(1);
+    expect(db.prepare(`SELECT count(*) c FROM nodes WHERE name = 'doOther' AND kind='function'`).get().c).toBe(1);
     // The real exported function is still extracted normally.
     expect(db.prepare(`SELECT count(*) c FROM nodes WHERE name = 'run' AND kind='function'`).get().c).toBeGreaterThan(0);
 

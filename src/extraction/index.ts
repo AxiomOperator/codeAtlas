@@ -2999,21 +2999,17 @@ export class ExtractionOrchestrator {
       ? this.queries.getNodeIdentitiesByFile(filePath)
       : [];
 
-    // Filter out nodes with missing required fields before insertion.
-    // This prevents FK violations when edges reference nodes that would
-    // be silently skipped by insertNode() (see issue #42).
-    const validNodes = result.nodes.filter((n) => n.id && n.kind && n.name && n.filePath && n.language);
-    const insertedIds = new Set(validNodes.map((n) => n.id));
-    const validEdges = result.edges.filter(
-      (e) => insertedIds.has(e.source) && insertedIds.has(e.target)
+    // One validation/denormalization implementation for every store path
+    // (incremental here, fresh bulk via buildFreshStoreBundle, kernel decode in
+    // the store worker): nodes missing identity fields are dropped (#42), edges
+    // must connect inserted nodes, refs must originate from inserted nodes.
+    const bundle = finalizeStoreBundle(
+      result,
+      filePath,
+      language,
+      this.buildFileRecord(filePath, content, language, stats, result.nodes.length, result.errors, contentHash, generated)
     );
-    const validRefs = result.unresolvedReferences
-      .filter((ref) => insertedIds.has(ref.fromNodeId))
-      .map((ref) => ({
-        ...ref,
-        filePath: ref.filePath ?? filePath,
-        language: ref.language ?? language,
-      }));
+    const { nodes: validNodes, edges: validEdges, refs: validRefs, file: fileRecord } = bundle;
 
     // Fast path for the common case (everything fits one chunk): the whole
     // re-store — deleting the old rows, the new nodes, edges, refs and file
@@ -3033,22 +3029,7 @@ export class ExtractionOrchestrator {
         if (existingFile) {
           this.queries.deleteFile(filePath);
         }
-        this.queries.storeFileBundle({
-          nodes: validNodes,
-          edges: validEdges,
-          refs: validRefs,
-          file: {
-            path: filePath,
-            contentHash,
-            language,
-            size: stats.size,
-            modifiedAt: stats.mtimeMs,
-            indexedAt: Date.now(),
-            nodeCount: result.nodes.length,
-            errors: result.errors.length > 0 ? result.errors : undefined,
-            generated,
-          },
-        });
+        this.queries.storeFileBundle(bundle);
         // On a fresh bulk index crossFileIncomingEdges is [].
         if (crossFileIncomingEdges.length > 0) {
           this.reattachCrossFileEdges(crossFileIncomingEdges, priorNodes, validNodes);
@@ -3112,26 +3093,10 @@ export class ExtractionOrchestrator {
       }
 
       // Insert file record
-      const fileRecord: FileRecord = {
-        path: filePath,
-        contentHash,
-        language,
-        size: stats.size,
-        modifiedAt: stats.mtimeMs,
-        indexedAt: Date.now(),
-        nodeCount: result.nodes.length,
-        errors: result.errors.length > 0 ? result.errors : undefined,
-        generated,
-      };
       this.queries.upsertFile(fileRecord);
     });
   }
 
-  /**
-   * Build one file's store bundle for the FRESH-DB path: no existing-file
-   * check, no cross-file edge snapshot (both are re-index concerns — a fresh
-   * database has neither). Filters mirror storeExtractionResult exactly.
-   */
   /** The FileRecord for a fresh-index store (nodeCount is the PRE-filter count). */
   private buildFileRecord(
     filePath: string,
@@ -3139,24 +3104,31 @@ export class ExtractionOrchestrator {
     language: Language,
     stats: fs.Stats,
     nodeCount: number,
-    resultErrors: ExtractionResult['errors']
+    resultErrors: ExtractionResult['errors'],
+    contentHash: string = hashContent(content),
+    generated: boolean = detectGeneratedFile(filePath, content)
   ): FileRecord {
     return {
       path: filePath,
-      contentHash: hashContent(content),
+      contentHash,
       language,
       size: stats.size,
       modifiedAt: stats.mtimeMs,
       indexedAt: Date.now(),
       nodeCount,
       errors: resultErrors.length > 0 ? resultErrors : undefined,
-      // Decided here, once, while the content is already in memory — never at
-      // query time (#1500). The header scan short-circuits on a single
-      // substring test for ~every hand-written file.
-      generated: detectGeneratedFile(filePath, content),
+      // Decided at store time, once, while the content is already in memory —
+      // never at query time (#1500). The header scan short-circuits on a
+      // single substring test for ~every hand-written file.
+      generated,
     };
   }
 
+  /**
+   * Build one file's store bundle for the FRESH-DB path: no existing-file
+   * check, no cross-file edge snapshot (both are re-index concerns — a fresh
+   * database has neither). Both paths finalize through finalizeStoreBundle.
+   */
   private buildFreshStoreBundle(
     filePath: string,
     content: string,

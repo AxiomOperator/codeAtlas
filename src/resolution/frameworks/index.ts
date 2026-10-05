@@ -24,6 +24,7 @@ import { djangoResolver, flaskResolver, fastapiResolver } from './python';
 import { railsResolver } from './ruby';
 import { springResolver } from './java';
 import { playResolver } from './play';
+import { micronautResolver } from './micronaut';
 import { goResolver } from './go';
 import { goframeResolver } from './goframe';
 import { rustResolver } from './rust';
@@ -73,6 +74,8 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   // Java
   springResolver,
   playResolver,
+  // Micronaut — `@Controller` + `@Get/@Post/…` → route nodes (gated on io.micronaut.http.annotation imports)
+  micronautResolver,
   // Go
   goResolver,
   goframeResolver,
@@ -172,6 +175,7 @@ export { djangoResolver, flaskResolver, fastapiResolver } from './python';
 export { railsResolver } from './ruby';
 export { springResolver } from './java';
 export { playResolver } from './play';
+export { micronautResolver } from './micronaut';
 export { goResolver } from './go';
 export { goframeResolver } from './goframe';
 export { rustResolver } from './rust';

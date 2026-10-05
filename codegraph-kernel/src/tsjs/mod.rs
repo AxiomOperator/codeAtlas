@@ -687,6 +687,14 @@ impl<'t> Walker<'t> {
                     skip_children = true;
                 }
             }
+        } else if kind == "assignment_expression"
+            && !self.inside_class_like()
+            && self.member_assigned_object(node).is_some()
+        {
+            // `window.api = { load() {…} }` (#2300). Mirrors the
+            // memberAssignedObject branch of TreeSitterExtractor.visitNode.
+            self.extract_member_assigned_object(node);
+            skip_children = true;
         } else if kind == "call_expression" {
             self.extract_call(node);
         } else if kind == "new_expression" {

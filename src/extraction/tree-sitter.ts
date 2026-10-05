@@ -30,9 +30,11 @@ import { AstroExtractor } from './astro-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
+import { SpringBeansExtractor, isSpringBeansXml } from './spring-beans-extractor';
 import { CfmlExtractor } from './cfml-extractor';
 import { tryKernelExtract, takeDeferredPreParse } from './kernel';
 import { commonJsRequireRefs } from './commonjs-requires';
+import { buildFileNode } from './file-node';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -381,8 +383,11 @@ const MEMBER_ACCESS_TYPES: ReadonlySet<string> = new Set([
  * +2448 `references` on excalidraw, the retrieval-perf benchmark, all pointing at
  * already-covered types). Don't re-add `member_expression`/`attribute` here.
  */
+/** A Rust type / variant / associated-const path segment (`Mode`, `A`, `MAX`). */
+const RUST_TYPE_SEGMENT = /^[A-Z][A-Za-z0-9_]*$/;
+
 const STATIC_MEMBER_LANGS: ReadonlySet<string> = new Set([
-  'java', 'csharp', 'kotlin', 'swift', 'scala', 'dart', 'php', 'cpp',
+  'java', 'csharp', 'kotlin', 'swift', 'scala', 'dart', 'php', 'cpp', 'vbnet',
 ]);
 
 /**
@@ -430,6 +435,11 @@ const LITERAL_RECEIVER_TYPES = new Set([
  * Languages whose member calls go through the TS/JS grammars.
  */
 const TS_JS_CHAIN_LANGUAGES = new Set(['typescript', 'tsx', 'javascript', 'jsx']);
+
+/** Whether two nodes cover the same source span. */
+function sameSpan(a: SyntaxNode | null | undefined, b: SyntaxNode): boolean {
+  return !!a && a.startIndex === b.startIndex && a.endIndex === b.endIndex;
+}
 
 /** Receiver node types (TS/JS grammars) that continue a member chain downward. */
 const TS_JS_CHAIN_RECEIVER_TYPES = new Set(['member_expression', 'subscript_expression']);
@@ -643,20 +653,7 @@ export class TreeSitterExtractor {
       }
 
       // Create file node representing the source file
-      const fileNode: Node = {
-        id: `file:${this.filePath}`,
-        kind: 'file',
-        name: path.basename(this.filePath),
-        qualifiedName: this.filePath,
-        filePath: this.filePath,
-        language: this.language,
-        startLine: 1,
-        endLine: this.source.split('\n').length,
-        startColumn: 0,
-        endColumn: 0,
-        isExported: false,
-        updatedAt: Date.now(),
-      };
+      const fileNode = buildFileNode(this.filePath, this.source, this.language);
       const fileDocstring = this.extractor?.getBodyDocstring?.(this.tree.rootNode, this.source);
       if (fileDocstring) fileNode.docstring = fileDocstring;
       this.nodes.push(fileNode);
@@ -1122,6 +1119,8 @@ export class TreeSitterExtractor {
       }
     }
 
+    if (this.language === 'dart' && this.extractDartDeclarationTypeRefs(node)) return;
+
     // Pascal-specific AST handling
     if (this.language === 'pascal') {
       skipChildren = this.visitPascalNode(node);
@@ -1492,6 +1491,19 @@ export class TreeSitterExtractor {
         skipChildren = true;
       }
     }
+    // A namespace object hung off a member at module scope — `window.api = {
+    // load() {…} }`, `ns.mod = { run: function () {…} }` (#2300): the classic
+    // script-tag JS shape. Mint the container (named by the property) and its
+    // function members, exactly like a top-level `const api = {…}`.
+    else if (
+      nodeType === 'assignment_expression' &&
+      TS_JS_CHAIN_LANGUAGES.has(this.language) &&
+      !this.isInsideClassLikeNode() &&
+      this.memberAssignedObject(node)
+    ) {
+      this.extractMemberAssignedObject(node);
+      skipChildren = true;
+    }
     // Check for function calls
     else if (this.extractor.callTypes.includes(nodeType)) {
       this.extractCall(node);
@@ -1715,6 +1727,7 @@ export class TreeSitterExtractor {
       visitNode: (node) => self.visitNode(node),
       visitFunctionBody: (body, functionId) => self.visitFunctionBody(body, functionId),
       addUnresolvedReference: (ref) => self.unresolvedReferences.push(ref),
+      extractTypeRefs: (node, fromNodeId) => self.extractTypeRefsFromSubtree(node, fromNodeId),
       pushScope: (nodeId) => self.nodeStack.push(nodeId),
       popScope: () => self.nodeStack.pop(),
       get filePath() { return self.filePath; },
@@ -1816,6 +1829,16 @@ export class TreeSitterExtractor {
       // descends into this subtree. (#528)
       const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
         ?? getChildByField(node, this.extractor.bodyField);
+      // A module-scope IIFE (`(function () { … })()`) IS the module of
+      // script-tag JS: its declarations are walked as top-level ones, so the
+      // namespace objects it builds get nodes (#2300).
+      if (body && this.isModuleScopeIife(node, 0)) {
+        for (let i = 0; i < body.namedChildCount; i++) {
+          const stmt = body.namedChild(i);
+          if (stmt) this.visitNode(stmt);
+        }
+        return;
+      }
       if (body) {
         this.visitFunctionBody(body, '');
       }
@@ -2577,6 +2600,92 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * Walk, attributed to the object's own node, the members of an object
+   * literal that extractObjectLiteralFunctions does NOT mint — `{ a:
+   * compute(), ...base(), m() {…} }`'s `compute()` and `base()`. Without
+   * this, extracting the members one by one dropped every call written in a
+   * data member.
+   */
+  private walkObjectLiteralDataMembers(obj: SyntaxNode, ownerId: string | undefined): void {
+    if (ownerId) this.nodeStack.push(ownerId);
+    for (let i = 0; i < obj.namedChildCount; i++) {
+      const member = obj.namedChild(i);
+      if (!member) continue;
+      let value: SyntaxNode | null = null;
+      if (member.type === 'pair') {
+        value = getChildByField(member, 'value');
+        if (value && (value.type === 'arrow_function' || value.type === 'function_expression')) continue;
+        if (value?.type === 'call_expression') {
+          const fn = getChildByField(value, 'arguments')?.namedChild(0);
+          if (fn && this.curriedWrapperBoundName(fn)) continue;
+        }
+      } else if (member.type === 'spread_element') {
+        value = member;
+      }
+      if (value) this.visitFunctionBody(value, '');
+    }
+    if (ownerId) this.nodeStack.pop();
+  }
+
+  /**
+   * The object literal a module-scope member assignment hangs off a namespace
+   * — `window.api = { load() {…} }`, `ns.mod = { run: () => {…} }` — when it
+   * has ≥1 inline function member (a data object stays as it was). Not the
+   * CommonJS `module.exports = {…}`, which the export machinery owns.
+   */
+  private memberAssignedObject(assignment: SyntaxNode): SyntaxNode | null {
+    const left = getChildByField(assignment, 'left');
+    const right = getChildByField(assignment, 'right');
+    if (!left || !right || left.type !== 'member_expression') return null;
+    if (right.type !== 'object' && right.type !== 'object_expression') return null;
+    const property = getChildByField(left, 'property');
+    if (!property || property.type !== 'property_identifier') return null;
+    if (getNodeText(left, this.source) === 'module.exports') return null;
+    return this.objectHasInlineFunctions(right) ? right : null;
+  }
+
+  /** `window.api = {…}` → a `variable` named `api` over the assignment, holding the object's function members. */
+  private extractMemberAssignedObject(assignment: SyntaxNode): void {
+    const obj = this.memberAssignedObject(assignment)!;
+    const property = getChildByField(getChildByField(assignment, 'left')!, 'property')!;
+    const text = getNodeText(obj, this.source).slice(0, 100);
+    const holder = this.createNode('variable', getNodeText(property, this.source), assignment, {
+      signature: `= ${text}${text.length >= 100 ? '...' : ''}`,
+      isExported: false,
+    });
+    this.walkObjectLiteralDataMembers(obj, holder?.id);
+    this.extractObjectLiteralFunctions(obj);
+  }
+
+  /**
+   * An anonymous function invoked in place at module scope — `(function () {
+   * … })()`, `(() => {…})()`, `!function () {…}()`, `(function () {…}).call(this)`
+   * — as a statement of the program, or of another such IIFE's body.
+   */
+  private isModuleScopeIife(fn: SyntaxNode, depth: number): boolean {
+    if (depth > 4 || !TS_JS_CHAIN_LANGUAGES.has(this.language)) return false;
+    if (fn.type !== 'function_expression' && fn.type !== 'arrow_function') return false;
+    if (getChildByField(fn, 'body')?.type !== 'statement_block') return false;
+    let callee: SyntaxNode = fn;
+    while (callee.parent?.type === 'parenthesized_expression') callee = callee.parent;
+    let call = callee.parent;
+    if (call?.type === 'member_expression' && sameSpan(getChildByField(call, 'object'), callee)) {
+      const prop = getChildByField(call, 'property');
+      if (!prop || !['call', 'apply'].includes(getNodeText(prop, this.source))) return false;
+      callee = call;
+      call = call.parent;
+    }
+    if (call?.type !== 'call_expression' || !sameSpan(getChildByField(call, 'function'), callee)) return false;
+    let stmt = call.parent;
+    while (stmt?.type === 'unary_expression' || stmt?.type === 'parenthesized_expression') stmt = stmt.parent;
+    if (stmt?.type !== 'expression_statement') return false;
+    const scope = stmt.parent;
+    if (scope?.type === 'program') return true;
+    const outer = scope?.type === 'statement_block' ? scope.parent : null;
+    return !!outer && this.isModuleScopeIife(outer, depth + 1);
+  }
+
+  /**
    * A top-level binding exported by a LATER statement rather than at its
    * declaration: `export default NAME`, `export { NAME }`, `export { NAME as
    * default }`. The declaration's own `isExported` (an `export_statement`
@@ -2983,6 +3092,10 @@ export class TreeSitterExtractor {
               if (nameNode.type === 'object_pattern' && valueNode?.type === 'identifier') {
                 this.extractRtkHookBindings(nameNode, isExported);
               }
+              // The initializer still RUNS here: `const { a } = useFoo(1)` at
+              // module scope (or in a `<script setup>`) calls useFoo, and with
+              // no symbol bound the call is the enclosing scope's (#2340).
+              if (valueNode && valueNode.type !== 'identifier') this.visitFunctionBody(valueNode, '');
               continue;
             }
             const name = getNodeText(nameNode, this.source);
@@ -3058,8 +3171,13 @@ export class TreeSitterExtractor {
             // whose functions are body-local consts — it must fall through to a
             // normal body walk (extracting those consts), not be skipped here.
             const hasInlineFns = !!objectOfFns && this.objectHasInlineFunctions(objectOfFns);
+            // A DIRECT object value gets its members whether or not it is
+            // exported (#2300): `const api = { load() {…} }` is the namespace of
+            // script-tag JS as much as `export const` is of a module. The
+            // call-returned (store-factory) shape stays export-gated.
+            const directObject = objectOfFns === valueNode;
             const extractObjectMethods =
-              (isExported || this.isExportedLater(name)) && !!objectOfFns && hasInlineFns;
+              (isExported || directObject || this.isExportedLater(name)) && !!objectOfFns && hasInlineFns;
 
             // RTK Query: `createApi`/`injectEndpoints` define endpoints as
             // object-literal properties whose values are `build.query/mutation(...)`
@@ -3113,6 +3231,7 @@ export class TreeSitterExtractor {
             }
 
             if (extractObjectMethods && objectOfFns) {
+              if (directObject) this.walkObjectLiteralDataMembers(objectOfFns, varNode?.id);
               this.extractObjectLiteralFunctions(objectOfFns);
             }
             if (rtkEndpoints) {
@@ -5563,6 +5682,132 @@ export class TreeSitterExtractor {
     }
   }
 
+  /**
+   * Rust `Type::Item` value/pattern paths inside a body — an enum variant in an
+   * expression or a `match` arm (`Mode::A`, `mode::Mode::B`, `Mode::C(x) =>`),
+   * a tuple-variant constructor, a struct variant (`Mode::C { .. }` as a
+   * pattern or a literal), or an associated const (`Limits::MAX`). The
+   * type was referenced only through its items, so it had no inbound edge and
+   * looked unused to callers/impact (#2328). Emits a `references` ref to the
+   * type (the path's last segment) and one to the item (`Type::Item`), which
+   * lands on the variant's enum_member node when it is one. Both segments must
+   * be PascalCase/CONST-cased: a lowercase segment is a module (`mode::Mode`)
+   * or an associated fn (`Mode::new()`, already a call). Mirrored in the kernel
+   * (codegraph-kernel/src/rustlang.rs, extract_rust_type_path_ref).
+   */
+  private extractRustTypePathRef(node: SyntaxNode): void {
+    const ownerId = this.nodeStack[this.nodeStack.length - 1];
+    if (!ownerId) return;
+    const pathNode = getChildByField(node, 'path');
+    const nameNode = getChildByField(node, 'name');
+    if (!pathNode || !nameNode || (nameNode.type !== 'identifier' && nameNode.type !== 'type_identifier')) return;
+    const typeNode = pathNode.type === 'identifier'
+      ? pathNode
+      : pathNode.type === 'scoped_identifier' ? getChildByField(pathNode, 'name') : null;
+    if (!typeNode || typeNode.type !== 'identifier') return;
+    const typeName = getNodeText(typeNode, this.source);
+    const itemName = getNodeText(nameNode, this.source);
+    if (!RUST_TYPE_SEGMENT.test(typeName) || typeName === 'Self') return;
+    if (!RUST_TYPE_SEGMENT.test(itemName)) return;
+    this.pushStaticMemberRef(typeName, ownerId, typeNode);
+    this.pushStaticMemberRef(`${typeName}::${itemName}`, ownerId, nameNode);
+  }
+
+  /**
+   * Dart type positions outside signatures (#2327): a class field's or a
+   * top-level variable's declared type (`final Report report;`, `Report? cur;`)
+   * and the generic arguments in their initializers (`final p =
+   * Family<Report?, String>();`). The tree flattens a declaration's parts into
+   * its parent (`declaration` in a class body, `program` at top level), so the
+   * type is a direct child there. Function bodies are not reached from here —
+   * their generic arguments are taken by the body walker — so the sibling-body
+   * revisit doesn't duplicate them. Returns true when `node` was consumed.
+   * Mirrored in the kernel (dart.rs visit).
+   */
+  private extractDartDeclarationTypeRefs(node: SyntaxNode): boolean {
+    const parentType = node.parent?.type;
+    if (parentType !== 'program' && parentType !== 'declaration') return false;
+    const ownerId = this.nodeStack[this.nodeStack.length - 1];
+    if (node.type === 'type_identifier' || node.type === 'type_arguments') {
+      if (ownerId) this.extractTypeRefsFromSubtree(node, ownerId);
+      return true;
+    }
+    if (node.type === 'initialized_identifier_list' && ownerId) this.extractDartTypeArgumentRefs(node, ownerId);
+    return false;
+  }
+
+  /** References for every type named in the generic arguments (`<Report?, String>`) within `node`. */
+  private extractDartTypeArgumentRefs(node: SyntaxNode, ownerId: string): void {
+    if (node.type === 'type_arguments') {
+      this.extractTypeRefsFromSubtree(node, ownerId);
+      return;
+    }
+    for (const c of node.namedChildren) this.extractDartTypeArgumentRefs(c, ownerId);
+  }
+
+  /**
+   * A Dart getter read — `x.area`, `s?.label` — is a call of the getter, but
+   * has no argument part, so the call extractor never saw it (#2338). Emit it
+   * as a `references` ref named `receiver.member`; the resolver accepts it
+   * only through the receiver's declared type, onto a getter of that type (or
+   * of an extension on it), so a plain field read links nothing. Only a simple
+   * lowerCamel receiver, a lowerCamel member, and not the accessor of a method
+   * call (`x.grow()`, whose next selector carries the arguments). Setter
+   * writes (`x.area = 3`) parse as an assignable_expression and never reach
+   * here. Mirrored in the kernel (dart.rs extract_property_read).
+   */
+  private extractDartPropertyRead(node: SyntaxNode): void {
+    if (node.type !== 'selector') return;
+    const accessor = node.namedChild(0);
+    if (!accessor || node.namedChildCount !== 1 ||
+        (accessor.type !== 'unconditional_assignable_selector' && accessor.type !== 'conditional_assignable_selector')) return;
+    const member = accessor.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
+    if (!member || !/^[a-z_$][A-Za-z0-9_$]*$/.test(member.text)) return;
+    const prev = node.previousNamedSibling;
+    if (prev?.type !== 'identifier' || !/^[a-z_$][A-Za-z0-9_$]*$/.test(prev.text)) return;
+    const next = node.nextNamedSibling;
+    if (next?.type === 'selector' && next.namedChildren.some((c: SyntaxNode) => c.type === 'argument_part')) return;
+    const ownerId = this.nodeStack[this.nodeStack.length - 1];
+    if (!ownerId) return;
+    this.unresolvedReferences.push({
+      fromNodeId: ownerId,
+      referenceName: `${prev.text}.${member.text}`,
+      referenceKind: 'references',
+      line: member.startPosition.row + 1,
+      column: member.startPosition.column,
+    });
+  }
+
+  /**
+   * A VB.NET field / property read or write through a name — `AppSession.SessionId`,
+   * `AppSession.CurrentUser = "demo"`, `session.Name` (#2305). Calls are taken
+   * by the call extractor (a member access that is an invocation's target is
+   * skipped here); this emits the value access as a `references` ref named
+   * `receiver.member`, which the resolver accepts only when the receiver is a
+   * project type / module or a value of a declared project type that has the
+   * member — never by the member's name alone.
+   */
+  private extractVbMemberRead(node: SyntaxNode): void {
+    if (node.type !== 'member_access_expression') return;
+    const recv = getChildByField(node, 'object');
+    const member = getChildByField(node, 'member');
+    if (recv?.type !== 'identifier' || member?.type !== 'identifier') return;
+    const recvText = getNodeText(recv, this.source);
+    if (/^(?:Me|MyBase|MyClass)$/i.test(recvText)) return;
+    const parent = node.parent;
+    if (parent && this.extractor!.callTypes.includes(parent.type) && parent.namedChild(0)?.startIndex === node.startIndex &&
+        parent.namedChild(0)?.endIndex === node.endIndex) return;
+    const ownerId = this.nodeStack[this.nodeStack.length - 1];
+    if (!ownerId) return;
+    this.unresolvedReferences.push({
+      fromNodeId: ownerId,
+      referenceName: `${recvText}.${getNodeText(member, this.source)}`,
+      referenceKind: 'references',
+      line: member.startPosition.row + 1,
+      column: member.startPosition.column,
+    });
+  }
+
   private pushStaticMemberRef(name: string, ownerId: string, node: SyntaxNode): void {
     this.unresolvedReferences.push({
       fromNodeId: ownerId,
@@ -6168,8 +6413,31 @@ export class TreeSitterExtractor {
         }
       }
 
+      // Rust enum variant / associated item paths: `Mode::A`, `m::Mode::B(x)`.
+      if (
+        this.language === 'rust' &&
+        (nodeType === 'scoped_identifier' ||
+          (nodeType === 'scoped_type_identifier' &&
+            (node.parent?.type === 'struct_pattern' || node.parent?.type === 'struct_expression')))
+      ) {
+        this.extractRustTypePathRef(node);
+      }
+
       // Static-member / value-read: `Enum.value`, `Type.CONST`, `Foo::BAR`.
       this.extractStaticMemberRef(node);
+
+      // Dart: generic arguments in an expression (`Future<Report?>.value(…)`,
+      // `Family<Report, String>()`) name types the function depends on (#2327);
+      // a getter read (`x.area`) is a call of the getter (#2338).
+      if (this.language === 'dart') {
+        if (nodeType === 'type_arguments') {
+          const ownerId = this.nodeStack[this.nodeStack.length - 1];
+          if (ownerId) this.extractTypeRefsFromSubtree(node, ownerId);
+          return;
+        }
+        this.extractDartPropertyRead(node);
+      }
+      if (this.language === 'vbnet') this.extractVbMemberRead(node);
 
       // Local variable type annotations inside a body — `const items: Foo[] = []`,
       // `const x: SomeType = svc.load()`. We deliberately do NOT create nodes for
@@ -6285,6 +6553,16 @@ export class TreeSitterExtractor {
    * Extract inheritance relationships
    */
   private extractInheritance(node: SyntaxNode, classId: string): void {
+    // Dart `extension ReportX on Report<T> { … }` — the ON type is a dependency
+    // of the extension (#2327). Only a NAMED extension: an anonymous `extension
+    // on Report` is itself named after the ON type, so the ref would point at
+    // itself. Mirrored in the kernel (dart.rs extract_inheritance).
+    if (this.language === 'dart' && node.type === 'extension_declaration' &&
+        node.namedChildren.some((c: SyntaxNode) => c.type === 'identifier')) {
+      for (const c of node.namedChildren) {
+        if (c.type === 'type_identifier' || c.type === 'type_arguments') this.extractTypeRefsFromSubtree(c, classId);
+      }
+    }
     // Objective-C @interface MyClass : NSObject <ProtoA, ProtoB>
     if (node.type === 'class_interface') {
       const superclass = getChildByField(node, 'superclass');
@@ -7681,10 +7959,16 @@ export function extractFromSource(
     const extractor = new RazorExtractor(filePath, source);
     result = extractor.extract();
   } else if (detectedLanguage === 'xml') {
-    // Custom extractor for MyBatis mapper XML. Non-mapper XML returns just a
-    // file node so the watcher tracks it without emitting symbols.
-    const extractor = new MyBatisExtractor(filePath, source);
-    result = extractor.extract();
+    // Root-tag routing: a Spring `<beans>` document (bare, prefixed
+    // `<beans:beans>`, or declaring the springframework schema) goes to the
+    // Spring beans extractor; everything else (MyBatis `<mapper>`/`<sqlMap>`,
+    // or any other XML) keeps going through MyBatisExtractor, which returns a
+    // file-node-only result for non-mapper XML (pom.xml, web.xml, …).
+    if (isSpringBeansXml(source)) {
+      result = new SpringBeansExtractor(filePath, source).extract();
+    } else {
+      result = new MyBatisExtractor(filePath, source).extract();
+    }
   } else if (detectedLanguage === 'cfml' || detectedLanguage === 'cfscript') {
     // Custom extractor for CFML (.cfc/.cfm) — dialect-switches between the
     // tag-based cfml grammar and the bare-script cfscript grammar. Standalone

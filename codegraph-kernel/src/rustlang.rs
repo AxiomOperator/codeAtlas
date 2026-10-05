@@ -1202,6 +1202,17 @@ impl<'t> Walker<'t> {
             self.extract_instantiation(node);
         }
 
+        // Enum variant / associated item paths (`Mode::A`, `Mode::C { .. }`).
+        if kind == "scoped_identifier"
+            || (kind == "scoped_type_identifier"
+                && node
+                    .parent()
+                    .map(|p| matches!(p.kind(), "struct_pattern" | "struct_expression"))
+                    .unwrap_or(false))
+        {
+            self.extract_rust_type_path_ref(node);
+        }
+
         // Nested NAMED fns become their own nodes (a nested fn inside an impl
         // method walks up to the impl and indexes as a METHOD).
         if matches!(kind, "function_item" | "function_signature_item") {
@@ -1235,6 +1246,44 @@ impl<'t> Walker<'t> {
                 self.visit_for_calls_and_structure(c);
             }
         }
+    }
+
+    /// extractRustTypePathRef (#2328) — `Type::Item` in a body: a `references`
+    /// ref to the type (path's last segment) then one to `Type::Item`. Both
+    /// segments must match /^[A-Z][A-Za-z0-9_]*$/; `Self` is skipped.
+    fn extract_rust_type_path_ref(&mut self, node: Node<'t>) {
+        if self.stack.is_empty() {
+            return;
+        }
+        let (Some(path), Some(name)) = (node.child_by_field_name("path"), node.child_by_field_name("name")) else {
+            return;
+        };
+        if !matches!(name.kind(), "identifier" | "type_identifier") {
+            return;
+        }
+        let type_node = match path.kind() {
+            "identifier" => Some(path),
+            "scoped_identifier" => path.child_by_field_name("name"),
+            _ => None,
+        };
+        let Some(type_node) = type_node else { return };
+        if type_node.kind() != "identifier" {
+            return;
+        }
+        let type_name = self.text(type_node).to_string();
+        let item_name = self.text(name).to_string();
+        let seg = |s: &str| {
+            let mut cs = s.chars();
+            matches!(cs.next(), Some(c) if c.is_ascii_uppercase())
+                && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        };
+        if !seg(&type_name) || type_name == "Self" || !seg(&item_name) {
+            return;
+        }
+        let from = self.top_row();
+        let refs = edge_kind_index("references").unwrap();
+        self.push_ref_at(from, &type_name, refs, type_node);
+        self.push_ref_at(from, &format!("{}::{}", type_name, item_name), refs, name);
     }
 
     // --- fn refs (RUST_SPEC) ----------------------------------------------------

@@ -8,6 +8,7 @@ import { posix } from 'path';
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
+import { lineOfIndex } from '../synth-utils';
 
 /**
  * Laravel facade mappings to underlying classes
@@ -126,7 +127,7 @@ export const laravelResolver: FrameworkResolver = {
     let match: RegExpExecArray | null;
     while ((match = routeRegex.exec(safe)) !== null) {
       const [, method, routePath, handlerExpr] = match;
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineOfIndex(safe, match.index);
       const upper = method!.toUpperCase();
       const inFile = joinRoutePath(prefixAt(groups, match.index), routePath!);
       const routeNode: Node = {
@@ -162,7 +163,7 @@ export const laravelResolver: FrameworkResolver = {
     const resourceRegex = /Route::(resource|apiResource)\s*\(\s*['"]([^'"]+)['"]\s*(?:,\s*([^)]+))?\)/g;
     while ((match = resourceRegex.exec(safe)) !== null) {
       const [, _fn, resourceName, handlerExpr] = match;
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineOfIndex(safe, match.index);
       const inFile = joinRoutePath(prefixAt(groups, match.index), resourceName!);
       const routeNode: Node = {
         id: `route:${filePath}:${line}:RESOURCE:${resourceName}`,

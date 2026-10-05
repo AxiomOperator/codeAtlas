@@ -171,11 +171,16 @@ function resolveExtendsTarget(spec: string, fromDir: string): string | null {
  *
  * `stack` holds the configs currently being resolved, so a cycle
  * (`a extends b extends a`) stops instead of recursing forever.
+ *
+ * `configDir` is the directory of the config the chain started from: TS 5.5's
+ * `${configDir}` template in `baseUrl` / `paths` names it, whichever config in
+ * the chain spelled it.
  */
 function loadEffectiveOptions(
   filePath: string,
   stack: Set<string>,
-  depth: number
+  depth: number,
+  configDir: string = path.dirname(path.resolve(filePath))
 ): EffectiveOptions | null {
   const abs = path.resolve(filePath);
   if (stack.has(abs) || depth > MAX_EXTENDS_DEPTH) {
@@ -197,7 +202,7 @@ function loadEffectiveOptions(
       logDebug('path-aliases: unresolved extends', { from: abs, spec });
       continue;
     }
-    const inherited = loadEffectiveOptions(target, stack, depth + 1);
+    const inherited = loadEffectiveOptions(target, stack, depth + 1, configDir);
     if (!inherited) continue;
     if (inherited.baseUrl !== undefined) effective.baseUrl = inherited.baseUrl;
     if (inherited.paths !== undefined) {
@@ -210,12 +215,18 @@ function loadEffectiveOptions(
   const co = raw.compilerOptions ?? {};
   // Both are relative to the file that declared them, not to whichever
   // config started the chain.
-  if (typeof co.baseUrl === 'string') effective.baseUrl = path.resolve(dir, co.baseUrl);
+  if (typeof co.baseUrl === 'string') effective.baseUrl = path.resolve(dir, withConfigDir(co.baseUrl, configDir));
   if (co.paths && typeof co.paths === 'object') {
-    effective.paths = co.paths;
+    effective.paths = Object.fromEntries(Object.entries(co.paths).map(([pattern, targets]) =>
+      [pattern, Array.isArray(targets) ? targets.map((t) => typeof t === 'string' ? withConfigDir(t, configDir) : t) : targets]));
     effective.pathsDir = dir;
   }
   return effective;
+}
+
+/** TS 5.5: a leading `${configDir}` is the directory of the config being loaded. */
+function withConfigDir(value: string, configDir: string): string {
+  return value.startsWith('${configDir}') ? configDir + value.slice('${configDir}'.length) : value;
 }
 
 function readTsconfigLike(filePath: string): RawTsconfig | null {
@@ -338,6 +349,8 @@ export function applyAliases(
   for (const pat of aliases.patterns) {
     if (!importPath.startsWith(pat.prefix)) continue;
     if (pat.suffix && !importPath.endsWith(pat.suffix)) continue;
+    // `@/*.js` is not `@.js`: the prefix and suffix must not overlap.
+    if (importPath.length < pat.prefix.length + pat.suffix.length) continue;
 
     let captured = '';
     if (pat.hasWildcard) {

@@ -1,6 +1,6 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText } from '../tree-sitter-helpers';
-import type { LanguageExtractor } from '../tree-sitter-types';
+import type { ExtractorContext, LanguageExtractor } from '../tree-sitter-types';
 
 /**
  * The `function_signature` carrying a method's return type — unwrapped from a
@@ -116,6 +116,15 @@ function dartCalleeOfArgPart(argPart: SyntaxNode): string | undefined {
   return undefined;
 }
 
+/** References for the types named in every generic-argument list (`<Report?, String>`) within `node`. */
+function dartTypeArgumentRefs(node: SyntaxNode, fromId: string, ctx: ExtractorContext): void {
+  if (node.type === 'type_arguments') {
+    ctx.extractTypeRefs(node, fromId);
+    return;
+  }
+  for (const c of node.namedChildren) dartTypeArgumentRefs(c, fromId, ctx);
+}
+
 export const dartExtractor: LanguageExtractor = {
   functionTypes: ['function_signature'],
   classTypes: ['class_definition'],
@@ -152,9 +161,13 @@ export const dartExtractor: LanguageExtractor = {
       if (nameNode) {
         const valueNode = nameNode.nextNamedSibling;
         const initValue = valueNode ? getNodeText(valueNode, ctx.source).slice(0, 100) : undefined;
-        ctx.createNode('constant', getNodeText(nameNode, ctx.source), node, {
+        const created = ctx.createNode('constant', getNodeText(nameNode, ctx.source), node, {
           signature: initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined,
         });
+        // Generic arguments in the initializer — Riverpod's
+        // `final p = FutureProvider.family<Report?, String>(…)` — are what the
+        // constant depends on (#2327). Mirrored in the kernel (dart.rs visit).
+        if (created) dartTypeArgumentRefs(node, created.id, ctx);
       }
       return true;
     }

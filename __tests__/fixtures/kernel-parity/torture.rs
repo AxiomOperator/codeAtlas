@@ -296,3 +296,24 @@ pub union Reg {
 }
 
 impl Base for Reg {}
+
+// Enum variant / associated item paths (#2328): expression, nested module
+// path, tuple/struct patterns, struct literal, tuple-variant ctor, Self skip,
+// lowercase segments skipped.
+pub enum Glyph { Dot, Line(u8), Box { w: u8 } }
+
+pub fn variant_paths(s: Glyph) -> u8 {
+    let _a = Glyph::Dot;
+    let _b = glyphs::Glyph::Line(1);
+    let _c = Glyph::Box { w: 2 };
+    let _d = Limits::MAX + Glyph::new().w + mode::run();
+    match s {
+        Glyph::Dot => 0,
+        crate::glyphs::Glyph::Line(n) => n,
+        Glyph::Box { w } => w,
+    }
+}
+
+impl Glyph {
+    fn own(&self) -> bool { matches!(self, Self::Dot) && Self::Dot.is_dot() }
+}

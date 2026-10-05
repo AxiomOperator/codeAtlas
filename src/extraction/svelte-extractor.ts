@@ -2,7 +2,8 @@ import { Node, Edge, ExtractionResult, ExtractionError, UnresolvedReference, Lan
 import { generateNodeId } from './tree-sitter-helpers';
 import { TreeSitterExtractor } from './tree-sitter';
 import { isLanguageSupported } from './grammars';
-import { foldScriptResult, sfcFileNode } from './sfc-script';
+import { foldScriptResult } from './sfc-script';
+import { buildFileNode } from './file-node';
 
 /** Svelte 5 rune names — compiler builtins, not real functions */
 const SVELTE_RUNES = new Set([
@@ -43,7 +44,7 @@ export class SvelteExtractor {
 
     try {
       // The file, holding the component the .svelte file is
-      this.nodes.push(sfcFileNode(this.filePath, this.source, 'svelte'));
+      this.nodes.push(buildFileNode(this.filePath, this.source, 'svelte'));
       const componentNode = this.createComponentNode();
       this.edges.push({ source: `file:${this.filePath}`, target: componentNode.id, kind: 'contains' });
 

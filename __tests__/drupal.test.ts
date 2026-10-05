@@ -12,6 +12,7 @@ import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { CodeGraph } from '../src';
 import { initGrammars, loadAllGrammars } from '../src/extraction/grammars';
 import { drupalResolver } from '../src/resolution/frameworks/drupal';
+import { generateNodeId } from '../src/extraction/tree-sitter-helpers';
 import type { ResolutionContext } from '../src/resolution/types';
 
 // ---------------------------------------------------------------------------
@@ -605,5 +606,291 @@ describe('Drupal end-to-end — route node linked to controller method', () => {
     expect(edges.length).toBeGreaterThan(0);
 
     cg.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #300 — OOP hooks, plugin declarations, services
+// ---------------------------------------------------------------------------
+
+const HOOKS_FILE = 'web/modules/custom/m/src/Hook/FormHooks.php';
+
+describe('drupalResolver.extract — OOP #[Hook] attributes (#300)', () => {
+  const hookRefs = (file: string, src: string) =>
+    drupalResolver
+      .extract!(file, src)
+      .references.filter((r) => r.referenceName.startsWith('hook_'))
+      .map((r) => [r.referenceName, r.fromNodeId]);
+
+  it('links a method-level #[Hook] from the method node (id hashed from the attribute line)', () => {
+    const src = `<?php
+namespace Drupal\\m\\Hook;
+
+use Drupal\\Core\\Hook\\Attribute\\Hook;
+
+class EntityHooks {
+  /**
+   * Docblocks sit outside the node; the attribute starts it.
+   */
+  #[Hook('entity_presave')]
+  public function entityPresave($entity): void {}
+}
+`;
+    expect(hookRefs(HOOKS_FILE, src)).toEqual([
+      ['hook_entity_presave', generateNodeId(HOOKS_FILE, 'method', 'entityPresave', 10)],
+    ]);
+  });
+
+  it('emits every hook of stacked, grouped, and named-argument attributes', () => {
+    const src = `<?php
+class CommentHooks {
+  #[Hook('comment_insert')]
+  #[Hook('comment_update')]
+  public function commentSave($c): void {}
+
+  #[Hook('node_insert'), \\Drupal\\Core\\Hook\\Attribute\\Hook(hook: 'node_update', order: Order::First)]
+  public static function nodeSave($n): void {}
+}
+`;
+    expect(hookRefs(HOOKS_FILE, src)).toEqual([
+      ['hook_comment_insert', generateNodeId(HOOKS_FILE, 'method', 'commentSave', 3)],
+      ['hook_comment_update', generateNodeId(HOOKS_FILE, 'method', 'commentSave', 3)],
+      ['hook_node_insert', generateNodeId(HOOKS_FILE, 'method', 'nodeSave', 7)],
+      ['hook_node_update', generateNodeId(HOOKS_FILE, 'method', 'nodeSave', 7)],
+    ]);
+  });
+
+  it('links a class-level #[Hook] to its method: target, or to __invoke', () => {
+    const src = `<?php
+#[Hook('form_alter', method: 'formAlter')]
+#[Hook('cron')]
+final class MixedHooks {
+  public function helper() {}
+
+  public function formAlter(array &$form): void {}
+
+  public function __invoke(): void {}
+}
+`;
+    expect(hookRefs(HOOKS_FILE, src)).toEqual([
+      ['hook_form_alter', generateNodeId(HOOKS_FILE, 'method', 'formAlter', 7)],
+      ['hook_cron', generateNodeId(HOOKS_FILE, 'method', '__invoke', 9)],
+    ]);
+  });
+
+  it('ignores #[Hook] text inside strings and comments, and non-Hook attributes', () => {
+    const src = `<?php
+class NotHooks {
+  // #[Hook('commented')]
+  public function a() { return "#[Hook('in_string')]"; }
+
+  #[Deprecated]
+  public function b() {}
+}
+`;
+    expect(hookRefs(HOOKS_FILE, src)).toEqual([]);
+  });
+
+  it('a class-level #[Hook] whose method is missing emits nothing', () => {
+    const src = `<?php
+#[Hook('cron', method: 'missing')]
+class Broken {
+  public function other() {}
+}
+`;
+    expect(hookRefs(HOOKS_FILE, src)).toEqual([]);
+  });
+});
+
+describe('drupalResolver.extract — plugin declarations (#300)', () => {
+  const FILE = 'web/modules/custom/m/src/Plugin/Block/MyBlock.php';
+  const decorates = (src: string) =>
+    drupalResolver
+      .extract!(FILE, src)
+      .references.filter((r) => r.referenceKind === 'decorates')
+      .map((r) => [r.referenceName, r.fromNodeId]);
+
+  it('a multi-line PHP 8 plugin attribute decorates the class', () => {
+    const src = `<?php
+namespace Drupal\\m\\Plugin\\Block;
+
+use Drupal\\Core\\Block\\Attribute\\Block;
+
+#[Block(
+  id: 'my_block',
+  admin_label: new TranslatableMarkup('My block'),
+)]
+class MyBlock extends BlockBase {}
+`;
+    expect(decorates(src)).toEqual([['Block', generateNodeId(FILE, 'class', 'MyBlock', 6)]]);
+  });
+
+  it('a docblock annotation decorates the class (node starts at the class line)', () => {
+    const src = `<?php
+use Drupal\\Core\\Block\\Annotation\\Block;
+
+/**
+ * @Block(
+ *   id = "old_block",
+ *   admin_label = @Translation("Old block")
+ * )
+ */
+final class OldBlock extends BlockBase {}
+`;
+    expect(decorates(src)).toEqual([['Block', generateNodeId(FILE, 'class', 'OldBlock', 10)]]);
+  });
+
+  it('recognises a contrib plugin type by its id argument, in either style', () => {
+    const attr = `<?php
+#[CommerceCheckoutPane(id: 'review', label: 'Review')]
+class Review {}
+`;
+    expect(decorates(attr)).toEqual([['CommerceCheckoutPane', generateNodeId(FILE, 'class', 'Review', 2)]]);
+    const anno = `<?php
+/**
+ * @CommerceCheckoutPane(
+ *   id = "review",
+ * )
+ */
+class Review {}
+`;
+    expect(decorates(anno)).toEqual([['CommerceCheckoutPane', generateNodeId(FILE, 'class', 'Review', 7)]]);
+  });
+
+  it('does not treat other attributes or docblock tags as plugins', () => {
+    const src = `<?php
+/**
+ * Something.
+ *
+ * @see Foo()
+ * @Translation("x")
+ */
+#[AsEventListener(event: 'kernel.request')]
+#[Hook('cron')]
+class NotAPlugin {
+  public function __invoke() {}
+}
+`;
+    expect(decorates(src)).toEqual([]);
+  });
+});
+
+describe('drupalResolver.extract — services.yml (#300)', () => {
+  const FILE = 'web/modules/custom/m/m.services.yml';
+
+  it('emits a node per service with a class and an instantiates ref to it, tags in the signature', () => {
+    const src = `services:
+  m.subscriber:
+    class: Drupal\\m\\EventSubscriber\\MySubscriber
+    arguments: ['@entity_type.manager']
+    tags:
+      - { name: event_subscriber }
+  m.helper:
+    class: '\\Drupal\\m\\Helper'
+  m.alias: '@m.helper'
+  _defaults:
+    autowire: true
+  Drupal\\m\\Autowired: ~
+  m.inline: { class: Drupal\\m\\Inline, tags: [{ name: event_subscriber }] }
+`;
+    const { nodes, references } = drupalResolver.extract!(FILE, src);
+    expect(nodes.map((n) => [n.kind, n.name, n.startLine, n.signature])).toEqual([
+      ['variable', 'm.subscriber', 2, 'class: Drupal\\m\\EventSubscriber\\MySubscriber tags: event_subscriber'],
+      ['variable', 'm.helper', 7, 'class: Drupal\\m\\Helper'],
+      ['variable', 'm.inline', 13, 'class: Drupal\\m\\Inline tags: event_subscriber'],
+    ]);
+    expect(references.map((r) => [r.fromNodeId, r.referenceKind, r.referenceName])).toEqual([
+      [nodes[0]!.id, 'instantiates', 'Drupal\\m\\EventSubscriber\\MySubscriber'],
+      [nodes[1]!.id, 'instantiates', 'Drupal\\m\\Helper'],
+      [nodes[2]!.id, 'instantiates', 'Drupal\\m\\Inline'],
+    ]);
+  });
+
+  it('reads the indentation from the file (4-space services)', () => {
+    const src = `parameters:
+    foo: bar
+services:
+    m.four:
+        class: Drupal\\m\\Four
+        tags:
+            -
+                name: event_subscriber
+`;
+    const { nodes } = drupalResolver.extract!(FILE, src);
+    expect(nodes.map((n) => [n.name, n.signature])).toEqual([['m.four', 'class: Drupal\\m\\Four tags: event_subscriber']]);
+  });
+});
+
+describe('drupalResolver.resolve — hook refs (#300)', () => {
+  const fn = (id: string, name: string, filePath: string) => ({
+    id, kind: 'function' as const, name, qualifiedName: name, filePath, language: 'php' as const,
+    startLine: 1, endLine: 1, startColumn: 0, endColumn: 0, updatedAt: 0,
+  });
+  const ref = {
+    fromNodeId: 'method:impl', referenceName: 'hook_cron', referenceKind: 'references' as const,
+    line: 1, column: 0, filePath: 'm/src/Hook/CronHooks.php', language: 'php' as const,
+  };
+
+  it('resolves to the hook definition in *.api.php', () => {
+    const ctx = makeContext({
+      getNodesByName: (n) => (n === 'hook_cron' ? [fn('f:def', 'hook_cron', 'core/core.api.php')] : []),
+    });
+    expect(drupalResolver.resolve(ref, ctx)?.targetNodeId).toBe('f:def');
+  });
+
+  it('stays unresolved without a definition — never binds to another implementation', () => {
+    const ctx = makeContext({
+      getNodesByKind: (k) => (k === 'function' ? [fn('f:other', 'other_cron', 'other/other.module')] : []),
+    });
+    expect(drupalResolver.resolve(ref, ctx)).toBeNull();
+  });
+});
+
+describe('Drupal end-to-end — OOP hooks, plugins and services (#300)', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('wires hooks to core definitions, plugins to their attribute class, services to their class', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-drupal-oop-'));
+    const files: Record<string, string> = {
+      'composer.json': JSON.stringify({ require: { 'drupal/core': '^11' } }),
+      'core/core.api.php': '<?php\nfunction hook_cron() {}\nfunction hook_form_alter() {}\n',
+      'core/lib/Drupal/Core/Block/Attribute/Block.php': '<?php\nnamespace Drupal\\Core\\Block\\Attribute;\nclass Block {}\n',
+      'core/lib/Drupal/Core/Block/Annotation/Block.php': '<?php\nnamespace Drupal\\Core\\Block\\Annotation;\nclass Block {}\n',
+      'm/m.services.yml':
+        'services:\n  m.subscriber:\n    class: Drupal\\m\\EventSubscriber\\MySubscriber\n    tags:\n      - { name: event_subscriber }\n',
+      'm/src/EventSubscriber/MySubscriber.php':
+        '<?php\nnamespace Drupal\\m\\EventSubscriber;\nclass MySubscriber {\n  public static function getSubscribedEvents() { return []; }\n}\n',
+      'm/src/Hook/MHooks.php':
+        "<?php\nnamespace Drupal\\m\\Hook;\nuse Drupal\\Core\\Hook\\Attribute\\Hook;\n\n#[Hook('form_alter', method: 'formAlter')]\nclass MHooks {\n  public function formAlter(array &$form): void {}\n\n  #[Hook('cron')]\n  public function cron(): void {}\n}\n",
+      'm/src/Plugin/Block/NewBlock.php':
+        "<?php\nnamespace Drupal\\m\\Plugin\\Block;\nuse Drupal\\Core\\Block\\Attribute\\Block;\n\n#[Block(\n  id: 'new_block',\n)]\nclass NewBlock {}\n",
+      'm/src/Plugin/Block/OldBlock.php':
+        '<?php\nnamespace Drupal\\m\\Plugin\\Block;\nuse Drupal\\Core\\Block\\Annotation\\Block;\n\n/**\n * @Block(\n *   id = "old_block",\n * )\n */\nclass OldBlock {}\n',
+    };
+    for (const [rel, content] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(tmpDir, rel)), { recursive: true });
+      fs.writeFileSync(path.join(tmpDir, rel), content);
+    }
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+    try {
+      const byName = (kind: string, name: string, file?: string) =>
+        cg.getNodesByKind(kind as never).find((n) => n.name === name && (!file || n.filePath.includes(file)))!;
+      const targetsOf = (id: string, kind: string) =>
+        cg.getOutgoingEdges(id).filter((e) => e.kind === kind).map((e) => e.target);
+
+      expect(targetsOf(byName('method', 'formAlter').id, 'references')).toEqual([byName('function', 'hook_form_alter').id]);
+      expect(targetsOf(byName('method', 'cron').id, 'references')).toEqual([byName('function', 'hook_cron').id]);
+      expect(targetsOf(byName('class', 'NewBlock').id, 'decorates')).toEqual([byName('class', 'Block', 'Attribute').id]);
+      expect(targetsOf(byName('class', 'OldBlock').id, 'decorates')).toEqual([byName('class', 'Block', 'Annotation').id]);
+      expect(targetsOf(byName('variable', 'm.subscriber').id, 'instantiates')).toEqual([byName('class', 'MySubscriber').id]);
+    } finally {
+      cg.close();
+    }
   });
 });

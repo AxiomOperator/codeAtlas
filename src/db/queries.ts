@@ -5,6 +5,7 @@
  */
 
 import { SqliteDatabase, SqliteStatement } from './sqlite-adapter';
+import { synthesisSiteExpr, synthesizedEdgeExpr } from './schema-ddl';
 import {
   Node,
   Edge,
@@ -1490,7 +1491,7 @@ export class QueryBuilder {
   getNodesByLowerName(name: string): Node[] {
     if (!this.stmts.getNodesByLowerName) {
       this.stmts.getNodesByLowerName = this.db.prepare(
-        'SELECT * FROM nodes WHERE lower(name) = lower(?)'
+        'SELECT * FROM nodes WHERE lower(name) = lower(?) ORDER BY file_path, start_line, id'
       );
     }
     const rows = this.stmts.getNodesByLowerName.all(name) as NodeRow[];
@@ -1577,7 +1578,7 @@ export class QueryBuilder {
       const maxFtsScore = Math.max(...results.map(r => r.score));
       const terms = query.split(/\s+/).filter(t => t.length >= 2);
       for (const term of terms) {
-        let sql = 'SELECT * FROM nodes WHERE lower(name) = lower(?)';
+        let sql = 'SELECT * FROM nodes WHERE lower(name) = lower(?) ORDER BY file_path, start_line, id';
         const params: (string | number)[] = [term];
         if (kinds && kinds.length > 0) {
           sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
@@ -2063,15 +2064,17 @@ export class QueryBuilder {
 
   /** Must run before file replacement/deletion cascades the endpoint edges. */
   hasSynthesizedEdgesTouchingFile(filePath: string): boolean {
-    const owned = "CASE WHEN json_valid(e.metadata) THEN json_extract(e.metadata, '$.synthesizedBy') END IS NOT NULL";
+    // Built from schema-ddl.ts so the planner matches idx_edges_synthesis_site.
+    const owned = synthesizedEdgeExpr('e');
+    const site = synthesisSiteExpr('e');
     for (const endpoint of ['source', 'target']) {
       if (this.db.prepare(`SELECT 1 FROM nodes n JOIN edges e ON e.${endpoint} = n.id
         WHERE n.file_path = ? AND ${owned} LIMIT 1`).get(filePath)) return true;
     }
     // Wiring often lives in a third file, with neither endpoint in it.
     return !!this.db.prepare(`SELECT 1 FROM edges e WHERE ${owned}
-      AND CASE WHEN json_valid(e.metadata) THEN json_extract(e.metadata, '$.registeredAt') END >= ?
-      AND CASE WHEN json_valid(e.metadata) THEN json_extract(e.metadata, '$.registeredAt') END < ? LIMIT 1`
+      AND ${site} >= ?
+      AND ${site} < ? LIMIT 1`
     ).get(`${filePath}:`, `${filePath};`);
   }
 

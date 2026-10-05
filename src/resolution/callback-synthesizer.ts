@@ -27,6 +27,8 @@ import type { ResolutionContext } from './types';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { stripCommentsForRegex } from './strip-comments';
 import { cFnPointerDispatchEdges } from './c-fnptr-synthesizer';
+import { cppOperatorEdges } from './cpp-operator-synthesizer';
+import { luaLoaderImportEdges } from './lua-loader-synthesizer';
 import { goframeRouteEdges } from './goframe-synthesizer';
 import { expoRouterReturnEdges } from './expo-router-synthesizer';
 import { nextLinkEdges } from './next-router-synthesizer';
@@ -37,7 +39,7 @@ import { angularTemplateEdges } from './angular-template-synthesizer';
 import { svelteKitLinkEdges, svelteKitPageComponentEdges } from './sveltekit-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequestEdges } from './tier-synthesizer';
-import { enclosingFn, makeLineAt } from './synth-utils';
+import { enclosingFn, makeLineAt, lineOfIndex } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
 import { crossesCodeBoundary } from './name-matcher';
 
@@ -165,19 +167,25 @@ async function fieldChannelEdges(queries: QueryBuilder, ctx: ResolutionContext, 
 
   const edges: Edge[] = [];
   const seen = new Set<string>();
+  let callerLines = null as { file: string; lines: string[] | undefined } | null;
   for (const reg of registrars) {
     const chDispatchers = dispatchers.filter(
       (d) => d.node.filePath === reg.node.filePath && d.field === reg.field
     );
     if (chDispatchers.length === 0) continue;
-    const argRe = new RegExp(`${reg.node.name}\\s*\\(\\s*(this\\.\\w+|\\w+)\\s*(?=[,)])`);
+    // Escaped: a name is literal text — a `$` in it (`$on`) is not an anchor.
+    const argRe = new RegExp(`${reg.node.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\(\\s*(this\\.\\w+|\\w+)\\s*(?=[,)])`);
     let added = 0;
     for (const e of queries.getIncomingEdges(reg.node.id, ['calls'])) {
       if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
       if (!e.line) continue;
       const caller = queries.getNodeById(e.source);
       if (!caller) continue;
-      const line = ctx.readFile(caller.filePath)?.split('\n')[e.line - 1];
+      // Split each caller file once, not once per incoming edge.
+      if (callerLines?.file !== caller.filePath) {
+        callerLines = { file: caller.filePath, lines: ctx.readFile(caller.filePath)?.split('\n') };
+      }
+      const line = callerLines.lines?.[e.line - 1];
       const am = line?.match(argRe);
       if (!am) continue;
       // Reuse the resolved value at this registration site: it retains the
@@ -593,7 +601,7 @@ async function arkuiEmitterEdges(ctx: ResolutionContext, onYield: MaybeYield): P
     while ((m = ARKUI_EMITTER_CALL_RE.exec(safe))) {
       const verb = m[1]!;
       const arg = m[2]!.trim();
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineOfIndex(safe, m.index);
       const encl = nodes
         .filter((n) => n.startLine <= line && n.endLine >= line)
         .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
@@ -697,7 +705,7 @@ async function arkuiRouterEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
     let m: RegExpExecArray | null;
     while ((m = ARKUI_ROUTER_RE.exec(safe))) {
       const url = m[1]!;
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineOfIndex(safe, m.index);
       const encl = nodes
         .filter((n) => n.startLine <= line && n.endLine >= line)
         .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
@@ -1326,12 +1334,14 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
     for (const parent of parents) {
       const src = sliceLines(content, parent.startLine, parent.endLine);
       if (!src || (!src.includes('</') && !src.includes('/>'))) continue;
-      const names = new Set<string>();
+      // Each child's first tag, for the edge's registeredAt line.
+      const names = new Map<string, number>();
       JSX_TAG_RE.lastIndex = 0;
       let m: RegExpExecArray | null;
-      while ((m = JSX_TAG_RE.exec(src))) names.add(m[1]!);
+      while ((m = JSX_TAG_RE.exec(src))) if (!names.has(m[1]!)) names.set(m[1]!, m.index);
+      const tagLine = makeLineAt(src, parent.startLine);
       let added = 0;
-      for (const name of names) {
+      for (const [name, at] of names) {
         if (added >= MAX_JSX_CHILDREN) break;
         const child = jsxChild(ctx, name, file, importsOf);
         if (!child || child.id === parent.id || crossesCodeBoundary(parent.language, child.language)) continue;
@@ -1341,7 +1351,7 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
         edges.push({
           source: parent.id, target: child.id, kind: 'calls', line: parent.startLine,
           provenance: 'heuristic',
-          metadata: { synthesizedBy: 'jsx-render', via: name },
+          metadata: { synthesizedBy: 'jsx-render', via: name, registeredAt: `${file}:${tagLine(at)}` },
         });
         added++;
       }
@@ -1387,15 +1397,22 @@ async function vueTemplateEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
     if ((++scannedFiles & 15) === 0) await onYield();
     if (!file.endsWith('.vue')) continue;
     const content = ctx.readFile(file);
-    const tpl = content && content.match(/<template[^>]*>([\s\S]*)<\/template>/i)?.[1];
-    if (!tpl) continue;
+    const tplMatch = content?.match(/<template[^>]*>([\s\S]*)<\/template>/i);
+    const tpl = tplMatch?.[1];
+    if (!content || !tpl) continue;
+    // A template offset's line in the file, for the edge's registeredAt.
+    const tplStart = tplMatch!.index! + tplMatch![0].length - '</template>'.length - tpl.length;
+    const lineOf = makeLineAt(content, 1);
+    const tagSite = (at: number) => `${file}:${lineOf(tplStart + at)}`;
     const comp = ctx.getNodesInFile(file).find((n) => n.kind === 'component');
     if (!comp) continue;
 
     // Composable-destructure map: alias → { composable, key }. Lets us resolve a
     // template handler that isn't a local function but a destructured composable
     // return (`@click="closeSidebar"` ← `const { close: closeSidebar } = useSidebarControl()`).
-    const script = content.match(/<script[^>]*>([\s\S]*?)<\/script>/i)?.[1] ?? '';
+    // EVERY script block: an SFC with `<script>` + `<script setup>` keeps its
+    // composable destructures in the second one.
+    const script = Array.from(content.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi), (s) => s[1] ?? '').join('\n');
     const destructured = new Map<string, { composable: string; key: string }>();
     VUE_DESTRUCTURE_RE.lastIndex = 0;
     let dm: RegExpExecArray | null;
@@ -1428,7 +1445,7 @@ async function vueTemplateEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
     VUE_KEBAB_RE.lastIndex = 0;
     while ((m = VUE_KEBAB_RE.exec(tpl))) {
       const tag = kebabToPascal(m[1]!);
-      addEdge(resolve(tag, COMPONENT_KINDS) ?? nuxtComponents.get(tag), { synthesizedBy: 'jsx-render', via: m[1] });
+      addEdge(resolve(tag, COMPONENT_KINDS) ?? nuxtComponents.get(tag), { synthesizedBy: 'jsx-render', via: m[1], registeredAt: tagSite(m.index) });
     }
     // PascalCase component tags. Try a direct name match first (flat components
     // and explicit registrations), then the Nuxt dir-prefixed auto-import name
@@ -1436,7 +1453,7 @@ async function vueTemplateEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
     VUE_PASCAL_RE.lastIndex = 0;
     while ((m = VUE_PASCAL_RE.exec(tpl))) {
       const tag = m[1]!;
-      addEdge(resolve(tag, COMPONENT_KINDS) ?? nuxtComponents.get(tag), { synthesizedBy: 'jsx-render', via: tag });
+      addEdge(resolve(tag, COMPONENT_KINDS) ?? nuxtComponents.get(tag), { synthesizedBy: 'jsx-render', via: tag, registeredAt: tagSite(m.index) });
     }
     VUE_HANDLER_RE.lastIndex = 0;
     while ((m = VUE_HANDLER_RE.exec(tpl))) {
@@ -2167,7 +2184,7 @@ async function ginMiddlewareChainEdges(queries: QueryBuilder, ctx: ResolutionCon
       const parenIdx = m.index + m[0].length - 1;
       const argStr = goBalancedArgs(safe, parenIdx);
       if (!argStr) continue;
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineOfIndex(safe, m.index);
       for (const arg of goSplitArgs(argStr)) {
         const name = goHandlerIdent(arg);
         if (name && !registered.has(name)) registered.set(name, `${file}:${line}`);
@@ -2344,7 +2361,7 @@ async function reduxThunkEdges(queries: QueryBuilder, ctx: ResolutionContext, on
       const key = `${node.id}>${target.id}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      const line = node.startLine + safe.slice(0, m.index).split('\n').length - 1;
+      const line = node.startLine + lineOfIndex(safe, m.index) - 1;
       edges.push({
         source: node.id,
         target: target.id,
@@ -2662,7 +2679,7 @@ async function piniaStoreEdges(ctx: ResolutionContext, onYield: MaybeYield): Pro
       const storeFile = varStore.get(cm[1]!);
       if (!storeFile) continue;
       const method = cm[2]!;
-      const line = safe.slice(0, cm.index).split('\n').length;
+      const line = lineOfIndex(safe, cm.index);
       const disp = enclosingFn(nodesInFile, line) ?? fallbackDispatcher;
       if (!disp) continue;
       const target = ctx
@@ -2754,7 +2771,7 @@ async function vuexDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield): P
     let added = 0;
     while ((m = VUEX_DISPATCH_RE.exec(safe)) && added < VUEX_FANOUT_CAP) {
       const key = m[1]!;
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineOfIndex(safe, m.index);
       const disp = enclosingFn(nodesInFile, line) ?? fallback;
       if (!disp) continue;
       const target = resolve(key, file);
@@ -2850,7 +2867,7 @@ async function celeryDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield):
     let added = 0;
     while ((m = CELERY_DISPATCH_RE.exec(safe)) && added < CELERY_FANOUT_CAP) {
       const name = m[1]!;
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineOfIndex(safe, m.index);
       const disp = enclosingFn(nodesInFile, line);
       if (!disp) continue; // module-level dispatch — no source symbol to attribute
       const target = resolve(name, file);
@@ -2972,7 +2989,7 @@ async function springEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
     while ((m = SPRING_PUBLISH_RE.exec(safe)) && added < SPRING_FANOUT_CAP) {
       const targets = listeners.get(m[1]!);
       if (!targets || !targets.length) continue;
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineOfIndex(safe, m.index);
       const disp = enclosingFn(nodesInFile, line);
       if (!disp) continue;
       for (const target of targets) {
@@ -3085,7 +3102,7 @@ async function mediatrDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield)
     let added = 0;
     while ((m = MEDIATR_DISPATCH_RE.exec(safe)) && added < MEDIATR_FANOUT_CAP) {
       if (!MEDIATR_RECEIVER_RE.test(m[1]!)) continue; // not a mediator (MessagingCenter, HttpClient, …)
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineOfIndex(safe, m.index);
       const disp = enclosingFn(nodesInFile, line);
       if (!disp) continue;
       const type = resolveMediatrArgType(m[2]!, safeLines, disp.startLine, line);
@@ -3181,7 +3198,7 @@ async function sidekiqDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield)
     let m: RegExpExecArray | null;
     let added = 0;
     while ((m = SIDEKIQ_DISPATCH_RE.exec(safe)) && added < SIDEKIQ_FANOUT_CAP) {
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineOfIndex(safe, m.index);
       const disp = enclosingFn(nodesInFile, line);
       if (!disp) continue;
       const target = resolve(m[1]!);
@@ -3560,7 +3577,7 @@ async function erlangBehaviourDispatchEdges(queries: QueryBuilder, ctx: Resoluti
       const behaviour = behaviours[0]!;
       const targets = targetsOf(behaviour, fn, arity);
       if (targets.length === 0 || targets.length > ERLANG_BEHAVIOUR_FANOUT_CAP) continue;
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineOfIndex(safe, m.index);
       const disp = enclosingFn(nodesInFile, line);
       if (!disp) continue;
       for (const target of targets) {
@@ -3707,7 +3724,7 @@ async function laravelEventEdges(ctx: ResolutionContext, onYield: MaybeYield): P
     while ((m = LARAVEL_DISPATCH_RE.exec(safe)) && added < LARAVEL_FANOUT_CAP) {
       const targets = listeners.get(phpSimpleName(m[1]!));
       if (!targets) continue;
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineOfIndex(safe, m.index);
       const disp = enclosingFn(nodesInFile, line);
       if (!disp) continue;
       for (const target of targets.values()) {
@@ -3783,6 +3800,8 @@ export function hasSynthesisPattern(filePath: string, content: string): boolean 
     /\b(?:struct|union|typedef|virtual|override)\b|#\s*(?:include|define|if)|=|->|\[/.test(content)) return true;
   if (/\b(?:class|interface|protocol|trait|impl|extends|implements|expect|actual)\b/.test(content)) return true;
   if (/\.go$/.test(filePath) && /\b(?:struct|interface)\b|\bfunc\s*\(/.test(content)) return true;
+  // A Lua call with a string literal may be a project's own module loader (#1617).
+  if (/\.(?:lua|luau)$/i.test(filePath) && /[A-Za-z_]\w*\s*\(?\s*["']/.test(content)) return true;
   if (hasCrossTierPattern(content) || hasTestRequestPattern(filePath, content)) return true;
   if (/\b(?:render|build|setState|defineStore|createStore|createApi|Store|href|sendEvent|sendEventWithName)\b|<\/|\/>/.test(content)) return true;
   if (/\.(?:forEach|append|add|push|insert|fire|dispatchEvent|addListener|Use|GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD|Any|Handle)\s*\(/.test(content)) return true;
@@ -3834,6 +3853,10 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'arkuiEmitter', gate: (has) => has('arkts'), run: (_q, c, y) => arkuiEmitterEdges(c, y) },
   { name: 'arkuiRoutes', gate: (has) => has('arkts'), run: (_q, c, y) => arkuiRouterEdges(c, y) },
   { name: 'cppEdges', gate: (has) => has('cpp'), run: (q, _c, y) => cppOverrideEdges(q, y) },
+  // `a + b` / `a[i]` onto the left operand's class's `operator+` / `operator[]` (#1258).
+  { name: 'cppOperatorEdges', gate: (has) => has('cpp'), run: (_q, c, y) => cppOperatorEdges(c, y) },
+  // A project's own Lua module loaders (`Require("x.lua")`), named in codegraph.json (#1617).
+  { name: 'luaLoaderEdges', gate: (has) => has('lua', 'luau'), run: (_q, c, y) => luaLoaderImportEdges(c, y) },
   {
     name: 'ifaceEdges',
     gate: (has) => has('java', 'kotlin', 'csharp', 'swift', 'scala', 'go', 'rust', 'arkts', ...JS_FAMILY),
@@ -4121,7 +4144,8 @@ export async function synthesizeCallbackEdges(
   const merged: Edge[] = [];
   const seen = new Set<string>();
   for (const e of passEdges.flat()) {
-    const key = `${e.source}>${e.target}`;
+    // First-seen wins a duplicate edge; the same pair under another kind is another edge.
+    const key = `${e.source}>${e.target}>${e.kind}`;
     if (seen.has(key)) continue;
     seen.add(key);
     merged.push(e);

@@ -23,25 +23,6 @@
  */
 
 import type { Edge, ExtractionError, ExtractionResult, Language, Node, UnresolvedReference } from '../types';
-import * as path from 'path';
-
-/** The SFC's own file node — the whole file, as the tree-sitter extractor makes one. */
-export function sfcFileNode(filePath: string, source: string, language: Language): Node {
-  return {
-    id: `file:${filePath}`,
-    kind: 'file',
-    name: path.basename(filePath),
-    qualifiedName: filePath,
-    filePath,
-    language,
-    startLine: 1,
-    endLine: source.split('\n').length,
-    startColumn: 0,
-    endColumn: 0,
-    isExported: false,
-    updatedAt: Date.now(),
-  };
-}
 
 export interface ScriptFold {
   filePath: string;

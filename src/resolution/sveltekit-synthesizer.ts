@@ -38,83 +38,50 @@
 import type { Edge, Node } from '../types';
 import type { ResolutionContext } from './types';
 import type { MaybeYield } from './cooperative-yield';
-import { isTestPath } from '../search/query-utils';
 import { HOLE, readStringAt, routesForFile, toHref } from './frameworks/expo-router';
 import { destinationsForHref } from './frameworks/nextjs';
 import { svelteKitTable } from './frameworks/sveltekit-router';
-import { enclosingFn, makeLineAt } from './synth-utils';
+import { linkEdgesPass, linkTagPattern } from './link-edges';
 
 const MARKUP_FILE = /\.svelte$/;
 
 /** `<a … href=…`, the attribute anywhere in the tag, quoted or bound. */
-const LINK_TAG = /<a\b([^>]*?)\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|\{\s*)/g;
-
-/** Links a single component may carry before it is a navigation menu, not a decision. */
-const MAX_LINKS_PER_COMPONENT = 24;
+const LINK_TAG = linkTagPattern(['a'], `\\bhref\\s*=\\s*(?:"([^"]*)"|'([^']*)'|\\{\\s*)`);
 
 export async function svelteKitLinkEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   const table = svelteKitTable(ctx);
   if (table.byRoot.size === 0) return [];
-  const edges: Edge[] = [];
-  const seen = new Set<string>();
-  const perComponent = new Map<string, number>();
-  let scanned = 0;
-  for (const file of ctx.getAllFiles()) {
-    if (!MARKUP_FILE.test(file) || isTestPath(file)) continue;
-    const routes = routesForFile(table, file);
-    if (!routes || routes.exact.size === 0) continue;
-    if ((++scanned & 63) === 0) await onYield();
-    const source = ctx.readFile(file);
-    if (!source || !source.includes('href')) continue;
-    const nodes = ctx.getNodesInFile(file);
-    const lineOf = makeLineAt(source, 1);
-    LINK_TAG.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = LINK_TAG.exec(source)) !== null) {
-      let literal: string | null = m[2] ?? m[3] ?? null;
+  return linkEdgesPass(ctx, onYield, {
+    synthesizedBy: 'sveltekit-link',
+    fileFilter: MARKUP_FILE,
+    routesFor: (file) => {
+      const routes = routesForFile(table, file);
+      return routes && routes.exact.size > 0 ? routes : null;
+    },
+    pattern: (_file, source) => (source.includes('href') ? LINK_TAG : null),
+    stripComments: false,
+    site: (m, source, _file, routes) => {
+      let literal: string | null = m[3] ?? m[4] ?? null;
       if (literal === null) {
         // `href={…}`: a string or a template with holes.
         const at = m.index + m[0].length;
         const ch = source[at];
         if (ch === '"' || ch === "'" || ch === '`') literal = readStringAt(source, at);
       }
-      if (literal === null) continue;
+      if (literal === null) return null;
       // An external href is a link out of the site, not a transition. A
       // Svelte `{expr}` inside a quoted attribute is an interpolation, so it
       // becomes the same hole a template literal's `${…}` does — which is how
       // `/profile/@{user.username}` reaches the `/profile/@:user` page.
-      if (!literal.startsWith('/')) continue;
+      if (!literal.startsWith('/')) return null;
       const href = toHref(literal.replace(/\{[^}]*\}/g, HOLE));
-      if (!href) continue;
-      const line = lineOf(m.index);
-      const component = enclosingFn(nodes, line);
-      if (!component) continue;
-      // A destination written as a choice names one route per arm, and the
-      // user reaches every one of them — each is drawn.
-      for (const { node: page, href: arm } of destinationsForHref(href, routes)) {
-        const key = `${component.id}>${page.id}`;
-        if (seen.has(key)) continue;
-        const count = (perComponent.get(component.id) ?? 0) + 1;
-        perComponent.set(component.id, count);
-        if (count > MAX_LINKS_PER_COMPONENT) continue;
-        seen.add(key);
-        edges.push({
-          source: component.id,
-          target: page.id,
-          kind: 'navigates',
-          line,
-          provenance: 'heuristic',
-          metadata: {
-            synthesizedBy: 'sveltekit-link',
-            href: arm.display,
-            navMethod: 'a',
-            registeredAt: `${file}:${line}`,
-          },
-        });
-      }
-    }
-  }
-  return edges;
+      if (!href) return null;
+      return {
+        destinations: destinationsForHref(href, routes).map((d) => ({ node: d.node, display: d.href.display })),
+        metadata: { navMethod: 'a' },
+      };
+    },
+  });
 }
 
 

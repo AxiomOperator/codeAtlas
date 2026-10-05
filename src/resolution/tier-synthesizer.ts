@@ -411,17 +411,26 @@ function httpRoutes(ctx: ResolutionContext): HttpRoute[] {
 const PARAM_SEG = /^(?::|\{|\[|<|\*)|\?$/;
 const CATCH_ALL = /^(?:\*|\[\.\.\.|\{\*|:[\w$]+\*$|\{[\w$]+:\*\}|\*[\w$]*$)/;
 
+/** An optional parameter — `:id?`, `{id?}`, `[[id]]` — which a client path may leave out. */
+const OPTIONAL_SEG = /^(?::[\w$]+\?|\{[\w$]+\?\}|\[\[[\w$]+\]\])$/;
+
 /** How well the client's segments match a route's; null when they do not. A literal match beats a parameter's. */
-function scorePath(client: readonly string[], route: readonly string[]): number | null {
+function scorePath(client: readonly string[], route: readonly string[], i = 0, from = 0): number | null {
   let score = 0;
-  let i = 0;
-  for (let r = 0; r < route.length; r++) {
+  for (let r = from; r < route.length; r++) {
     const seg = route[r]!;
     if (CATCH_ALL.test(seg)) {
       if (i >= client.length) return null;
       score += client.length - i;
       i = client.length;
       continue;
+    }
+    if (OPTIONAL_SEG.test(seg)) {
+      // Filled by the client's next segment, or left out (`/users` for `/users/:id?`).
+      const filled = i < client.length ? scorePath(client, route, i + 1, r + 1) : null;
+      const skipped = scorePath(client, route, i, r + 1);
+      const best = filled === null ? skipped : skipped === null ? filled + 2 : Math.max(filled + 2, skipped);
+      return best === null ? null : score + best;
     }
     if (i >= client.length) return null;
     const c = client[i]!;

@@ -48,6 +48,7 @@ import {
   FrameworkExtractionResult,
   FrameworkResolver,
 } from '../types';
+import { lineOfIndex } from '../synth-utils';
 
 const CODEGEN_DECL_RE =
   /\b(codegenNativeComponent|requireNativeComponent)\s*(?:<[^>]+>)?\s*\(\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]/g;
@@ -341,7 +342,7 @@ function extractFabricNodes(filePath: string, source: string): Node[] {
     for (const propName of props) {
       const propBefore = source.indexOf(propName, source.indexOf(body));
       const propLine =
-        propBefore >= 0 ? source.slice(0, propBefore).split('\n').length : 1;
+        propBefore >= 0 ? lineOfIndex(source, propBefore) : 1;
       nodes.push({
         id: `fabric-prop:${filePath}:${propName}:${propLine}`,
         kind: 'property',

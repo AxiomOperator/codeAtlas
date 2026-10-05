@@ -21,6 +21,22 @@
  *    canonical `hook_X` name, linking implementations to the hook when `codegraph_callers`
  *    is invoked.
  *
+ * 4. **OOP hooks** (Drupal 10.2+) — `#[Hook('x')]` on a method, or on a class naming its
+ *    `method:` (else `__invoke`), emits the same `hook_x` reference a procedural
+ *    implementation does, from the implementing method (#300).
+ *
+ * 5. **Plugins** — a class declared by a plugin attribute (`#[Block(id: …)]`) or a docblock
+ *    annotation (`@Block(id = "…")`) gets a `decorates` reference to that attribute /
+ *    annotation class, resolved through the file's `use` statement (#300).
+ *
+ * 6. **Services** — every `*.services.yml` service with a class is a `variable` node with an
+ *    `instantiates` edge to that class; its tags (e.g. `event_subscriber`) are in the
+ *    signature (#300).
+ *
+ * Deferred: the event an `EventSubscriberInterface` handles (`getSubscribedEvents()` maps an
+ * event name to a method — needs the dispatcher side to be useful), `@service` arguments
+ * between services (dotted ids collide with the dotted-call matcher), and Twig.
+ *
  * ## Design decisions (review in future iterations)
  *
  * - Hook graph resolution (v1): hook references are stored as UnresolvedRef pointing to the
@@ -29,19 +45,12 @@
  *   `codegraph_search("form_alter")`. Full hook-node creation (virtual nodes for every hook)
  *   is deferred to a future iteration.
  *
- * - Services / plugins (out of scope for v1): `*.services.yml` service definitions and plugin
- *   annotations (`@Block`, `@FormElement`, etc.) are not extracted. Add a TODO below when
- *   ready to implement.
- *
  * - Twig templates (out of scope for v1): `.twig` files are tracked as file nodes but no
  *   symbol extraction is performed (no tree-sitter Twig grammar). Implement when a Twig
  *   grammar WASM is available.
  *
  * ## TODOs for future iterations
  *
- * - TODO: Extract service definitions from `*.services.yml` files (class → service-id edges).
- * - TODO: Extract plugin annotations (`@Block`, `@FormElement`, `@Field`, etc.) from PHP
- *   docblocks and emit plugin nodes with references to the annotated class.
  * - TODO: Add Twig symbol extraction when a tree-sitter Twig grammar becomes available.
  * - TODO: Improve hook resolution: create virtual `hook_*` nodes so `codegraph_callers`
  *   returns all implementations even when Drupal core is not indexed.
@@ -50,6 +59,7 @@
 import { generateNodeId } from '../../extraction/tree-sitter-helpers';
 import { Node } from '../../types';
 import { FrameworkResolver, ResolutionContext, ResolvedRef, UnresolvedRef } from '../types';
+import { lineOfIndex } from '../synth-utils';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -238,7 +248,7 @@ function extractDrupalHooks(
     const name = fm[1]!;
     if (!funcLineMap.has(name)) {
       // line = number of newlines before match start + 1
-      funcLineMap.set(name, content.slice(0, fm.index).split('\n').length);
+      funcLineMap.set(name, lineOfIndex(content, fm.index));
     }
   }
 
@@ -287,6 +297,436 @@ function extractDrupalHooks(
   }
 
   return { nodes: [], references };
+}
+
+// ---------------------------------------------------------------------------
+// PHP declaration scanner (attributes, docblocks, classes, methods)
+// ---------------------------------------------------------------------------
+
+/** One attribute inside a `#[...]` group: last name segment + raw argument text. */
+interface PhpAttr {
+  name: string;
+  args: string;
+}
+
+/** A class / method / function declaration with what decorates it. */
+interface PhpDecl {
+  kind: 'class' | 'method' | 'function' | 'other';
+  name: string;
+  /**
+   * The line tree-sitter's node starts on — the first attribute group or
+   * modifier before the keyword, not the keyword itself. Node ids are hashed
+   * from it, so a hook/plugin ref built from the `function`/`class` line would
+   * point at a node that does not exist.
+   */
+  line: number;
+  attrs: PhpAttr[];
+  /** The `/** … *\/` docblock directly above (annotations live here). */
+  docblock: string | null;
+  /** Index (in the returned list) of the enclosing class-like declaration. */
+  container: number | null;
+}
+
+const PHP_MODIFIERS = new Set(['public', 'protected', 'private', 'static', 'final', 'abstract', 'readonly', 'var']);
+const PHP_CONTAINERS = new Set(['class', 'interface', 'trait', 'enum']);
+
+/** Index just past the bracket that closes the one opening at `open` (string-aware). */
+function skipBalanced(src: string, open: number, o: string, c: string): number {
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === '"' || ch === "'") {
+      i++;
+      while (i < src.length && src[i] !== ch) {
+        if (src[i] === '\\') i++;
+        i++;
+      }
+      continue;
+    }
+    if (ch === o) depth++;
+    else if (ch === c) {
+      depth--;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return src.length;
+}
+
+/** Split `Hook('a'), Hook('b', method: 'x')` (a `#[...]` group's body) into attributes. */
+function parseAttrGroup(body: string): PhpAttr[] {
+  const attrs: PhpAttr[] = [];
+  let i = 0;
+  while (i < body.length) {
+    const m = /^\s*,?\s*\\?([A-Za-z_][\w\\]*)/.exec(body.slice(i));
+    if (!m) break;
+    i += m[0].length;
+    const name = m[1]!.split('\\').pop()!;
+    let args = '';
+    const ws = /^\s*/.exec(body.slice(i))![0].length;
+    if (body[i + ws] === '(') {
+      const end = skipBalanced(body, i + ws, '(', ')');
+      args = body.slice(i + ws + 1, end - 1);
+      i = end;
+    }
+    attrs.push({ name, args });
+  }
+  return attrs;
+}
+
+/**
+ * Lenient single-pass scan of a PHP file for class-like and function
+ * declarations, collecting each one's `#[...]` attributes and docblock. Not a
+ * parser: strings and comments are skipped so their contents never read as
+ * code, and brace depth tracks which class a method belongs to.
+ */
+function scanPhpDecls(content: string): PhpDecl[] {
+  const decls: PhpDecl[] = [];
+  const stack: { decl: number; depth: number }[] = [];
+  let depth = 0;
+  let pendingAttrs: PhpAttr[] = [];
+  let pendingStart = -1;
+  let docblock: string | null = null;
+  let openContainer: number | null = null;
+  const reset = (): void => {
+    pendingAttrs = [];
+    pendingStart = -1;
+    docblock = null;
+  };
+  const n = content.length;
+  let i = 0;
+  while (i < n) {
+    const ch = content[i]!;
+    if (ch === '"' || ch === "'") {
+      i++;
+      while (i < n && content[i] !== ch) {
+        if (content[i] === '\\') i++;
+        i++;
+      }
+      i++;
+      reset();
+      continue;
+    }
+    if (ch === '#' && content[i + 1] === '[') {
+      const end = skipBalanced(content, i + 1, '[', ']');
+      if (pendingStart < 0) pendingStart = i;
+      pendingAttrs.push(...parseAttrGroup(content.slice(i + 2, end - 1)));
+      i = end;
+      continue;
+    }
+    if ((ch === '/' && content[i + 1] === '/') || ch === '#') {
+      const nl = content.indexOf('\n', i);
+      i = nl < 0 ? n : nl + 1;
+      continue;
+    }
+    if (ch === '/' && content[i + 1] === '*') {
+      const end = content.indexOf('*/', i + 2);
+      const stop = end < 0 ? n : end + 2;
+      if (content[i + 2] === '*') docblock = content.slice(i, stop);
+      i = stop;
+      continue;
+    }
+    if (ch === '$') {
+      // A variable (`$class`) is never a keyword.
+      i++;
+      while (i < n && /\w/.test(content[i]!)) i++;
+      reset();
+      continue;
+    }
+    if (/[A-Za-z_]/.test(ch)) {
+      const start = i;
+      while (i < n && /\w/.test(content[i]!)) i++;
+      const word = content.slice(start, i);
+      const before = content.slice(Math.max(0, start - 2), start);
+      if (before === '::' || before === '->' || before.endsWith('\\')) {
+        reset();
+        continue;
+      }
+      if (PHP_MODIFIERS.has(word.toLowerCase())) {
+        if (pendingStart < 0) pendingStart = start;
+        continue;
+      }
+      const lower = word.toLowerCase();
+      if (lower === 'function' || PHP_CONTAINERS.has(lower)) {
+        const m = /^\s*&?\s*([A-Za-z_]\w*)/.exec(content.slice(i, i + 200));
+        const prev = content.slice(Math.max(0, start - 10), start);
+        // `function (` is a closure, `new class` an anonymous class.
+        if (m && !/\bnew\s+$/.test(prev)) {
+          const declStart = pendingStart >= 0 ? pendingStart : start;
+          const top = stack.length > 0 ? stack[stack.length - 1]! : null;
+          const inClassBody = top !== null && depth === top.depth;
+          const kind: PhpDecl['kind'] =
+            lower === 'function' ? (inClassBody ? 'method' : 'function') : lower === 'class' ? 'class' : 'other';
+          decls.push({
+            kind,
+            name: m[1]!,
+            line: lineOfIndex(content, declStart),
+            attrs: pendingAttrs,
+            docblock,
+            container: inClassBody ? top!.decl : null,
+          });
+          if (lower !== 'function') openContainer = decls.length - 1;
+          i += m[0].length;
+        }
+        reset();
+        continue;
+      }
+      reset();
+      continue;
+    }
+    if (ch === '{') {
+      depth++;
+      if (openContainer !== null) {
+        stack.push({ decl: openContainer, depth });
+        openContainer = null;
+      }
+      reset();
+    } else if (ch === '}') {
+      if (stack.length > 0 && stack[stack.length - 1]!.depth === depth) stack.pop();
+      depth--;
+      reset();
+    } else if (!/\s/.test(ch)) {
+      // `;` ends an interface method / abstract declaration; any other
+      // punctuation means the pending attributes belonged to something else.
+      if (ch === ';' && openContainer !== null) openContainer = null;
+      reset();
+    }
+    i++;
+  }
+  return decls;
+}
+
+// ---------------------------------------------------------------------------
+// OOP hooks (#[Hook], Drupal 10.2+) and plugin declarations
+// ---------------------------------------------------------------------------
+
+/**
+ * Plugin types core declares with an attribute (Drupal 10.2+) or a docblock
+ * annotation (earlier). A contrib plugin type is recognised by its `id`
+ * argument instead — see `isPluginAttr`.
+ */
+const DRUPAL_PLUGIN_TYPES = new Set([
+  'Action', 'Archiver', 'Block', 'CKEditor5Plugin', 'Condition', 'ConfigEntityType', 'Constraint',
+  'ContentEntityType', 'DataType', 'DisplayVariant', 'Editor', 'EntityReferenceSelection', 'EntityType',
+  'Field', 'FieldFormatter', 'FieldType', 'FieldWidget', 'Filter', 'FormElement', 'HelpSection',
+  'ImageEffect', 'ImageToolkit', 'ImageToolkitOperation', 'LanguageNegotiation', 'Layout', 'Mail',
+  'MediaSource', 'Menu', 'MenuLink', 'MigrateDestination', 'MigrateField', 'MigrateProcess',
+  'MigrateProcessPlugin', 'MigrateSource', 'PageDisplayVariant', 'QueueWorker', 'RenderElement',
+  'RestResource', 'SearchPlugin', 'SectionStorage', 'StreamWrapper', 'ViewsAccess', 'ViewsArea',
+  'ViewsArgument', 'ViewsArgumentDefault', 'ViewsArgumentValidator', 'ViewsCache', 'ViewsDisplay',
+  'ViewsDisplayExtender', 'ViewsExposedForm', 'ViewsField', 'ViewsFilter', 'ViewsJoin', 'ViewsPager',
+  'ViewsQuery', 'ViewsRelationship', 'ViewsRow', 'ViewsSort', 'ViewsStyle', 'ViewsWizard', 'WorkflowType',
+]);
+
+/** The hook name a `#[Hook(...)]` names: the first positional string, or `hook: '…'`. */
+function hookNameOf(args: string): string | null {
+  const named = /\bhook\s*:\s*['"](\w+)['"]/.exec(args);
+  if (named) return named[1]!;
+  const positional = /^\s*['"](\w+)['"]/.exec(args);
+  return positional ? positional[1]! : null;
+}
+
+function isPluginAttr(attr: PhpAttr): boolean {
+  if (attr.name === 'Hook' || attr.name === 'LegacyHook') return false;
+  return DRUPAL_PLUGIN_TYPES.has(attr.name) || /(?:^|[,(\s])id\s*:/.test(attr.args);
+}
+
+/** Plugin annotations in a docblock: `@Block(` (known type) or `@Anything(… id = "x" …)`. */
+function pluginAnnotations(docblock: string): string[] {
+  const types: string[] = [];
+  for (const m of docblock.matchAll(/@([A-Z]\w*)\s*\(/g)) {
+    const name = m[1]!;
+    if (name === 'Translation' || name === 'PluralTranslation' || name === 'ContextDefinition') continue;
+    const open = m.index! + m[0].length - 1;
+    const body = docblock.slice(open, skipBalanced(docblock, open, '(', ')'));
+    if (DRUPAL_PLUGIN_TYPES.has(name) || /(?:^|[,(\s*])id\s*=/.test(body)) types.push(name);
+  }
+  return [...new Set(types)];
+}
+
+/**
+ * OOP hook implementations and plugin declarations in a PHP class file.
+ *
+ * Hooks — each emits the same `hook_X` reference a procedural implementation
+ * does, from the method that implements it:
+ *   - `#[Hook('entity_presave')]` on a method (stacked or grouped attributes
+ *     each count);
+ *   - `#[Hook('form_alter', method: 'formAlter')]` on a class → that method;
+ *   - `#[Hook('cron')]` on a class with no `method:` → its `__invoke()`.
+ *
+ * Plugins — a class declared by a plugin attribute (`#[Block(id: …)]`) or a
+ * docblock annotation (`@Block(id = "…")`) gets a `decorates` reference to the
+ * attribute/annotation class, which the file's own `use` statement names —
+ * the same edge a Java annotation or a TypeScript decorator produces.
+ */
+function extractDrupalClassPatterns(filePath: string, content: string): UnresolvedRef[] {
+  if (!content.includes('#[') && !/@[A-Z]\w*\s*\(/.test(content)) return [];
+  const references: UnresolvedRef[] = [];
+  const decls = scanPhpDecls(content);
+  const hookRef = (decl: PhpDecl, hook: string): void => {
+    references.push({
+      fromNodeId: generateNodeId(filePath, 'method', decl.name, decl.line),
+      referenceName: `hook_${hook}`,
+      referenceKind: 'references',
+      line: decl.line,
+      column: 0,
+      filePath,
+      language: 'php',
+    });
+  };
+
+  decls.forEach((decl, index) => {
+    if (decl.kind === 'method') {
+      for (const attr of decl.attrs) {
+        if (attr.name !== 'Hook') continue;
+        const hook = hookNameOf(attr.args);
+        if (hook) hookRef(decl, hook);
+      }
+      return;
+    }
+    if (decl.kind !== 'class') return;
+
+    for (const attr of decl.attrs) {
+      if (attr.name !== 'Hook') continue;
+      const hook = hookNameOf(attr.args);
+      if (!hook) continue;
+      const target = /\bmethod\s*:\s*['"](\w+)['"]/.exec(attr.args)?.[1] ?? '__invoke';
+      const method = decls.find((d) => d.kind === 'method' && d.container === index && d.name === target);
+      if (method) hookRef(method, hook);
+    }
+
+    const pluginTypes = new Set<string>();
+    for (const attr of decl.attrs) if (isPluginAttr(attr)) pluginTypes.add(attr.name);
+    if (decl.docblock) for (const t of pluginAnnotations(decl.docblock)) pluginTypes.add(t);
+    for (const type of pluginTypes) {
+      references.push({
+        fromNodeId: generateNodeId(filePath, 'class', decl.name, decl.line),
+        referenceName: type,
+        referenceKind: 'decorates',
+        line: decl.line,
+        column: 0,
+        filePath,
+        language: 'php',
+      });
+    }
+  });
+  return references;
+}
+
+// ---------------------------------------------------------------------------
+// Services (*.services.yml)
+// ---------------------------------------------------------------------------
+
+/**
+ * Each service in a `*.services.yml` with a class becomes a `variable` node
+ * named by its service id, with an `instantiates` reference to the class the
+ * container builds for it (the shape Spring XML beans use). Tags are kept in
+ * the signature, so an `event_subscriber` reads as one:
+ *
+ *   services:
+ *     mymodule.subscriber:
+ *       class: Drupal\mymodule\EventSubscriber\MySubscriber
+ *       tags:
+ *         - { name: event_subscriber }
+ *
+ * A service whose id is itself the class (`Drupal\x\Foo: ~`, the autowired
+ * short form) is skipped: its node would carry the class's own name and add
+ * nothing the class node does not already say. Aliases (`foo: '@bar'`) and
+ * `_defaults` declare no class and are skipped too. Indentation is read from
+ * the file, not assumed.
+ */
+function extractDrupalServices(filePath: string, content: string): { nodes: Node[]; references: UnresolvedRef[] } {
+  const nodes: Node[] = [];
+  const references: UnresolvedRef[] = [];
+  const now = Date.now();
+  const lines = content.split('\n');
+  const unquote = (v: string): string => v.trim().replace(/\s+#.*$/, '').replace(/^['"]|['"]$/g, '').trim();
+
+  type Svc = { id: string; line: number; cls: string | null; tags: string[] };
+  const services: Svc[] = [];
+  let inServices = false;
+  let svcIndent = -1;
+  let current: Svc | null = null;
+  let inTags = false;
+  let propIndent = -1;
+
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i]!.replace(/\r$/, '');
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const indent = raw.length - raw.trimStart().length;
+    if (indent === 0) {
+      inServices = /^services\s*:\s*$/.test(trimmed);
+      current = null;
+      svcIndent = -1;
+      continue;
+    }
+    if (!inServices) continue;
+    if (svcIndent < 0) svcIndent = indent;
+    if (indent === svcIndent) {
+      inTags = false;
+      propIndent = -1;
+      const m = /^(['"]?)([^'":]+(?::[^'":\s]+)*)\1\s*:\s*(.*)$/.exec(trimmed);
+      if (!m) {
+        current = null;
+        continue;
+      }
+      const id = m[2]!.trim();
+      const value = m[3]!.trim();
+      current = null;
+      if (id === '_defaults' || value.startsWith("'@") || value.startsWith('"@') || value.startsWith('@')) continue;
+      current = { id, line: i + 1, cls: null, tags: [] };
+      services.push(current);
+      // Inline map: `foo: { class: Drupal\x\Foo, tags: [{ name: event_subscriber }] }`
+      const inlineClass = /\bclass\s*:\s*([^,}]+)/.exec(value);
+      if (inlineClass) current.cls = unquote(inlineClass[1]!);
+      for (const t of value.matchAll(/\bname\s*:\s*([\w.]+)/g)) current.tags.push(t[1]!);
+      continue;
+    }
+    if (!current || indent < svcIndent) continue;
+    // A service's own keys sit at one indentation (the first one seen); a
+    // deeper `name: event_subscriber` belongs to an expanded tag list.
+    if (propIndent < 0) propIndent = indent;
+    const prop = indent === propIndent ? /^(\w+)\s*:\s*(.*)$/.exec(trimmed) : null;
+    if (prop && !trimmed.startsWith('-')) {
+      inTags = prop[1] === 'tags';
+      if (prop[1] === 'class') current.cls = unquote(prop[2]!);
+      if (inTags) for (const t of prop[2]!.matchAll(/\bname\s*:\s*([\w.]+)/g)) current.tags.push(t[1]!);
+      continue;
+    }
+    if (inTags) {
+      for (const t of trimmed.matchAll(/\bname\s*:\s*['"]?([\w.]+)/g)) current.tags.push(t[1]!);
+    }
+  }
+
+  for (const svc of services) {
+    if (!svc.cls || !svc.cls.includes('\\') || svc.id.includes('\\')) continue;
+    const cls = svc.cls.replace(/^\\/, '');
+    const node: Node = {
+      id: generateNodeId(filePath, 'variable', svc.id, svc.line),
+      kind: 'variable',
+      name: svc.id,
+      qualifiedName: `${filePath}::${svc.id}`,
+      filePath,
+      startLine: svc.line,
+      endLine: svc.line,
+      startColumn: 0,
+      endColumn: 0,
+      language: 'yaml',
+      signature: svc.tags.length > 0 ? `class: ${cls} tags: ${[...new Set(svc.tags)].join(', ')}` : `class: ${cls}`,
+      updatedAt: now,
+    };
+    nodes.push(node);
+    references.push({
+      fromNodeId: node.id,
+      referenceName: cls,
+      referenceKind: 'instantiates',
+      line: svc.line,
+      column: 0,
+      filePath,
+      language: 'yaml',
+    });
+  }
+  return { nodes, references };
 }
 
 // ---------------------------------------------------------------------------
@@ -381,20 +821,18 @@ export const drupalResolver: FrameworkResolver = {
       }
     }
 
-    // hook_X — find any function whose name ends in _{hookSuffix} in a hook file
+    // hook_X — the hook's documented definition (`function hook_X()` in a
+    // `*.api.php`), when core or the defining module is indexed. Without it the
+    // ref stays unresolved: binding to some OTHER module's `*_X` implementation
+    // (what this branch used to do) linked one implementation to another, and an
+    // implementation to itself.
     if (name.startsWith('hook_')) {
-      const hookSuffix = name.slice(5); // strip 'hook_'
-      const candidates = context.getNodesByKind('function').filter(
-        (n) => n.name.endsWith(`_${hookSuffix}`) && isDrupalHookFile(n.filePath)
-      );
-      if (candidates.length > 0) {
-        return {
-          original: ref,
-          targetNodeId: candidates[0]!.id,
-          confidence: 0.75,
-          resolvedBy: 'framework',
-        };
+      const defs = context.getNodesByName(name).filter((n) => n.kind === 'function' && n.language === 'php');
+      const def = defs.find((n) => n.filePath.endsWith('.api.php')) ?? (defs.length === 1 ? defs[0] : undefined);
+      if (def && def.id !== ref.fromNodeId) {
+        return { original: ref, targetNodeId: def.id, confidence: 0.9, resolvedBy: 'framework' };
       }
+      return null;
     }
 
     return null;
@@ -405,8 +843,16 @@ export const drupalResolver: FrameworkResolver = {
       return extractDrupalRoutes(filePath, content);
     }
 
+    if (filePath.endsWith('.services.yml')) {
+      return extractDrupalServices(filePath, content);
+    }
+
     if (isDrupalHookFile(filePath) || filePath.endsWith('.php')) {
-      return extractDrupalHooks(filePath, content);
+      const procedural = extractDrupalHooks(filePath, content);
+      return {
+        nodes: procedural.nodes,
+        references: [...procedural.references, ...extractDrupalClassPatterns(filePath, content)],
+      };
     }
 
     return { nodes: [], references: [] };

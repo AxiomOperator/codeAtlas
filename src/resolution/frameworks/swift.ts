@@ -8,6 +8,7 @@ import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 import { pickByNameAndKind } from './name-heuristic';
+import { lineOfIndex } from '../synth-utils';
 
 // No extract(): a SwiftUI view is its own struct node, and a UIKit controller
 // its class. A one-line `component`/`class` twin per `struct X: View` (and per
@@ -306,7 +307,7 @@ export const vaporResolver: FrameworkResolver = {
     let match: RegExpExecArray | null;
     while ((match = routeRegex.exec(safe)) !== null) {
       const [, receiver, method, segsStr, handlerExpr] = match;
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineOfIndex(safe, match.index);
       const upper = method!.toUpperCase();
       const routePath = (groupPrefix.get(receiver!) ?? '') + segJoin('', segsStr!) || '/';
 
@@ -346,7 +347,7 @@ export const vaporResolver: FrameworkResolver = {
     const pathArgs = (argText: string) => argText.split(',').filter((a) => /^\s*"[^"]*"\s*$/.test(a)).join(',');
     while ((match = onRegex.exec(safe)) !== null) {
       const [, receiver, method, segsStr, handlerExpr] = match;
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineOfIndex(safe, match.index);
       const routePath = (groupPrefix.get(receiver!) ?? '') + segJoin('', pathArgs(segsStr!)) || '/';
       const id = `route:${filePath}:${line}:${method}:${routePath}`;
       nodes.push({
@@ -377,7 +378,7 @@ export const vaporResolver: FrameworkResolver = {
         method = on[1]!;
         segs = on[2]!;
       }
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineOfIndex(safe, match.index);
       const routePath = (groupPrefix.get(receiver!) ?? '') + segJoin('', segs) || '/';
       const id = `route:${filePath}:${line}:${method}:${routePath}`;
       nodes.push({

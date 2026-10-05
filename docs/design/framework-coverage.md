@@ -1,6 +1,6 @@
 # Framework & language coverage — what is done, what is left
 
-**Last verified: 2026-08-29** (Angular row: 2026-09-29) against the build at that date. Re-verify with the
+**Last verified: 2026-08-29** (Angular row: 2026-09-29; server-framework rows: 2026-10-05) against the build at that date. Re-verify with the
 queries in [Checking this file is still true](#checking-this-file-is-still-true)
 before trusting a row; this is a snapshot, not a live view.
 
@@ -69,6 +69,20 @@ picked up at the next sync of any source file (templates are not watched).
 
 ---
 
+## Server frameworks — routes and DI wiring (2026-10-05)
+
+Not routers (no Screens picture — see "What is left" §2), but where an entry
+point or an injected object comes from. Each row is in its resolver's file
+header too.
+
+| Framework | What the graph has | Tests | Validated on | Known gaps |
+|---|---|---|---|---|
+| Micronaut | `frameworks/micronaut.ts`: `@Controller("/base")` + `@Get/@Post/@Put/@Patch/@Delete/@Head/@Options` (`"/x"`, `value =`, `uri =`, `uris = {…}`, same-file constants) → `route` nodes `VERB /base/x` bound to the handler, Java and Kotlin. Runs only on files importing `io.micronaut.http.annotation`, and only inside a `@Controller` class (a declarative `@Client` interface uses the same verbs for outgoing calls). Shares `parseMappingPaths` / `joinPath` with Spring (#971) | `micronaut.test.ts` | Kestra `webserver` (226 of 226 verb annotations → routes, all bound) | `@CustomHttpMethod`; `@Controller` prefixes from config placeholders (`${api.prefix}`) stay literal |
+| Drupal | `frameworks/drupal.ts`: routes (`*.routing.yml`), procedural hooks, OOP `#[Hook]` (method, stacked/grouped, class-level `method:` / `__invoke`) → the same `hook_X` ref procedural hooks emit; plugin attributes and docblock annotations → `decorates` to the attribute/annotation class through the file's `use`; `*.services.yml` services → `variable` node + `instantiates` to the class, tags (e.g. `event_subscriber`) in the signature (#300). A `hook_X` ref binds only to its `*.api.php` definition — never to another module's implementation | `drupal.test.ts` | fixture only | which event an `EventSubscriberInterface` method handles (`getSubscribedEvents()`); `@service` arguments between services; autowired FQCN-id services (no node); Twig |
+| Spring XML | `extraction/spring-beans-extractor.ts` (routed on a `<beans>` root; every other XML still goes to the MyBatis extractor): `<bean>` → `variable` node + `instantiates` to the `class=` FQN (and to `jobClass`/`*ClassName`-style by-value FQNs); bean→bean `references` from `ref`/`idref`/`parent`/`depends-on`/`factory-bean`/`p:`/`c:`/lookup- and replaced-method, aliases and `name=` tokens, `${prop:default}` refs. A dangling `ref=` joins a uniquely-named `@Service`/`@Component`/`@Repository`/`@Controller` class (`springResolver`; edge `metadata.synthesizedBy: 'spring-bean-scan-join'`), standing down when any XML bean has that name. Ported from @ESPINS's branch (#1225) | `spring-beans-extractor.test.ts` | contributor: eGovFrame web sample | SpEL `#{bean}`; refs inside `util:*` contents; `mapperLocations` → MyBatis mapper files |
+
+---
+
 ## What is left
 
 Ordered by cost-to-value. Each row says what is missing, not merely that
@@ -83,14 +97,17 @@ something is.
 `redirect` entries in `astro.config`.
 **Size:** smallest job on this list. `sveltekit-synthesizer.ts`'s
 `svelteKitLinkEdges` is the same pass over the same tag against a different
-table; the resolver half is one `Astro.redirect` reader.
+table — and every markup-link synthesizer is now one `linkEdgesPass` spec
+(`link-edges.ts`: the shared `=>`-safe tag pattern, attribution, dedup and
+per-component cap), so Astro's is one more spec; the resolver half is one
+`Astro.redirect` reader.
 **Validate on:** any `withastro/astro` example, or the Astro docs site.
 
 ### 2. Server-rendered frameworks — a redirect is a transition, not just a response
 
-**Fourteen frameworks** have route nodes and no navigation: Django, Flask,
-FastAPI, Express, NestJS, Laravel, Drupal, Rails, Spring, Play, Gin/chi/gorilla,
-Axum/actix/Rocket, ASP.NET, Vapor.
+**Fifteen frameworks** have route nodes and no navigation: Django, Flask,
+FastAPI, Express, NestJS, Laravel, Drupal, Rails, Spring, Micronaut, Play,
+Gin/chi/gorilla, Axum/actix/Rocket, ASP.NET, Vapor.
 
 Be precise about what is missing. `redirect_to`, `HttpResponseRedirect`,
 `res.redirect`, PHP's `redirect()` are **already recognised as `response`
@@ -108,6 +125,7 @@ gets no Screens picture at all today:
 | Django | `redirect('profile')`, `reverse('profile')` | same — a route *name*, like Vue's `{ name }`, which `vue-router.ts` already shows how to index |
 | Laravel | `redirect()->route('home')`, `->view()` | route names again |
 | Spring | `"redirect:/x"`, `RedirectView` | a literal inside a string return value |
+| Micronaut | `HttpResponse.redirect(URI.create("/x"))` | a literal two calls deep |
 | ASP.NET | `RedirectToAction("Index", "Home")` | controller + action pair, not a path — needs the route table's reverse mapping |
 | Flask | `redirect(url_for('profile'))` | nested call; the name is `url_for`'s argument |
 

@@ -28,44 +28,32 @@
 import type { Edge } from '../types';
 import type { ResolutionContext } from './types';
 import type { MaybeYield } from './cooperative-yield';
-import { stripCommentsForRegex } from './strip-comments';
-import { isTestPath } from '../search/query-utils';
 import { readStringAt, routesForFile } from './frameworks/expo-router';
 import { destinationsForHref } from './frameworks/nextjs';
 import { tanstackDestination, tanstackTable } from './frameworks/tanstack-router';
-import { enclosingFn, makeLineAt } from './synth-utils';
+import { linkEdgesPass, linkTagPattern } from './link-edges';
 
 const JSX_FILE = /\.(?:[cm]?[jt]sx?)$/;
 
 /** `<Link … to=` / `<Navigate … to=`, the attribute anywhere in the tag. */
-const LINK_TAG = /<(Link|Navigate)\b([^>]*?)\bto\s*=\s*(?:"([^"]*)"|'([^']*)'|\{\s*)/g;
+const LINK_TAG = linkTagPattern(['Link', 'Navigate'], `\\bto\\s*=\\s*(?:"([^"]*)"|'([^']*)'|\\{\\s*)`);
 
 /** A tag this pass could possibly match — the cheap prefilter. */
 const HAS_LINK_TAG = /<(?:Link|Navigate)\b/;
 
-/** Links a single component may carry before it is a navigation menu, not a decision. */
-const MAX_LINKS_PER_COMPONENT = 24;
-
 export async function tanstackLinkEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   const table = tanstackTable(ctx);
   if (table.byRoot.size === 0) return [];
-  const edges: Edge[] = [];
-  const seen = new Set<string>();
-  const perComponent = new Map<string, number>();
-  let scanned = 0;
-  for (const file of ctx.getAllFiles()) {
-    if (!JSX_FILE.test(file) || isTestPath(file)) continue;
-    const routes = routesForFile(table, file);
-    if (!routes || routes.exact.size === 0) continue;
-    if ((++scanned & 63) === 0) await onYield();
-    const source = ctx.readFile(file);
-    if (!source || !HAS_LINK_TAG.test(source)) continue;
-    const safe = stripCommentsForRegex(source, 'typescript');
-    const nodes = ctx.getNodesInFile(file);
-    const lineOf = makeLineAt(safe, 1);
-    LINK_TAG.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = LINK_TAG.exec(safe)) !== null) {
+  return linkEdgesPass(ctx, onYield, {
+    synthesizedBy: 'tanstack-link',
+    fileFilter: JSX_FILE,
+    routesFor: (file) => {
+      const routes = routesForFile(table, file);
+      return routes && routes.exact.size > 0 ? routes : null;
+    },
+    pattern: (_file, source) => (HAS_LINK_TAG.test(source) ? LINK_TAG : null),
+    stripComments: true,
+    site: (m, safe, _file, routes) => {
       let literal: string | null = m[3] ?? m[4] ?? null;
       if (literal === null) {
         // `to={…}`: a string or a template.
@@ -73,36 +61,13 @@ export async function tanstackLinkEdges(ctx: ResolutionContext, onYield: MaybeYi
         const ch = safe[at];
         if (ch === '"' || ch === "'" || ch === '`') literal = readStringAt(safe, at);
       }
-      if (literal === null) continue;
+      if (literal === null) return null;
       const href = tanstackDestination(JSON.stringify(literal));
-      if (!href) continue;
-      const line = lineOf(m.index);
-      const component = enclosingFn(nodes, line);
-      if (!component) continue;
-      // A destination written as a choice names one route per arm, and the
-      // user reaches every one of them — each is drawn.
-      for (const { node: route, href: arm } of destinationsForHref(href, routes)) {
-        const key = `${component.id}>${route.id}`;
-        if (seen.has(key)) continue;
-        const count = (perComponent.get(component.id) ?? 0) + 1;
-        perComponent.set(component.id, count);
-        if (count > MAX_LINKS_PER_COMPONENT) continue;
-        seen.add(key);
-        edges.push({
-          source: component.id,
-          target: route.id,
-          kind: 'navigates',
-          line,
-          provenance: 'heuristic',
-          metadata: {
-            synthesizedBy: 'tanstack-link',
-            href: arm.display,
-            navMethod: m[1] === 'Navigate' ? 'navigate' : 'link',
-            registeredAt: `${file}:${line}`,
-          },
-        });
-      }
-    }
-  }
-  return edges;
+      if (!href) return null;
+      return {
+        destinations: destinationsForHref(href, routes).map((d) => ({ node: d.node, display: d.href.display })),
+        metadata: { navMethod: m[1] === 'Navigate' ? 'navigate' : 'link' },
+      };
+    },
+  });
 }

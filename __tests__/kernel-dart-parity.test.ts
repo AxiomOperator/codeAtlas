@@ -110,6 +110,7 @@ describe.skipIf(!kernelBuilt)('kernel Dart extraction parity', () => {
     ['TortureSigs.dart', 4],
     ['TortureCtors.dart', 3],
     ['TortureVrefDart.dart', 4],
+    ['TortureTypeRefsDart.dart', 8],
   ] as const;
 
   for (const [file, minNodes] of FIXTURES) {

@@ -112,6 +112,36 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
 
   it.each([
     ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('object-literal namespaces, IIFEs and destructuring initializers: %s (#2300, #2340)', (ext, language) => {
+    const result = assertParity(`ns.${ext}`, `
+const plain = { m() { return helper(); }, p: () => 1, data: compute(), ...base() };
+var data = { a: 1, b: [1, 2] };
+const { a } = useFoo(1);
+const [b] = useBar(1);
+(function () {
+  const inner = { im() { return 1; } };
+  window.WS = { wsM() { return inner.im(); }, cfg: build() };
+  ns.mod = { modM: function () { return 2; } };
+  (() => { const deep = { dm() {} }; })();
+})();
+!function () { var bang = { bm() {} }; }();
+(function () { const viaCall = { cm() {} }; }).call(this);
+module.exports = { exported() {} };
+window.api = { load() { return store.shorthand(); } };
+function f() { window.api.load(); api.load(); (function () { const notTop = { nm() {} }; })(); }
+`, language);
+    const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+    expect(fns).toEqual(expect.arrayContaining(['m', 'p', 'im', 'wsM', 'modM', 'dm', 'bm', 'cm', 'load']));
+    expect(fns).not.toContain('nm');
+    expect(fns).not.toContain('exported');
+    const vars = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
+    expect(vars).toEqual(expect.arrayContaining(['WS', 'mod', 'api', 'data']));
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toEqual(expect.arrayContaining(['useFoo', 'useBar', 'compute', 'base', 'build']));
+  });
+
+  it.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
   ] as const)('leaves nested identifier receivers unresolved and keeps argument calls: %s (#1566)', (ext, language) => {
     const result = assertParity(`fixture.${ext}`, `
 function readKey() { return 'answer'; }

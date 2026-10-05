@@ -63,6 +63,7 @@ import {
   type RouteTable,
 } from './expo-router';
 import { destinationsForHref } from './nextjs';
+import { lineOfIndex } from '../synth-utils';
 
 // =============================================================================
 // Reading a routes array
@@ -257,7 +258,7 @@ export function parseAngularRoutes(content: string): { routes: AngularRoute[]; m
   const redirects: AngularRedirect[] = [];
   if (!ROUTER_IMPORT.test(content)) return { routes, mounts, redirects };
   const safe = stripCommentsForRegex(content, 'typescript');
-  const lineOf = (at: number) => safe.slice(0, at).split('\n').length;
+  const lineOf = (at: number) => lineOfIndex(safe, at);
   const seenPaths = new Set<string>();
   const walked = new Set<number>();
 

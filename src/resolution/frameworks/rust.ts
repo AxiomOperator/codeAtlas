@@ -10,6 +10,7 @@ import { stripCommentsForRegex } from '../strip-comments';
 import { getCargoWorkspaceCrateMap } from './cargo-workspace';
 import { isRustNameInScope } from '../name-matcher';
 import { pickByNameAndKind } from './name-heuristic';
+import { lineOfIndex } from '../synth-utils';
 
 /**
  * Whether the item a name heuristic found is one the reference can name:
@@ -114,7 +115,7 @@ export const rustResolver: FrameworkResolver = {
     let match: RegExpExecArray | null;
     while ((match = attrRegex.exec(safe)) !== null) {
       const [, method, routePath] = match;
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineOfIndex(safe, match.index);
       const upper = method!.toUpperCase();
 
       const routeNode: Node = {
@@ -162,15 +163,20 @@ export const rustResolver: FrameworkResolver = {
       const pathMatch = args.match(/^\s*"([^"]+)"\s*,/);
       if (!pathMatch) continue;
       const routePath = pathMatch[1]!;
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineOfIndex(safe, match.index);
 
       const methodBody = args.slice(pathMatch[0].length);
+      const bodyOffset = openIdx + 1 + pathMatch[0].length;
       const methodHandlerRegex = /\b(get|post|put|patch|delete|head|options|trace)\s*\(\s*([A-Za-z_][\w:]*)/g;
       let mh: RegExpExecArray | null;
       while ((mh = methodHandlerRegex.exec(methodBody)) !== null) {
         const upper = mh[1]!.toUpperCase();
         const handler = mh[2]!.split('::').filter(Boolean).pop();
         if (!handler) continue;
+        // The handler ref sits where the handler is SPELLED: rustfmt wraps a
+        // long `.route(` call so `get(handlers::f)` lands lines below it, and
+        // the Rust scope gate looks for the name on the ref's own line (#2326).
+        const handlerAt = lineColAt(safe, bodyOffset + mh.index + mh[0].length - mh[2]!.length);
 
         const routeNode: Node = {
           id: `route:${filePath}:${line}:${upper}:${routePath}`,
@@ -191,8 +197,8 @@ export const rustResolver: FrameworkResolver = {
           fromNodeId: routeNode.id,
           referenceName: handler,
           referenceKind: 'references',
-          line,
-          column: 0,
+          line: handlerAt.line,
+          column: handlerAt.column,
           filePath,
           language: 'rust',
         });
@@ -201,7 +207,10 @@ export const rustResolver: FrameworkResolver = {
 
     // Actix-web builder API (the dominant actix routing style; attribute macros
     // are handled above). The handler lives in `.to(handler)`, not `get(handler)`.
-    const pushActixRoute = (routePath: string, method: string, handlerExpr: string, line: number) => {
+    const pushActixRoute = (
+      routePath: string, method: string, handlerExpr: string, line: number,
+      handlerAt: { line: number; column: number } = { line, column: 0 },
+    ) => {
       const handler = handlerExpr.split('::').filter(Boolean).pop();
       if (!handler) return;
       const upper = method.toUpperCase();
@@ -223,8 +232,8 @@ export const rustResolver: FrameworkResolver = {
         fromNodeId: routeNode.id,
         referenceName: handler,
         referenceKind: 'references',
-        line,
-        column: 0,
+        line: handlerAt.line,
+        column: handlerAt.column,
         filePath,
         language: 'rust',
       });
@@ -234,7 +243,7 @@ export const rustResolver: FrameworkResolver = {
     const resourceRegex = /web::resource\s*\(\s*"([^"]+)"\s*\)/g;
     while ((match = resourceRegex.exec(safe)) !== null) {
       const routePath = match[1]!;
-      const startLine = safe.slice(0, match.index).split('\n').length;
+      const startLine = lineOfIndex(safe, match.index);
       const after = match.index + match[0].length;
       // Bound the resource's method chain at the next resource() to avoid bleed.
       const nextRes = safe.indexOf('web::resource', after);
@@ -245,22 +254,28 @@ export const rustResolver: FrameworkResolver = {
       let m2: RegExpExecArray | null;
       let found = false;
       while ((m2 = methodTo.exec(chain)) !== null) {
-        const mLine = startLine + chain.slice(0, m2.index).split('\n').length - 1;
-        pushActixRoute(routePath, m2[1]!, m2[2]!, mLine);
+        const mLine = startLine + lineOfIndex(chain, m2.index) - 1;
+        pushActixRoute(routePath, m2[1]!, m2[2]!, mLine,
+          lineColAt(safe, after + m2.index + m2[0].length - m2[2]!.length));
         found = true;
       }
       // Direct `.resource("/x").to(handler)` (all methods) when no explicit verb route.
       if (!found) {
         const direct = chain.match(/^\s*\.to\s*\(\s*([A-Za-z_][\w:]*)/);
-        if (direct) pushActixRoute(routePath, 'ANY', direct[1]!, startLine);
+        if (direct) {
+          pushActixRoute(routePath, 'ANY', direct[1]!, startLine,
+            lineColAt(safe, after + direct[0].length - direct[1]!.length));
+        }
       }
     }
 
     // App-level: .route("/path", web::METHOD().to(handler)).
     const appRouteRegex = /\.route\s*\(\s*"([^"]+)"\s*,\s*web::(get|post|put|patch|delete|head)\s*\(\s*\)\s*\.to\s*\(\s*([A-Za-z_][\w:]*)/g;
     while ((match = appRouteRegex.exec(safe)) !== null) {
-      const line = safe.slice(0, match.index).split('\n').length;
-      pushActixRoute(match[1]!, match[2]!, match[3]!, line);
+      const line = lineOfIndex(safe, match.index);
+      // A wrapped `.route(\n "/p",\n web::get().to(h))` spells h lines below (#2326).
+      const handlerAt = lineColAt(safe, match.index + match[0].length - match[3]!.length);
+      pushActixRoute(match[1]!, match[2]!, match[3]!, line, handlerAt);
     }
 
     return { nodes, references };
@@ -275,6 +290,13 @@ const MODEL_DIRS = ['/models/', '/model/', '/entities/', '/entity/', '/domain/',
 const FUNCTION_KINDS = new Set(['function']);
 const SERVICE_KINDS = new Set(['struct', 'trait']);
 const STRUCT_KINDS = new Set(['struct']);
+
+/** 1-based line and 0-based column of offset `idx` in `s`. */
+function lineColAt(s: string, idx: number): { line: number; column: number } {
+  const before = s.slice(0, idx);
+  const nl = before.lastIndexOf('\n');
+  return { line: before.split('\n').length, column: idx - (nl + 1) };
+}
 
 /** Index of the ')' that matches the '(' at openIdx, or -1 if unbalanced. */
 function findMatchingParen(s: string, openIdx: number): number {

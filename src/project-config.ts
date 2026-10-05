@@ -82,6 +82,14 @@ export interface ProjectConfig {
    * beyond the built-ins.
    */
   deprioritize?: string[];
+  /**
+   * Lua settings. `loaderFunctions` names a project's own module loaders —
+   * functions that load a module the way `require` does (`Require("Script/
+   * Foo.lua")`, common in embedded Lua whose host ships a path-based loader).
+   * A call to one with a string literal becomes an `imports` edge to the file
+   * it names (#1617). Absent/empty (the default) adds nothing beyond `require`.
+   */
+  lua?: { loaderFunctions?: string[] };
 }
 
 /** Parsed, validated view of a project's `codegraph.json`. */
@@ -91,6 +99,7 @@ interface ParsedConfig {
   exclude: string[];
   deprioritize: string[];
   include: string[];
+  luaLoaderFunctions: string[];
 }
 
 interface CacheEntry {
@@ -114,6 +123,7 @@ const EMPTY_CONFIG: ParsedConfig = Object.freeze({
   exclude: Object.freeze([]) as unknown as string[],
   include: Object.freeze([]) as unknown as string[],
   deprioritize: Object.freeze([]) as unknown as string[],
+  luaLoaderFunctions: Object.freeze([]) as unknown as string[],
 });
 
 /**
@@ -167,16 +177,47 @@ function parseConfig(file: string): ParsedConfig {
   const exclude = extractExclude(parsed, file);
   const include = extractInclude(parsed, file);
   const deprioritize = extractPatternList(parsed, file, 'deprioritize');
+  const luaLoaderFunctions = extractLuaLoaderFunctions(parsed, file);
   if (
     extensions === EMPTY_EXTENSIONS &&
     includeIgnored.length === 0 &&
     exclude.length === 0 &&
     include.length === 0 &&
-    deprioritize.length === 0
+    deprioritize.length === 0 &&
+    luaLoaderFunctions.length === 0
   ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude, include, deprioritize };
+  return { extensions, includeIgnored, exclude, include, deprioritize, luaLoaderFunctions };
+}
+
+/**
+ * Validate `lua.loaderFunctions`: an array of Lua function names (a plain
+ * identifier, or a dotted / colon path like `Loader.require`). A wrong shape or
+ * an invalid entry warns-and-skips; never throws.
+ */
+function extractLuaLoaderFunctions(parsed: object, file: string): string[] {
+  const lua = (parsed as ProjectConfig).lua;
+  if (lua === undefined) return [];
+  if (!lua || typeof lua !== 'object' || Array.isArray(lua)) {
+    logWarn(`Ignoring "lua" in ${PROJECT_CONFIG_FILENAME}: must be an object`, { file });
+    return [];
+  }
+  const raw = lua.loaderFunctions;
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    logWarn(`Ignoring "lua.loaderFunctions" in ${PROJECT_CONFIG_FILENAME}: must be an array of function names`, { file });
+    return [];
+  }
+  const out: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*(?:[.:][A-Za-z_][A-Za-z0-9_]*)*$/.test(entry.trim())) {
+      logWarn(`Ignoring a "lua.loaderFunctions" entry in ${PROJECT_CONFIG_FILENAME}: "${String(entry)}" is not a Lua function name`, { file });
+      continue;
+    }
+    if (!out.includes(entry.trim())) out.push(entry.trim());
+  }
+  return out;
 }
 
 /**
@@ -389,6 +430,15 @@ export function loadDeprioritizePatterns(rootDir: string): string[] {
  */
 export function loadIncludePatterns(rootDir: string): string[] {
   return loadParsedConfig(rootDir).include;
+}
+
+/**
+ * Load the validated `lua.loaderFunctions` for a project, mtime-cached: the
+ * project's own module-loader function names, whose string-literal calls
+ * become `imports` edges like `require` (#1617). Empty by default.
+ */
+export function loadLuaLoaderFunctions(rootDir: string): string[] {
+  return loadParsedConfig(rootDir).luaLoaderFunctions;
 }
 
 /** Test/maintenance hook: forget cached config (e.g. after rewriting it in a test). */

@@ -236,7 +236,10 @@ describe('partial parse is retried by the next sync', () => {
     await loadGrammarsForLanguages(['typescript']);
     const proto = TreeSitterExtractor.prototype as unknown as { visitNode: (n: unknown) => void };
     vi.spyOn(proto, 'visitNode').mockImplementation(() => { throw new Error('extractor bug'); });
+    // The spy is on the wasm walker; keep a staged native kernel out of the way.
+    vi.stubEnv('CODEGRAPH_KERNEL', '0');
     const result = extractFromSource('a.ts', 'export function a() {}\n', 'typescript');
+    vi.unstubAllEnvs();
     expect(result.errors.some((e) => e.incomplete === true && e.code === 'parse_error')).toBe(true);
   });
 

@@ -82,6 +82,11 @@ fn starts_upper_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^[A-Z]").unwrap())
 }
+/// A lowerCamel Dart identifier (`x`, `_area`, `$v`) — extractDartPropertyRead's gate.
+fn lower_ident_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[a-z_$][A-Za-z0-9_$]*$").unwrap())
+}
 /// extractDartReturnType's `<...>` strip (`/<[^>]*>/g`).
 fn angle_args_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -628,9 +633,20 @@ impl<'t> Walker<'t> {
                     }
                 });
                 let name = self.text(name_node).to_string();
-                self.create_node("constant", &name, node, Extra { signature, ..Default::default() });
+                let row = self.create_node("constant", &name, node, Extra { signature, ..Default::default() });
+                // Generic arguments in the initializer (#2327) — dart.ts
+                // dartTypeArgumentRefs.
+                if let Some(row) = row {
+                    self.type_argument_refs(node, row);
+                }
             }
             self.scan_fn_ref_subtree(node, 0);
+            return;
+        }
+
+        // Declared types and initializer generic arguments of class fields and
+        // top-level variables (#2327) — extractDartDeclarationTypeRefs.
+        if self.declaration_type_refs(node) {
             return;
         }
 
@@ -1192,6 +1208,15 @@ impl<'t> Walker<'t> {
     fn extract_inheritance(&mut self, node: Node<'t>, class_row: u32) {
         let mut cursor = node.walk();
         let kids: Vec<Node<'t>> = node.named_children(&mut cursor).collect();
+        // A NAMED extension's ON type (#2327) — an anonymous one is named
+        // after the ON type, so the ref would point at itself.
+        if node.kind() == "extension_declaration" && kids.iter().any(|c| c.kind() == "identifier") {
+            for c in kids.iter().copied() {
+                if matches!(c.kind(), "type_identifier" | "type_arguments") {
+                    self.type_refs_from_subtree(c, class_row);
+                }
+            }
+        }
         for child in kids {
             if child.kind() == "mixin_application_class" {
                 // `class A = B with M implements I;` — extends B, implements
@@ -1287,6 +1312,79 @@ impl<'t> Walker<'t> {
         }
     }
 
+    /// extractDartDeclarationTypeRefs: a class field's / top-level
+    /// variable's declared type and its initializer's generic arguments
+    /// (#2327). Returns true when `node` was consumed.
+    fn declaration_type_refs(&mut self, node: Node<'t>) -> bool {
+        let parent_kind = node.parent().map(|p| p.kind());
+        if !matches!(parent_kind, Some("program") | Some("declaration")) {
+            return false;
+        }
+        let owner = self.stack.last().map(|s| s.row);
+        match node.kind() {
+            "type_identifier" | "type_arguments" => {
+                if let Some(owner) = owner {
+                    self.type_refs_from_subtree(node, owner);
+                }
+                true
+            }
+            "initialized_identifier_list" => {
+                if let Some(owner) = owner {
+                    self.type_argument_refs(node, owner);
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Type refs for every `type_arguments` list within `node`.
+    fn type_argument_refs(&mut self, node: Node<'t>, from_row: u32) {
+        stack_guard!();
+        if node.kind() == "type_arguments" {
+            self.type_refs_from_subtree(node, from_row);
+            return;
+        }
+        let mut cursor = node.walk();
+        let kids: Vec<Node<'t>> = node.named_children(&mut cursor).collect();
+        for c in kids {
+            self.type_argument_refs(c, from_row);
+        }
+    }
+
+    /// extractDartPropertyRead (#2338): a getter read `x.area` / `x?.area`,
+    /// emitted as a `references` ref named `receiver.member` at the member.
+    fn extract_property_read(&mut self, node: Node<'t>) {
+        if node.kind() != "selector" || node.named_child_count() != 1 {
+            return;
+        }
+        let Some(accessor) = node.named_child(0) else { return };
+        if !matches!(accessor.kind(), "unconditional_assignable_selector" | "conditional_assignable_selector") {
+            return;
+        }
+        let mut cursor = accessor.walk();
+        let Some(member) = accessor.named_children(&mut cursor).find(|c| c.kind() == "identifier") else { return };
+        let member_text = self.text(member);
+        if !lower_ident_re().is_match(member_text) {
+            return;
+        }
+        let Some(prev) = node.prev_named_sibling() else { return };
+        if prev.kind() != "identifier" || !lower_ident_re().is_match(self.text(prev)) {
+            return;
+        }
+        if let Some(next) = node.next_named_sibling() {
+            if next.kind() == "selector" {
+                let mut nc = next.walk();
+                if next.named_children(&mut nc).any(|c| c.kind() == "argument_part") {
+                    return;
+                }
+            }
+        }
+        let Some(owner) = self.stack.last().map(|s| s.row) else { return };
+        let name = format!("{}.{}", self.text(prev), member_text);
+        self.push_ref_at(owner, &name, "references", member);
+    }
+
     // --- visitFunctionBody (:5129-5286) — dart rows -----------------------
 
     fn visit_body(&mut self, node: Node<'t>) {
@@ -1307,6 +1405,15 @@ impl<'t> Walker<'t> {
         }
 
         self.extract_static_member_ref(node);
+
+        // Generic arguments in an expression (#2327); getter reads (#2338).
+        if kind == "type_arguments" {
+            if let Some(owner) = self.stack.last().map(|s| s.row) {
+                self.type_refs_from_subtree(node, owner);
+            }
+            return;
+        }
+        self.extract_property_read(node);
 
         if kind == "function_signature" {
             // Nested named functions (:5245) — extractFunction walks the

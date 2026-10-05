@@ -62,6 +62,7 @@ import {
   type RouteTable,
 } from './expo-router';
 import { destinationsForHref } from './nextjs';
+import { lineOfIndex } from '../synth-utils';
 
 const ROUTE_LANGUAGES: readonly Language[] = ['typescript', 'javascript', 'tsx', 'jsx'];
 
@@ -168,7 +169,7 @@ export function parseTanstackRoutes(content: string): TanstackRouteEntry[] {
   if (!ROUTE_FACTORY.test(content)) return [];
   const safe = stripCommentsForRegex(content, 'typescript');
   const out: TanstackRouteEntry[] = [];
-  const lineOf = (index: number): number => safe.slice(0, index).split('\n').length;
+  const lineOf = (index: number): number => lineOfIndex(safe, index);
 
   // ---- file-based: the path is the first argument, the options follow ----
   const fileRoutes = /\bcreate(?:Lazy)?FileRoute\s*\(/g;

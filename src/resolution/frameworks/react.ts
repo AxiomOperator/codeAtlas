@@ -9,6 +9,7 @@ import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { dependsOn } from './package-deps';
 import { resolveImportPath } from '../import-resolver';
+import { lineOfIndex } from '../synth-utils';
 
 /** The languages React components, hooks and contexts are written and used in. */
 const REACT_SCRIPT_LANGUAGES: ReadonlySet<string> = new Set(['typescript', 'javascript', 'tsx', 'jsx']);
@@ -126,7 +127,7 @@ export const reactResolver: FrameworkResolver = {
     // Read only each opening tag's own attributes, including expression values.
     const declarations = scanRouteDeclarations(content, !/\.(?:ts|mts|cts)$/.test(filePath));
     for (const { path: routePath, parts, component, lazy, at } of declarations) {
-      const line = content.slice(0, at).split('\n').length;
+      const line = lineOfIndex(content, at);
       const routeNode: Node = {
         id: `route:${filePath}:${line}:${routePath}`,
         kind: 'route',
