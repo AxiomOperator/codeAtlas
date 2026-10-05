@@ -6,36 +6,15 @@
 
 import type CodeGraph from '../index';
 import type { QueryPool } from './query-pool';
-import { findNearestCodeGraphRoot, isSameIndexRoot } from '../directory';
-import { WslSharedIndexError } from '../db/wsl-shared-index';
-// Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
-// helper in engine.ts. ToolHandler must load to answer tools/list (static
-// schemas), but it must NOT drag in sqlite/query layers before the daemon binds;
-// CodeGraph is pulled in only when a tool actually opens a project. require() is
-// sync + cached (CommonJS build).
-const loadCodeGraph = (): typeof import('../index').default =>
-  loadCodeGraphForTests ?? (require('../index') as typeof import('../index')).default;
-// Test seam (same pattern as the watcher's `__setFsWatchForTests`): vitest's
-// module transform can't service the lazy `require('../index')` above, so
-// in-process tests that exercise a genuine cross-project open (an explicit
-// `projectPath` to a different project — issue #1474's repro shape) inject the
-// already-imported class here. Never set outside tests.
-let loadCodeGraphForTests: typeof import('../index').default | null = null;
-export function __setLoadCodeGraphForTests(cls: typeof import('../index').default | null): void {
-  loadCodeGraphForTests = cls;
-}
+import type { WslSharedIndexError } from '../db/wsl-shared-index';
 import {
-  detectWorktreeIndexMismatch,
-  nestedRepositoryBelow,
   worktreeMismatchWarning,
   worktreeMismatchNotice,
-  type NestedRepository,
-  type WorktreeIndexMismatch,
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
-import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
-import { isTestFile, normalizeNameToken } from '../search/query-utils';
-import { groupDefinitions, isQualifiedSymbol, lastQualifierPart, matchesSymbol } from '../graph/symbol-lookup';
+import type { Node, Edge, NodeKind } from '../types';
+import { normalizeNameToken } from '../search/query-utils';
+import { groupDefinitions, lookupSymbolNodes, suggestSymbolNames } from '../graph/symbol-lookup';
 import {
   extractQueryPaths,
   queryMightContainPaths,
@@ -45,21 +24,16 @@ import {
 import {
   existsSync,
   readFileSync,
-  realpathSync,
   statSync,
 } from 'fs';
 import { createHash } from 'crypto';
-import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
-import { guardLabel, guardsForFileSync, siteKey, supportsBranchGuards, warmBranchGuardGrammars } from '../graph/branch-guards';
-import { findDynamicBoundaries, type BoundarySite } from '../graph/dynamic-boundary-report';
-import { countImplementers } from '../graph/type-hierarchy';
-import {
-  findAllSymbols,
-  resolveNamedSymbolFlow,
-} from '../graph/named-symbol-flow';
+import { compileFileGlob } from './file-glob';
+import { clamp, validatePathWithinRoot, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
+import { warmBranchGuardGrammars } from '../graph/branch-guards';
+import { findAllSymbols } from '../graph/named-symbol-flow';
 import { getUpdateNotice } from '../upgrade/update-check';
 import { measurePendingChanges } from './index-freshness';
-import { validateAnswerFiles, type AnswerFile } from './answer-freshness';
+import { validateAnswerFiles } from './answer-freshness';
 import { ExploreDiagnostics } from './explore-diagnostics';
 import {
   EXPLORE_EMISSION_KEY,
@@ -67,7 +41,6 @@ import {
   ExploreSessionState,
   readExploreSessionView,
   viewForProject,
-  type ExploreEmission,
   type ExploreFileEmission,
   type ExploreLineRange,
 } from './explore-session-state';
@@ -83,33 +56,16 @@ import {
 } from './explore-dedup';
 
 /**
- * An expected, recoverable "codegraph can't serve this" condition — most
- * importantly a project with no index. The dispatch catch converts these to
- * SUCCESS-shaped responses (guidance text, NO isError): an `isError: true`
- * early in a session teaches the agent the toolset is broken and it stops
- * calling codegraph entirely (observed repeatedly), which is exactly wrong
- * for conditions the agent can simply work around (use built-in tools for
- * that codebase / pass projectPath). isError is reserved for "stop trying"
- * cases: security refusals ({@link PathRefusalError}) and genuine
- * malfunctions.
+ * Expected, recoverable conditions and the single error classifier live in
+ * `./error-classifier` (so the query worker/pool classify identically without
+ * loading this module); re-exported here because this is where every existing
+ * caller imports them from.
  */
-export class NotIndexedError extends Error {}
-
-/**
- * The Windows/WSL shared-index failure (#995) phrased for the agent. It is an
- * expected condition the USER fixes in their environment, so like
- * {@link NotIndexedError} it answers SUCCESS-shaped — never `isError`, which
- * would teach the agent to abandon codegraph for projects that work fine.
- */
-function wslSharedIndexGuidance(err: WslSharedIndexError): string {
-  return (
-    `${err.message}\n\n` +
-    "If you are an AI agent: codegraph can't read this project's index from WSL until the user " +
-    'makes that change. Use your built-in tools (Read/Grep/Glob) for this task and pass the message ' +
-    "above on to the user — setting CODEGRAPH_DIR and building the index are the user's decisions, " +
-    "so don't do either yourself."
-  );
-}
+export { NotIndexedError, ToolInputError, classifyError } from './error-classifier';
+import {
+  classifyError,
+  inputGuidanceResult,
+} from './error-classifier';
 
 /**
  * A security refusal (sensitive system path). Stays `isError: true` WITHOUT
@@ -120,15 +76,130 @@ function wslSharedIndexGuidance(err: WslSharedIndexError): string {
  * because this is where every existing caller imports it from.
  */
 export { PathRefusalError } from '../errors';
-import { PathRefusalError } from '../errors';
 import { indexedHashInput, readSourceTextSync } from '../file-limits';
 import { LRUCache } from '../resolution/lru-cache';
 
-/** Bound for the per-start-path git caches (worktree mismatch, nested repo). */
-const MCP_PATH_CACHE_MAX = 256;
 /** Bound for the per-file drift memo; entries are only valid for DRIFT_TTL_MS anyway. */
 const DRIFT_CACHE_MAX = 2048;
-import { resolve as resolvePath, relative as relativePath } from 'path';
+import { resolve as resolvePath } from 'path';
+// The tool schemas, explore budgets/allocation/rendering helpers, explore's
+// graph-derived sections, the plain-text tool formatters, response banners and
+// project resolution (ProjectRegistry) live in their own modules; the public
+// names are re-exported here because this is where every existing caller
+// imports them from.
+export { normalizeQuerySpelling } from './explore-query';
+import { filesDefiningSymbol, normalizeQuerySpelling, pathIsProjectFile } from './explore-query';
+export { getExploreBudget, getExploreOutputBudget } from './explore-budget';
+export type { ExploreOutputBudget } from './explore-budget';
+import {
+  type ExploreOutputBudget,
+  getExploreBudget,
+  getExploreOutputBudget,
+} from './explore-budget';
+export {
+  RELEVANCE_KIND_WEIGHT,
+  EXPLORE_ALLOCATION,
+  allocateExploreBudget,
+} from './explore-allocation';
+export type { ExploreAllocationCandidate, ExploreAllocation } from './explore-allocation';
+import {
+  AMBIENT_DECLARATION_RANK_PENALTY,
+  DECLARATION_KINDS,
+  DEFAULT_RELEVANCE_KIND_WEIGHT,
+  EXPLORE_ALLOCATION,
+  GENERATED_RANK_PENALTY,
+  ISOLATED_WEAK_KIND_WEIGHT,
+  LOW_VALUE_RANK_PENALTY,
+  PERIPHERAL_SCORE_CAP,
+  RELEVANCE_KIND_WEIGHT,
+  RELEVANCE_USAGE_EDGES,
+  SCORE_FLOOR_ABSOLUTE,
+  SCORE_FLOOR_FRACTION_OF_TOP,
+  SCORE_FLOOR_KEEP_MIN,
+  SCORE_FLOOR_MAX,
+  TYPE_MEMBER_RELEVANCE_WEIGHT,
+  WEAK_RELEVANCE_KINDS,
+  allocateExploreBudget,
+  isNamedCandidate,
+} from './explore-allocation';
+export {
+  symbolsBetweenRanges,
+  symbolsNotInRanges,
+  formatGapMarker,
+  joinPartsWithNamedGaps,
+  biasHeaderSymbols,
+  EXPLORE_FALLBACK_NOTES,
+  elidedWantedSpans,
+  shortestUniqueSuffixes,
+  exploreCompletenessNotes,
+  fitExploreEpilogue,
+} from './explore-format';
+export type { ExploreWantedSpan, ExplorePartialFile } from './explore-format';
+import {
+  ANCHOR_CALLABLE_KINDS,
+  ANCHOR_LINE_CONTEXT,
+  EXPLORE_FALLBACK_NOTES,
+  type ElidedSymbolRef,
+  type ExplorePartialFile,
+  type ExploreWantedSpan,
+  FILE_SECTION_PREFIX,
+  MAX_BODY_FOCUS_LINES,
+  POINTER_HEADER,
+  POINTER_MAX_FILES,
+  SUMMARY_SENTINEL,
+  adaptiveExploreEnabled,
+  biasHeaderSymbols,
+  elidedWantedSpans,
+  exploreCompletenessNotes,
+  exploreLineNumbersEnabled,
+  fileSectionHeader,
+  fitExploreEpilogue,
+  joinPartsWithNamedGaps,
+  mentionsPath,
+  numberSourceLines,
+  pointerLineFor,
+  roomForLines,
+  symbolsNotInRanges,
+} from './explore-format';
+export { MAX_CACHED_PROJECTS, __setLoadCodeGraphForTests } from './project-registry';
+export type { ProjectLifecycle } from './project-registry';
+import { ProjectRegistry, type ProjectLifecycle } from './project-registry';
+export {
+  formatStaleBanner,
+  formatStaleFooter,
+  formatDegradedBanner,
+  formatRecoveringBanner,
+} from './response-decorators';
+import {
+  formatDegradedBanner,
+  formatRecoveringBanner,
+  formatStaleBanner,
+  formatStaleFooter,
+} from './response-decorators';
+export { tools, getStaticTools } from './tool-definitions';
+export type { ToolDefinition, ToolAnnotations, ToolResult } from './tool-definitions';
+import {
+  DEFAULT_MCP_TOOLS,
+  type ToolDefinition,
+  type ToolResult,
+  tools,
+  withRequiredProjectPath,
+} from './tool-definitions';
+export { coerceToolArgs } from './tool-args';
+import { coerceToolArgs, describeArgValue } from './tool-args';
+import { buildBlastRadiusSection, buildFlowFromNamedSymbols, formatTrail } from './explore-sections';
+import { computeGraphRelevance } from './explore-allocation';
+import {
+  buildContainerOutline,
+  edgeLabel,
+  formatFilesFlat,
+  formatFilesGrouped,
+  formatFilesTree,
+  formatImpact,
+  formatNodeDetails,
+  formatNodeList,
+  formatSearchResults,
+} from './tool-formatters';
 
 /** Maximum output length to prevent context bloat (characters) */
 const MAX_OUTPUT_LENGTH = 15000;
@@ -162,1816 +233,80 @@ const CONTAINER_NODE_KINDS = new Set<NodeKind>([
 
 
 /**
- * Normalize Erlang-native symbol spellings in an explore query into the shapes
- * the rest of the pipeline already understands. Agents working Erlang code
- * name symbols the way the language spells them — `mod:fn/3`, `init/2` — and
- * those tokens previously died in both consumers: the flow-builder's token
- * filter rejects `:` and `/arity` outright, and the search-side field parser
- * eats `mod:fn` as an unknown `field:value`. Measured on cowboy: the agent
- * named `cowboy_stream_h:request_process/3` in two queries, got no body back
- * either time, and fell back to Read.
- *
- *   - `fn/3` → `fn` (arity tail after an identifier; a path segment like
- *     `src/2fa` doesn't match because the tail must be all digits)
- *   - `mod:fn` → `mod.fn` (exactly one colon between identifiers, so it rides
- *     the existing Class.method qualified handling; `::`, URLs, drive letters,
- *     and times don't match, and the query language's own field prefixes —
- *     kind:/lang:/language:/path:/name: — are left alone)
- *
- * Safe cross-language: Lua's `t:m` spelling maps to the same `t.m` its
- * qualified names use, and no other supported spelling contains a bare
- * single-colon identifier pair.
- */
-export function normalizeQuerySpelling(query: string): string {
-  return query
-    .replace(/\b([A-Za-z_][\w@]*)\/(\d{1,3})(?=$|[\s,()[\]/])/g, '$1')
-    .replace(
-      /(^|[\s,()[\]])(?!(?:kind|lang|language|path|name):)([a-z_][\w@]*):([A-Za-z_][\w@]*)(?=$|[\s,()[\]])/g,
-      '$1$2.$3'
-    );
-}
-
-/**
- * Does this query-named span point at a real FILE inside the project?
- *
- * The `existsOnDisk` predicate `extractQueryPaths` takes (that module is pure —
- * no DB, no fs — so the fs access lives here, where the project root is known).
- * Only a REGULAR FILE counts: a directory span (`src/search`) is not a file
- * reference and must keep flowing to the normal matching pipeline. Containment
- * is enforced by `validatePathWithinRoot`, so a `../` span in a query cannot
- * probe outside the project, and every fs error answers `false`.
- */
-function pathIsProjectFile(projectRoot: string, relPath: string): boolean {
-  try {
-    const abs = validatePathWithinRoot(projectRoot, relPath);
-    return abs !== null && statSync(abs).isFile();
-  } catch {
-    return false;
-  }
-}
-
-/** Kinds that name a thing without defining it in the file that holds them. */
-const NOT_A_DEFINITION = new Set(['file', 'import', 'export', 'parameter']);
-
-/**
- * Which indexed files define a symbol spelled like this query token?
- *
- * The `symbolFiles` lookup `extractQueryPaths` takes, split out for the same
- * reason as `pathIsProjectFile`: that module stays DB-free. Exact names only —
- * and the shared matcher for a qualified token (`SQLCompiler.as_sql`) — so it
- * agrees with what explore's named-symbol seeding resolves. Lookup errors
- * answer "none", which leaves the span's pins as they were.
- */
-function filesDefiningSymbol(cg: CodeGraph, symbol: string): string[] {
-  try {
-    const nodes = isQualifiedSymbol(symbol)
-      ? cg.getNodesByName(lastQualifierPart(symbol)).filter((n) => matchesSymbol(n, symbol))
-      : cg.getNodesByName(symbol);
-    return nodes.filter((n) => !NOT_A_DEFINITION.has(n.kind)).map((n) => n.filePath);
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Calculate the recommended number of codegraph_explore calls based on project size.
- * Larger codebases need more exploration calls to cover their surface area,
- * but smaller ones should use fewer to avoid unnecessary overhead.
- */
-export function getExploreBudget(fileCount: number): number {
-  if (fileCount < 500) return 1;
-  if (fileCount < 5000) return 2;
-  if (fileCount < 15000) return 3;
-  if (fileCount < 25000) return 4;
-  return 5;
-}
-
-/**
- * Adaptive output budget for `codegraph_explore`, scaled to project size.
- *
- * Smaller codebases get a tighter total cap, fewer default files, smaller
- * per-file cap, and tighter clustering — so a focused query on a 100-file
- * project doesn't dump a whole file's worth of source into the agent's
- * context. Larger codebases keep the generous defaults because the
- * agent's native discovery cost (grep + find + many Reads) genuinely
- * dwarfs a fat explore call at that scale.
- *
- * Meta-text (relationships map, "additional relevant files" list,
- * completeness signal, budget note) is gated off for tiny projects
- * where one rich call is the whole story and the extra prose is just
- * overhead.
- *
- * Tier breakpoints mirror `getExploreBudget` so a project sits in the
- * same tier across both knobs.
- */
-export interface ExploreOutputBudget {
-  /** Hard cap on total output characters. */
-  maxOutputChars: number;
-  /** Default `maxFiles` when the caller didn't specify one. */
-  defaultMaxFiles: number;
-  /** Cap on contiguous source returned per file (across all its clusters). */
-  maxCharsPerFile: number;
-  /** Cluster gap threshold in lines — tighter clustering on small projects. */
-  gapThreshold: number;
-  /** Max symbols listed in the per-file header (``**`path`** — sym(kind), ...``). */
-  maxSymbolsInFileHeader: number;
-  /** Max edges shown per relationship kind in the Relationships section. */
-  maxEdgesPerRelationshipKind: number;
-  /** Include the "Relationships" section. */
-  includeRelationships: boolean;
-  /** Include the "Additional relevant files (not shown)" trailing list. */
-  includeAdditionalFiles: boolean;
-  /** Include the "Complete source code is included above…" reminder. */
-  includeCompletenessSignal: boolean;
-  /**
-   * Include the advisory exploration-guidance note at the end. Purely
-   * advisory — the server NEVER rejects or rate-limits extra explore calls.
-   */
-  includeBudgetNote: boolean;
-}
-
-export function getExploreOutputBudget(fileCount: number): ExploreOutputBudget {
-  // Tiered budget, scaled to project size. The budget is a CEILING (relevance
-  // still gates WHAT is included), and it MUST stay under the agent's INLINE
-  // tool-result cap (~25K chars). Above that, the host externalizes the result
-  // to a file the agent then Reads back — re-introducing a read AND the
-  // cache-write cost — which is exactly what a 35K vscode explore did in the
-  // n=4 README A/B. So even large repos cap at ~24K: the answer is the handful
-  // of ~100-line flow windows the agent would have grep-located and read (it
-  // natively reads ~6–9 files, median 100-line ranges), NOT a sprawl of 12
-  // files. Concentration onto the flow emerges from this cap + the named-file-
-  // first sort dropping peripheral files. Invariant: a larger tier must never
-  // get a smaller `maxCharsPerFile` than a smaller tier.
-  if (fileCount < 150) {
-    return {
-      // ITER3: revert iter2's aggressive body shrink (forced Read fallback —
-      // the per-file 2.5K cap pushed the agent to Read instead of node).
-      // Back to the iter1 shape (13K/4/3.8K) but keep the test-file
-      // hard-exclude. The cost lever for this tier lives in steering the
-      // agent to stop after 1-2 calls, not in this budget.
-      maxOutputChars: 13000,
-      defaultMaxFiles: 4,
-      maxCharsPerFile: 3800,
-      gapThreshold: 7,
-      maxSymbolsInFileHeader: 5,
-      maxEdgesPerRelationshipKind: 4,
-      includeRelationships: false,
-      includeAdditionalFiles: false,
-      includeCompletenessSignal: false,
-      includeBudgetNote: false,
-    };
-  }
-  if (fileCount < 500) {
-    return {
-      // ITER3: same revert/keep-filter pattern as <150.
-      maxOutputChars: 18000,
-      defaultMaxFiles: 5,
-      maxCharsPerFile: 3800,
-      gapThreshold: 8,
-      maxSymbolsInFileHeader: 6,
-      maxEdgesPerRelationshipKind: 6,
-      includeRelationships: false,
-      includeAdditionalFiles: false,
-      includeCompletenessSignal: false,
-      includeBudgetNote: false,
-    };
-  }
-  if (fileCount < 5000) {
-    return {
-      // ~150-line per-file window (the native read unit) × ~6 files, capped at
-      // the ~24K inline ceiling so the response is never externalized. Per-file
-      // stays ≥ the <500 tier (3800) — monotonic.
-      maxOutputChars: 24000,
-      defaultMaxFiles: 8,
-      maxCharsPerFile: 6500,
-      gapThreshold: 12,
-      maxSymbolsInFileHeader: 10,
-      maxEdgesPerRelationshipKind: 10,
-      includeRelationships: true,
-      includeAdditionalFiles: true,
-      includeCompletenessSignal: true,
-      includeBudgetNote: true,
-    };
-  }
-  // Large + very-large repos: SAME ~24K inline ceiling (a bigger response just
-  // externalizes — see vscode). More files indexed → more CALLS via
-  // getExploreBudget, not a bigger single response. Per-file 7000 (≥ smaller
-  // tiers) gives the central file a ~180-line orientation window.
-  if (fileCount < 15000) {
-    return {
-      maxOutputChars: 24000,
-      defaultMaxFiles: 8,
-      maxCharsPerFile: 7000,
-      gapThreshold: 15,
-      maxSymbolsInFileHeader: 15,
-      maxEdgesPerRelationshipKind: 15,
-      includeRelationships: true,
-      includeAdditionalFiles: true,
-      includeCompletenessSignal: true,
-      includeBudgetNote: true,
-    };
-  }
-  return {
-    maxOutputChars: 24000,
-    defaultMaxFiles: 8,
-    maxCharsPerFile: 7000,
-    gapThreshold: 15,
-    maxSymbolsInFileHeader: 15,
-    maxEdgesPerRelationshipKind: 15,
-    includeRelationships: true,
-    includeAdditionalFiles: true,
-    includeCompletenessSignal: true,
-    includeBudgetNote: true,
-  };
-}
-
-// ── Explore relevance scoring (CG-10 / #1500) ──────────────────────────────
-//
-// A file earns its slice of the explore envelope from the symbols in it that the
-// query matched. Before this weighting every match counted the same per tier, so
-// a file that merely declares a local `const explore` scored what a file that
-// DEFINES the explore pipeline scored — which is how three
-// `scripts/agent-eval/*.mjs` harnesses took 63% of this repo's own "how does
-// explore allocate its output budget across files" response on nothing but a
-// local `explore` and a `BUDGET` constant. Four levers — the first three are
-// multiplicative, so they compose without ordering surprises; the fourth decides
-// admission from the result:
-//
-//   1. KIND      — what a match on this NodeKind actually tells you (below).
-//   2. ISOLATION — a weak-kind symbol nothing calls or references is a pure name
-//                  collision; participation in the graph is the corroboration.
-//   3. PENALTY   — generated / test / i18n files are weaker answers to an
-//                  architecture question at EVERY signal, not just as the
-//                  tiebreak-at-equal-score they used to be.
-//   4. FLOOR     — admission scales with the best file's score, replacing an
-//                  absolute bar that admitted noise wherever the top score was
-//                  high.
-
-/**
- * How strongly a match on a symbol of this kind corroborates that its FILE is
- * what the query is about.
- *
- *   1.0   a callable or a type — the unit an architecture question is about
- *   ~0.5  a member of a type, or the file node itself (a path match, not a
- *         symbol match)
- *   ~0.3  a variable / constant — as often a name collision as a definition
- *   0.15  a parameter — essentially never the subject of a question
- *
- * Unlisted kinds fall back to `DEFAULT_RELEVANCE_KIND_WEIGHT`, so a NodeKind
- * added later is neither free nor fatal.
- */
-export const RELEVANCE_KIND_WEIGHT: Readonly<Record<string, number>> = {
-  // Callables and types: the answer lives in one of these.
-  function: 1, method: 1, class: 1, struct: 1, union: 1, interface: 1, trait: 1,
-  protocol: 1, component: 1, route: 1, enum: 1, type_alias: 1, constructor: 1,
-  // Containers: real structure, but a whole namespace/module matching a term is
-  // a coarser signal than a callable matching it.
-  namespace: 0.8, module: 0.8,
-  // Members of a type: real, weaker on their own.
-  property: 0.5, field: 0.5, enum_member: 0.35,
-  // The file node itself — the path matched, no symbol did.
-  file: 0.5,
-  // Incidental until the graph corroborates them (see ISOLATED_ below).
-  constant: 0.35, variable: 0.3, parameter: 0.15,
-};
-const DEFAULT_RELEVANCE_KIND_WEIGHT = 0.5;
-
-/**
- * The "member of a type" tier of the table above, named so the one kind that
- * cannot be read off `node.kind` can be placed on it: an interface's
- * `method_signature` (#1638). Same value as `property`/`field`, deliberately —
- * it is the same tier, not a new one.
- */
-const TYPE_MEMBER_RELEVANCE_WEIGHT = 0.5;
-
-/**
- * Kinds whose evidentiary value depends on whether anything USES them. An
- * exported `const DEFAULTS` that half the codebase references is a real
- * definition; a `const explore` living inside one function of an eval script is
- * a name collision. Only these kinds pay for the isolation probe.
- */
-const WEAK_RELEVANCE_KINDS: ReadonlySet<string> = new Set([
-  'constant', 'variable', 'parameter', 'field', 'property', 'enum_member',
-]);
-
-/** Weight for a weak-kind symbol with no incoming/outgoing usage edge at all. */
-const ISOLATED_WEAK_KIND_WEIGHT = 0.08;
-
-/**
- * Edges that mean "this symbol is used". `contains` is lexical nesting, not
- * usage — counting it would make every file-scope constant look corroborated,
- * which is exactly the case this guards against.
- */
-const RELEVANCE_USAGE_EDGES: ReadonlySet<string> = new Set([
-  'calls', 'references', 'extends', 'implements', 'overrides',
-  'instantiates', 'returns', 'type_of', 'decorates', 'navigates',
-]);
-
-/**
- * Cap on what PERIPHERAL nodes (in the subgraph, but neither a query match nor
- * adjacent to one) can contribute to a file's score. Uncapped, each such node
- * added a flat +1, so a file grew more "relevant" simply by being bigger —
- * `parse-session.mjs` reached score 22 off ONE incidental constant plus twelve
- * unrelated symbols. Size is not evidence; cap its contribution.
- */
-const PERIPHERAL_SCORE_CAP = 5;
-
-/**
- * Rank penalties, applied to BOTH the relevance score and the graph mass.
- *
- * Generated source used to be a tiebreak at equal score only, so a generated
- * file that outscored the hand-written one still won — the #1500 report exactly:
- * the FKIT CRUD layer carries every query term AND more graph mass than the
- * use-case that implements the business rule. A multiplier demotes it on the
- * PRIMARY sort key instead, without ever hard-excluding it (ask about the
- * generated API by name and the named-seed tier still puts it first). It is
- * self-normalizing: in an all-generated repo everything scales together and
- * relative ranking is untouched.
- */
-const GENERATED_RANK_PENALTY = 0.3;
-/**
- * Test/spec/icon/i18n files. These are normally hard-excluded outright, but that
- * filter stands down when fewer than 2 non-low-value candidates remain (else
- * tests would be the only signal for the area). This is the softened form for
- * that case: down-weighted rather than removed.
- */
-const LOW_VALUE_RANK_PENALTY = 0.5;
-/**
- * Ambient declaration files — a hand-written `.d.ts` of global shims, vendored
- * typings, module augmentation (CG-28). Declares nothing but types, and nothing
- * in the index depends on it.
- *
- * Such a file cannot answer a FLOW question no matter how much its identifiers
- * overlap the query: no bodies, no call edges, no behaviour, and nothing typed
- * by it. Its ceiling of usefulness is a type signature, and one follow-up
- * explore fetches that. But the identifiers it declares are exactly the generic
- * ones a prose question uses (`Body`, `Message`, `ImageMetadata`,
- * `ReadableStream`), so on term overlap it out-scores the implementation and
- * takes the envelope — measured at rank #1 and 51% of delivered source, with
- * the flow's own entry file getting none.
- *
- * Softer than {@link GENERATED_RANK_PENALTY} on purpose: "generated" is a claim
- * about provenance the file itself makes, while this is an inference about what
- * a file can be USEFUL for. A demoted declaration file that is still the best
- * candidate should keep its place; the penalty only has to stop it beating real
- * implementation. It does NOT stack with the generated penalty (see rankPenalty)
- * — penalising twice for the same property is how a file gets cliffed out of
- * answers where it is genuinely relevant.
- */
-const AMBIENT_DECLARATION_RANK_PENALTY = 0.5;
-/**
- * The type-level NodeKinds. Must stay in step with the kind list in
- * `QueryBuilder.getAmbientDeclarationPathsAmong` — that query decides which
- * files are ambient declarations, this set decides which symbols in them the
- * agent can name to lift the penalty back off.
- */
-const DECLARATION_KINDS = new Set(['interface', 'type_alias', 'enum', 'enum_member', 'namespace']);
-
-/**
- * Score floor: `clamp(topScore * FRACTION, ABSOLUTE, MAX)`.
- *
- * An absolute floor alone (`>= 3`) admits noise on any repo where the top file
- * scores 50+, so the bar is now a FRACTION of the best file's score and scales
- * with how strong the best match is. On a diffuse survey question no file
- * dominates, every candidate sits near the top score, and the whole spread gets
- * through; on a precise question it cuts the long tail of incidental matches.
- *
- * ABSOLUTE is recalibrated for kind-weighted scores: the old `>= 3` assumed an
- * unweighted tier sum where any query match was worth 10. A file whose sole
- * match is an unused local constant now scores 0.8, so 3 had quietly become a
- * much harsher admission bar than it was written to be — and the relative floor
- * is what this change means to prune with anyway.
- */
-const SCORE_FLOOR_ABSOLUTE = 1;
-const SCORE_FLOOR_FRACTION_OF_TOP = 0.2;
-/**
- * Ceiling on the relative floor, in units of one direct query match on a
- * callable (the `entryNodeIds` tier, weight 1.0). A single full-strength match
- * is never incidental, so no amount of concentration elsewhere may exclude it:
- * one named-seed-heavy file (`+50` per seed) otherwise pushed the floor to 21
- * and dropped `BridgeInterceptor`'s file, which the agent had named — a class,
- * so it entered at the +10 tier rather than +50. The #1500 noise this change
- * targets scores 0.8–6, well under this ceiling.
- */
-const SCORE_FLOOR_MAX = 10;
-/**
- * The relative floor must never starve a question of candidates: if it would
- * leave fewer than this, backfill with the best-scoring ones it cut. The cost of
- * under-serving is the agent calling explore again — a whole round-trip. See the
- * backfill itself for the two strengths it runs at (thin vs. empty).
- */
-const SCORE_FLOOR_KEEP_MIN = 3;
-
-// ── Score-proportional byte allocation (CG-12 / #1500) ─────────────────────
-//
-// The score floor above decides WHICH files reach the response. This decides how
-// the byte envelope is SPLIT among them — and until this existed, it wasn't
-// really decided at all: every admitted file was capped at the same
-// `maxCharsPerFile`, and the whole-file rule handed anything under
-// `maxCharsPerFile * 3` its entire contents. So allocation followed FILE SIZE,
-// not relevance. On this repo's own "how does explore allocate its output budget
-// across files", `src/mcp/tools.ts` (score 41, 4x the graph mass, 3x the distinct
-// term hits — it literally holds the allocator) was clipped at 3,800 while a
-// score-18 file shipped whole at 5,672 and took 51% of the envelope, purely for
-// being small. On the #1500 Go fixture, two generated CRUD files shipped whole at
-// ~4.5K each and consumed the tier's 4 file slots, so `BuildPayslip` — the
-// hand-written half of "create and calculate payslips" — never appeared at all.
-//
-// The replacement: reserve each file a share of the envelope proportional to what
-// it is worth, up front, before anything renders. Three consequences:
-//
-//   1. A reservation is a GUARANTEE, not a race. The old loop spent the envelope
-//      first-come-first-served in rank order, so the top two files could exhaust
-//      it and every later file hit a `budget-90pct` skip regardless of merit.
-//   2. A file below the cliff gets ZERO source — its path, symbols and line
-//      numbers only. It costs ~100 chars instead of ~4,500, and (crucially) it
-//      does not consume a `maxFiles` slot, so the slot goes to a file that earns
-//      its bytes. This is the concentration lever.
-//   3. The per-file cap stops being the primary guard. It survives only as
-//      `ALLOC_MAX_SHARE`, a safety valve against a single god-file — which the
-//      proportional split already bounds, since a file's share can't exceed its
-//      weight share.
-export const EXPLORE_ALLOCATION = {
-  /**
-   * A file whose weight is under this fraction of the top file's gets no source.
-   *
-   * Calibrated between the two shapes the fixtures pin: the #1500 generated CRUD
-   * lands at 10–11% of the top weight (penalised twice — once into the score by
-   * `rankPenalty`, once again here) and must cliff; a genuinely peripheral but
-   * hand-written flow file — `payslip_builder.go`, the direct callee of the
-   * workflow entry — lands at 25% and must NOT. Everything in between is a
-   * judgement call the agent can undo for ~0 cost, because a cliffed file is
-   * still NAMED in the response and one follow-up explore fetches it.
-   */
-  CLIFF_FRACTION: 0.15,
-  /**
-   * Ceiling on the cliff, in the same units as `SCORE_FLOOR_MAX` — and for the
-   * same reason. A file whose weight clears a full-strength direct match is never
-   * incidental, so no amount of concentration elsewhere may zero it: one
-   * overwhelming top file (a 99-scoring god-file among score-10 peers) otherwise
-   * puts the cliff at 14.9 and silences every peer the score floor had just
-   * deliberately admitted. The cliff is a RELATIVE prune of weak evidence, not a
-   * second admission gate — the score floor already owns admission.
-   */
-  CLIFF_MAX: SCORE_FLOOR_MAX,
-  /**
-   * Floor on a useful reservation — every admitted file gets this much before
-   * the proportional split divides the rest. Under it a slice can't hold one
-   * complete method, and a fragment is strictly worse than a pointer: it forces
-   * the Read this tool exists to prevent.
-   *
-   * It is a FLOOR, not a second cliff. Cliffing the starved file instead
-   * cascades: removing the smallest raises everyone else's share by so little
-   * that the next-smallest starves too, and a query with two dominant files ate
-   * six legitimately-ranked peers one at a time. Concentration is the relative
-   * cliff's job; this only keeps a served file's slice usable.
-   */
-  MIN_CHARS: 700,
-  /**
-   * Safety valve, as a fraction of the envelope. Not the primary guard any more —
-   * the proportional split is — so this only has to stop a pathological
-   * single-file response.
-   *
-   * It does not apply to a file the query NAMED — one that defines a symbol the
-   * query spelled, or that the query named by path. The valve hedges against a
-   * mis-ranked dominant file, and a file the agent asked for by name is not
-   * one. It also never redistributed: a clamped file's excess was simply left
-   * unreserved, and the carry-forward only moves reservations, so nobody could
-   * spend it. On express, "response.js res.send res.json res.render …" admits
-   * one file, clamps it at 9,100 with 3,700 of the pool unreserved, and cuts
-   * the named `send` body at 55 of 97 lines in a 10.9K response to a 13K budget.
-   */
-  MAX_SHARE: 0.7,
-  /**
-   * Markdown overhead charged per rendered file (header + fences + blank lines),
-   * matching the render loop's own `+ 200` accounting. Held out of the pool
-   * before the split so the reservations plus their overhead fit the envelope —
-   * without this the last file's reservation is always the one that doesn't fit.
-   */
-  FILE_OVERHEAD: 200,
-  /**
-   * Flow-spine files are weighted up and are exempt from the cliff. Clipping the
-   * spine causes the Read fallback (it IS the answer to a flow question);
-   * clipping a peripheral file does not. This makes the existing advisory spine
-   * handling — `hasSpine`, `SPINE_CEILING` — strict at the allocation layer.
-   */
-  SPINE_WEIGHT_BOOST: 2,
-  /**
-   * Slack allowed on the whole-file rule: a file a little over its reservation
-   * still ships WHOLE rather than as clusters, because slicing off that last
-   * sliver saves ~1% of the envelope and costs a Read — the trade the whole-file
-   * rule exists to refuse. Proportional (with an absolute ceiling) because a
-   * "sliver" is relative: a flat 800 is 15% of a 5K reservation but 31% of a 2.5K
-   * one, and at the small end that overshoot is exactly what the file below then
-   * loses.
-   */
-  WHOLE_FILE_GRACE_FRACTION: 0.15,
-  WHOLE_FILE_GRACE_MAX: 800,
-  /**
-   * A reservation that already covers this fraction of a file BUYS THE WHOLE
-   * FILE (CG-21), even though the file is bigger than the reservation.
-   *
-   * The grace above is calibrated as a *sliver* — it only rescues a file that
-   * essentially fits. Below it there is a hole the render loop cannot fill:
-   * express's `lib/utils.js` (5,293 B) was the TOP-ranked file, reserved 3,870,
-   * declined the whole-file render at a 4,450 grace bound, and then spent 583 on
-   * a three-symbol cluster render. The other 3,287 chars of its reservation were
-   * neither redistributed nor delivered — the envelope shrank by a third against
-   * an unchanged budget and the agent Read the file back four times.
-   *
-   * So the rule is not "does the file fit the reservation" but "has the
-   * reservation already bought most of the file": at 0.6 the loop pays at most
-   * two-thirds of a reservation extra to avoid losing the whole thing, and it
-   * spends bytes it was going to spend anyway on a file that already earned
-   * them. Below the fraction the shortfall is real — the file is several times
-   * its reservation, clustering is the right answer, and the carry-forward
-   * (`reservedSoFar`/`sourceSpent` in the render loop) hands whatever it cannot
-   * spend to the next file down.
-   */
-  WHOLE_FILE_BUY_FRACTION: 0.6,
-  /**
-   * The buy rule's overshoot is funded from ONE pool for the whole response,
-   * sized as this fraction of the envelope — deliberately the same 15% as
-   * `WHOLE_FILE_GRACE_FRACTION`, one level up: the grace is a sliver of a
-   * FILE's reservation, this is a sliver of the RESPONSE's envelope.
-   *
-   * Per-file funding is the version that fails, and it fails the same way the
-   * bug being fixed does. The merit test is a RATIO, so wherever several files
-   * sit near it they all qualify, and N independent overshoots inflate the
-   * response until the render ceiling drops whatever is last. Measured on the
-   * #1500 payroll fixture: three files bought whole and `payslip_builder.go` —
-   * the file that computes the payslip the question asks about, rank #6 — was
-   * dropped entirely so three higher-ranked files could each ship their final
-   * sliver. A dropped section is strictly worse than a clustered one, so one
-   * shared pool, spent in rank order, is the bound that matters.
-   */
-  WHOLE_FILE_BUY_OVERSHOOT_FRACTION: 0.15,
-} as const;
-
-/** One candidate file's allocation inputs, in final rank order. */
-export interface ExploreAllocationCandidate {
-  path: string;
-  /** Post-`rankPenalty` relevance score from the ranking pass. */
-  score: number;
-  /**
-   * How much this file's BYTES are worth, independent of how well it matched.
-   * Ranking answers "is this file about the query"; allocation answers "will
-   * these bytes teach the agent anything". Generated CRUD can legitimately rank
-   * (it name-collides on every domain word) while its bytes stay mechanical
-   * boilerplate the agent gains nothing from reading — so `rankPenalty` is
-   * applied a SECOND time here. That is what finally sinks the #1500 generated
-   * layer below the cliff: it survived CG-10's single penalty because the sort's
-   * leading keys (entry-point, graph mass) are structural, and a big densely
-   * self-referential generated file scores well on both.
-   */
-  worth: number;
-  /**
-   * Carries a symbol on the rendered flow spine — or an exact target (a
-   * qualified name, a line anchor), which is the answer by the same argument.
-   */
-  spine: boolean;
-  /**
-   * The query named this file by PATH (see query-paths.ts). Pinned files are
-   * never cliffed or trimmed, and weigh at least as much as the strongest
-   * candidate — the agent asked for the file itself, so starving it on text/
-   * graph scores (which a pure-path query doesn't produce) defeats the ask.
-   */
-  pinned?: boolean;
-  /**
-   * The query named a symbol this file defines (the named-first sort tier). Like
-   * a pinned file, it is exempt from the `MAX_SHARE` valve: its proportional
-   * share stands, bounded only by the pool.
-   */
-  named?: boolean;
-}
-
-export interface ExploreAllocation {
-  /** path → chars of source it may render. Only holds admitted files. */
-  allowances: Map<string, number>;
-  /** Files the cliff zeroed, in rank order — pointers, not bytes. */
-  cliffed: string[];
-  /** The weight threshold the cliff fired at (0 when nothing was cliffed). */
-  cliffAt: number;
-  /** Chars actually split among the admitted files. */
-  pool: number;
-}
-
-/** A file the query asked for by name — a symbol it defines, or its path. */
-function isNamedCandidate(c: Pick<ExploreAllocationCandidate, 'named' | 'pinned'>): boolean {
-  return c.named === true || c.pinned === true;
-}
-
-/**
- * Split `budget.maxOutputChars` across ranked candidates in proportion to
- * relevance, with a hard relative cliff.
- *
- * `candidates` must arrive in FINAL RANK ORDER — `maxFiles` is applied to the
- * survivors of the cliff, in that order, so cliffing genuinely hands a slot to
- * the next file down rather than leaving it unused.
- *
- * Tier invariant (`getExploreOutputBudget`): a larger tier must never allow less
- * per file than a smaller one. It holds here by construction — every bound is a
- * fraction of `maxOutputChars` or of `maxCharsPerFile`, both monotonic across
- * tiers — except `MIN_CHARS`, which is an absolute floor and so identical at
- * every tier.
- */
-export function allocateExploreBudget(
-  candidates: readonly ExploreAllocationCandidate[],
-  budget: ExploreOutputBudget,
-  maxFiles: number,
-): ExploreAllocation {
-  const A = EXPLORE_ALLOCATION;
-  const empty: ExploreAllocation = { allowances: new Map(), cliffed: [], cliffAt: 0, pool: 0 };
-  if (candidates.length === 0) return empty;
-
-  // A non-finite weight is treated as no evidence rather than propagated: an
-  // Infinity score would otherwise make every share `Infinity/Infinity` = NaN and
-  // hand the render loop a NaN allowance. Scores are finite sums in the real
-  // pipeline, so this only has to fail safe.
-  const weightOf = (c: ExploreAllocationCandidate) => {
-    const w = Math.max(0, c.score) * Math.max(0, Math.min(1, c.worth)) * (c.spine ? A.SPINE_WEIGHT_BOOST : 1);
-    return Number.isFinite(w) ? w : 0;
-  };
-
-  // Pinned files weigh at least as much as the strongest raw candidate: their
-  // score is whatever the stripped query happened to match (for a pure-path
-  // query, nearly nothing), and a proportional split on that would fund the
-  // named file worst of all. Floor of 1 covers the all-pinned/zero-score case.
-  const rawWeights = new Map(candidates.map((c) => [c.path, weightOf(c)]));
-  const topRaw = Math.max(...rawWeights.values());
-  const weights = new Map(candidates.map((c) => [
-    c.path,
-    c.pinned ? Math.max(rawWeights.get(c.path) ?? 0, topRaw, 1) : (rawWeights.get(c.path) ?? 0),
-  ]));
-  const topWeight = Math.max(...weights.values());
-  if (!(topWeight > 0)) return empty;
-
-  // Cliff over the WHOLE candidate list, before `maxFiles` — otherwise the file
-  // cap fills with cliff-bound files and the slot they free is never handed on.
-  const cliffAt = Math.min(topWeight * A.CLIFF_FRACTION, A.CLIFF_MAX);
-  const cliffed: string[] = [];
-  let admitted: ExploreAllocationCandidate[] = [];
-  for (const c of candidates) {
-    if (!c.spine && !c.pinned && (weights.get(c.path) ?? 0) < cliffAt) cliffed.push(c.path);
-    else admitted.push(c);
-  }
-  // Never cliff every candidate: an empty response costs a whole round-trip.
-  if (admitted.length === 0) {
-    admitted = [candidates[0]!];
-    cliffed.splice(cliffed.indexOf(candidates[0]!.path), 1);
-  }
-  for (const c of admitted.slice(maxFiles)) cliffed.push(c.path);
-  admitted = admitted.slice(0, maxFiles);
-
-  // Serve fewer files well rather than many badly: the envelope has to afford
-  // MIN_CHARS for everything admitted. When it can't, cliff the lowest-weight
-  // files (never a spine file, never the last one) in one deterministic trim —
-  // not one at a time, which is how the old starvation rule snowballed.
-  const affordable = Math.max(1, Math.floor(budget.maxOutputChars / (A.MIN_CHARS + A.FILE_OVERHEAD)));
-  if (admitted.length > affordable) {
-    const byWeight = [...admitted].sort((a, b) => (weights.get(b.path) ?? 0) - (weights.get(a.path) ?? 0));
-    const keep = new Set(byWeight.slice(0, affordable).map((c) => c.path));
-    for (const c of admitted) if (c.spine || c.pinned) keep.add(c.path);
-    for (const c of admitted) if (!keep.has(c.path)) cliffed.push(c.path);
-    admitted = admitted.filter((c) => keep.has(c.path));
-  }
-
-  const allowances = new Map<string, number>();
-  const pool = Math.max(0, budget.maxOutputChars - A.FILE_OVERHEAD * admitted.length);
-  const total = admitted.reduce((s, c) => s + (weights.get(c.path) ?? 0), 0);
-  if (total <= 0 || admitted.length === 0) return { allowances, cliffed, cliffAt, pool };
-  // Everyone gets MIN_CHARS; the REMAINDER is what splits by weight. The floor
-  // is what keeps a diffuse survey question returning a useful spread, and the
-  // remainder is what concentrates a precise one — the top file's slice grows
-  // with its weight share, uncapped by any flat per-file limit.
-  const ceiling = Math.round(budget.maxOutputChars * A.MAX_SHARE);
-  const floors = Math.min(pool, A.MIN_CHARS * admitted.length);
-  const remainder = Math.max(0, pool - floors);
-  // Both parts FLOOR: a sum of rounded shares can exceed the remainder that fed
-  // it (by up to half a char per file), and the reservations must fit the pool
-  // exactly — the render loop spends them, so an over-allocation is an over-long
-  // response the hard ceiling then has to truncate. Flooring costs at most one
-  // char per file.
-  // The valve spares a file the query named (see MAX_SHARE): its share is already
-  // a slice of `pool`, so the reservations still fit the pool exactly.
-  for (const c of admitted) {
-    const share = Math.floor(floors / admitted.length)
-      + Math.floor((remainder * (weights.get(c.path) ?? 0)) / total);
-    allowances.set(c.path, isNamedCandidate(c) ? share : Math.min(share, ceiling));
-  }
-  return { allowances, cliffed, cliffAt, pool };
-}
-
-/**
- * Whether `codegraph_explore` should prefix source lines with their line
- * numbers (cat -n style: `<num>\t<code>`).
- *
- * Line numbers let the agent cite `file:line` straight from the explore
- * payload instead of re-Reading the file just to find a line number — the
- * dominant residual cost on precise-tracing questions (#185 follow-up).
- *
- * Defaults ON. Set `CODEGRAPH_EXPLORE_LINENUMS=0` to disable (used by the
- * A/B harness to measure the payload-cost vs. read-savings tradeoff).
- */
-function exploreLineNumbersEnabled(): boolean {
-  return process.env.CODEGRAPH_EXPLORE_LINENUMS !== '0';
-}
-
-/**
- * Adaptive explore sizing (default ON). `codegraph_explore` skeletonizes OFF-SPINE
- * polymorphic-sibling files — a file whose class is one of ≥3 interchangeable
- * implementations of a shared interface (e.g. OkHttp's `: Interceptor` classes) —
- * to class + member signatures (bodies elided), keeping the on-spine exemplar full.
- * This sizes the response to the answer instead of the budget cap on sibling-heavy
- * flows (OkHttp interceptor-chain explore 28.5k→16.6k, ~28% cheaper than native
- * search, reads flat). It is PROVABLY INERT elsewhere: distinct pipeline steps (no
- * ≥3-implementer supertype, e.g. Excalidraw's `renderStaticScene`) and on-spine
- * files keep full source — output is byte-identical to shipped on excalidraw /
- * tokio / django / vscode / gin. Set `CODEGRAPH_ADAPTIVE_EXPLORE=0` to disable.
- */
-function adaptiveExploreEnabled(): boolean {
-  return process.env.CODEGRAPH_ADAPTIVE_EXPLORE !== '0' && process.env.CODEGRAPH_ADAPTIVE_EXPLORE !== 'false';
-}
-
-/**
- * How long the FIRST tool call waits on the post-open catch-up reconcile before
- * giving up and serving anyway (issue #905). On a normal repo the reconcile
- * finishes in well under this, so the gate is fully honored and nothing changes.
- * On a very large repo (~100k files) the reconcile takes minutes — blocking the
- * first call on all of it presents as a multi-minute hang — so we wait briefly
- * for a clean answer, then serve and let the reconcile finish in the background
- * (it yields to the event loop, so a concurrent read still runs).
- *
- * `CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS` overrides the default; `0` restores the
- * old unbounded-wait behavior (always block until the reconcile completes).
- */
-const DEFAULT_CATCHUP_GATE_TIMEOUT_MS = 3000;
-function resolveCatchUpGateTimeoutMs(): number {
-  const raw = process.env.CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS;
-  if (raw === undefined || raw === '') return DEFAULT_CATCHUP_GATE_TIMEOUT_MS;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n < 0) return DEFAULT_CATCHUP_GATE_TIMEOUT_MS;
-  return Math.floor(n);
-}
-
-/**
- * Prefix each line of a source slice with its 1-based line number, matching
- * the Read tool's `cat -n` convention (number + tab) so the agent treats it
- * the same way it treats Read output.
- *
- * @param slice  contiguous source text (already extracted from the file)
- * @param firstLineNumber  the 1-based line number of the slice's first line
- */
-function numberSourceLines(slice: string, firstLineNumber: number): string {
-  const out: string[] = [];
-  const split = slice.split('\n');
-  for (let i = 0; i < split.length; i++) {
-    out.push(`${firstLineNumber + i}\t${split[i]}`);
-  }
-  return out.join('\n');
-}
-
-/**
- * Unique line-prefix for a per-file source section in codegraph_explore output.
- * Issue #778: tool results dropped ATX headings (`####`, `##`, `###`) for bold
- * labels so Markdown-rendering MCP clients (e.g. the Claude Code VSCode
- * extension) stop blowing every header up to H1–H4. The path is bold + a code
- * span so it still reads as a header, and the leading ``**` `` stays a UNIQUE,
- * greppable marker — no other explore line begins with it — that the explore
- * truncation boundary (`handleExplore`) keys off to cut on whole file sections.
- */
-const FILE_SECTION_PREFIX = '**`';
-// Placeholder for codegraph_explore's "Found N symbols across M files." line.
-// The honest N/M can only be known after the final truncation drops trailing
-// sections (#1046), so the header is emitted as this sentinel and substituted
-// at the very end. This bracketed token never occurs in rendered source or a
-// file path, so the final string-replace can't collide.
-const SUMMARY_SENTINEL = '[[codegraph-explore-summary]]';
-function fileSectionHeader(filePath: string, suffix: string): string {
-  return suffix
-    ? `${FILE_SECTION_PREFIX}${filePath}\`** — ${suffix}`
-    : `${FILE_SECTION_PREFIX}${filePath}\`**`;
-}
-
-/** Header of `codegraph_explore`'s trailing pointer list. */
-const POINTER_HEADER = '**Not shown above — explore these names for their source**';
-/** Most files the pointer list ever names one-per-line; the rest are a count. */
-const POINTER_MAX_FILES = 10;
-/**
- * How many elided-in-file symbols a gap marker or biased header names (#1711).
- * Kept small: the names exist so a follow-up explore has a target, not so the
- * meta-text rivals the source it is pointing at.
- */
-const ELIDED_SYMBOL_CAP = 6;
-
-/**
- * Kinds a single-line anchor (`compiler.py:776`) resolves to: the innermost
- * one containing the line is the symbol the agent is pointing at. A class
- * enclosing the line is deliberately NOT a target — it spans most of its file,
- * and "the whole class" is not what a line number asks for.
- */
-const ANCHOR_CALLABLE_KINDS = new Set(['method', 'function', 'constructor', 'component']);
-/** Lines either side of a single-line anchor that no callable encloses. */
-const ANCHOR_LINE_CONTEXT = 15;
-
-/**
- * Most windows one oversize exact / named-spine body is cut into in the
- * focused view: the head plus the call sites into the other symbols the
- * question named. More turns a method into confetti.
- */
-const MAX_BODY_FOCUS_LINES = 6;
-
-type ElidedSymbolRef = { name: string; kind: string; startLine: number };
-
-/**
- * Indexed symbols whose definition starts strictly between two rendered
- * spans. The hole is what a trim dropped; naming them is what lets the agent
- * follow up by name instead of guessing (#1711).
- */
-export function symbolsBetweenRanges(
-  nodes: ReadonlyArray<{ name: string; kind: string; startLine: number; endLine: number }>,
-  fromEnd: number,
-  toStart: number,
-): ElidedSymbolRef[] {
-  if (toStart <= fromEnd + 1) return [];
-  const out: ElidedSymbolRef[] = [];
-  const seen = new Set<string>();
-  for (const n of nodes) {
-    if (n.kind === 'import' || n.kind === 'export') continue;
-    if (n.startLine <= fromEnd || n.startLine >= toStart) continue;
-    if (seen.has(n.name)) continue;
-    seen.add(n.name);
-    out.push({ name: n.name, kind: n.kind, startLine: n.startLine });
-  }
-  out.sort((a, b) => a.startLine - b.startLine);
-  return out;
-}
-
-/**
- * Symbols in `candidates` whose start line is not covered by any emitted range.
- * Used to bias the per-file header toward what the trim dropped (#1711).
- */
-export function symbolsNotInRanges(
-  candidates: ReadonlyArray<ElidedSymbolRef>,
-  ranges: ReadonlyArray<ExploreLineRange>,
-): ElidedSymbolRef[] {
-  if (ranges.length === 0) return [...candidates].sort((a, b) => a.startLine - b.startLine);
-  const out: ElidedSymbolRef[] = [];
-  const seen = new Set<string>();
-  for (const n of candidates) {
-    if (seen.has(n.name)) continue;
-    if (ranges.some((r) => n.startLine >= r.start && n.startLine <= r.end)) continue;
-    seen.add(n.name);
-    out.push(n);
-  }
-  out.sort((a, b) => a.startLine - b.startLine);
-  return out;
-}
-
-const BARE_GAP_MARKER = '\n\n... (gap) ...\n\n';
-
-/**
- * Gap marker between two non-contiguous slices of one file.
- *
- * Bare `... (gap) ...` told the agent something was missing but not WHAT —
- * and the footer then asked it to re-explore "with its exact name", which is
- * circular when the missing names *are* the question (#1711). When the hole
- * holds indexed symbols, list them as `name (file:line)` (same shape the
- * flow / blast-radius lines already use).
- */
-export function formatGapMarker(
-  filePath: string,
-  elided: ReadonlyArray<ElidedSymbolRef>,
-): string {
-  if (elided.length === 0) return BARE_GAP_MARKER;
-  const shown = elided.slice(0, ELIDED_SYMBOL_CAP);
-  const more = elided.length - shown.length;
-  const names = shown.map((s) => `${s.name} (${filePath}:${s.startLine})`).join(', ')
-    + (more > 0 ? `, +${more} more` : '');
-  return `\n\n... (gap: ${names}) ...\n\n`;
-}
-
-/**
- * Join rendered parts with gap markers that name whatever the trim skipped.
- *
- * `spareChars` is what naming may cost beyond bare markers. Cluster selection
- * prices every join between clusters as a bare marker, and on a long path each
- * named gap runs to several hundred chars, so unbounded naming overran the
- * file's reservation and the ceiling trim then dropped SOURCE to pay for the
- * names: vscode's `rpcProtocol.ts` went from ~5,200 chars of the RPCProtocol
- * body to a 222-char stub. A gap the spare can't cover stays bare; the file
- * header still lists the symbols the trim dropped.
- */
-export function joinPartsWithNamedGaps(
-  filePath: string,
-  parts: ReadonlyArray<{ range: ExploreLineRange; text: string }>,
-  nodes: ReadonlyArray<{ name: string; kind: string; startLine: number; endLine: number }>,
-  spareChars = Infinity,
-): string {
-  if (parts.length === 0) return '';
-  let out = parts[0]!.text;
-  let spare = spareChars;
-  for (let i = 1; i < parts.length; i++) {
-    const prev = parts[i - 1]!;
-    const next = parts[i]!;
-    const named = formatGapMarker(filePath, symbolsBetweenRanges(nodes, prev.range.end, next.range.start));
-    const extra = named.length - BARE_GAP_MARKER.length;
-    if (extra <= spare) {
-      out += named;
-      spare -= extra;
-    } else {
-      out += BARE_GAP_MARKER;
-    }
-    out += next.text;
-  }
-  return out;
-}
-
-/**
- * Prefer symbols the trim dropped when filling the per-file header's named
- * slots, so `+N more` is less likely to hide the answer (#1711). Frequency
- * still breaks ties among the preferred / remaining groups.
- */
-export function biasHeaderSymbols(
-  symbols: readonly string[],
-  elided: ReadonlyArray<ElidedSymbolRef>,
-  cap: number,
-): { shown: string[]; omitted: number } {
-  const elidedLabels = elided.map((s) => `${s.name}(${s.kind})`);
-  const elidedSet = new Set(elidedLabels);
-  const elidedNames = new Set(elided.map((s) => s.name));
-  const counts = new Map<string, number>();
-  for (const s of symbols) counts.set(s, (counts.get(s) ?? 0) + 1);
-  // Also surface elided symbols that never made it into `symbols` (a dropped
-  // cluster's members are absent from assembleSection's list today).
-  for (const label of elidedLabels) {
-    if (!counts.has(label)) counts.set(label, 1);
-  }
-  // Earlier elided defs first (elided is startLine-sorted) so the header's
-  // named slots track source order through the hole rather than alphabetical
-  // filler (`calls0` beating `syncStateNow`).
-  const elidedRank = new Map<string, number>();
-  elided.forEach((s, i) => {
-    elidedRank.set(`${s.name}(${s.kind})`, i);
-    if (!elidedRank.has(s.name)) elidedRank.set(s.name, i);
-  });
-  const score = (label: string): [number, number, number] => {
-    const name = label.replace(/\(.*\)$/, '');
-    const preferred = elidedSet.has(label) || elidedNames.has(name) ? 1 : 0;
-    const rank = elidedRank.get(label) ?? elidedRank.get(name) ?? 9999;
-    return [preferred, counts.get(label) ?? 0, -rank];
-  };
-  const sorted = [...counts.keys()].sort((a, b) => {
-    const [pa, ca, ra] = score(a);
-    const [pb, cb, rb] = score(b);
-    return pb - pa || cb - ca || rb - ra || a.localeCompare(b);
-  });
-  const shown = sorted.slice(0, cap);
-  return { shown, omitted: Math.max(0, sorted.length - shown.length) };
-}
-
-/**
- * One pointer line: the file plus enough symbol names to make it NAMEABLE in a
- * follow-up explore. Capped — an un-capped list ran to ~1.9K on the #1500
- * fixture (12 generated CRUD symbols on one line), meta-text bought at the
- * price of the source bytes this section exists to point away from.
- */
-function pointerLineFor(filePath: string, nodes: readonly Node[]): string {
-  const POINTER_SYMBOLS = 6;
-  const named = nodes.filter((n) => n.kind !== 'import' && n.kind !== 'export');
-  const pool = named.length > 0 ? named : nodes;
-  const shown = pool.slice(0, POINTER_SYMBOLS);
-  const more = pool.length - shown.length;
-  const symbols = shown.map((n) => `${n.name}:${n.startLine}`).join(', ')
-    + (more > 0 ? `, +${more} more` : '');
-  return `- ${filePath}: ${symbols}`;
-}
-/**
- * Emitted when the response was too full to carry ANY of its pointer list. It
- * is the one line the epilogue floor is reserved for: the list itself can be
- * traded away, but the agent must still be told that an uncovered area exists
- * and that another explore — not a Read — is how to reach it.
- */
-const EPILOGUE_LOST_NOTE = '> (Trailing pointer list omitted for size. The source above is complete and verbatim — treat it as already Read. For anything this call did not cover, run another codegraph_explore with the specific names rather than reading those files.)';
-/**
- * The notes that stand in for the epilogue, or close a truncated response, in
- * two wordings each. `complete` says the source above is complete; `trimmed` is
- * used when a section it vouches for was trimmed (see `elidedWantedSpans`) and
- * drops that claim, keeping the guarantee that is still true. Each trimmed
- * wording is no longer than its complete one: the epilogue floor (`lost`) and
- * the cut note's fit test (`cut`) are sized before the render knows which of the
- * two it will need.
- */
-export const EXPLORE_FALLBACK_NOTES = {
-  lost: {
-    complete: EPILOGUE_LOST_NOTE,
-    trimmed: '> (Trailing pointer list omitted for size. The source above is verbatim — treat it as already Read. For symbols its gap markers name, and anything else not covered, run another codegraph_explore with those names rather than reading.)',
-  },
-  cut: {
-    complete: '\n\n> (Trailing notes omitted for size. The source above is complete and verbatim — treat it as already Read. For anything this call did not cover, run another codegraph_explore with the specific names rather than reading those files.)',
-    trimmed: '\n\n> (Trailing notes omitted for size. The source above is verbatim — treat it as already Read. For symbols its gap markers name, and anything else not covered, run another codegraph_explore with those names rather than reading.)',
-  },
-  truncated: {
-    complete: '\n\n... (output truncated to budget; the source above is complete and verbatim — treat it as already Read. For any area not covered, run another codegraph_explore with the specific names — do NOT Read these files.)',
-    trimmed: '\n\n... (output truncated to budget; the source above is verbatim — treat it as already Read. For names its gap markers list, or any area not covered, run another codegraph_explore — do NOT Read these files.)',
-  },
-} as const;
-
-/**
- * One symbol a file section set out to deliver: a cluster member, or a symbol
- * of the per-symbol (focused/skeleton) view. Completeness is judged against
- * these, not against the file — explore never promises whole files, only the
- * symbols it selected for each one.
- */
-export type ExploreWantedSpan = {
-  name: string;
-  kind: string;
-  start: number;
-  end: number;
-  importance: number;
-  spine: boolean;
-  /** The indexed qualified name (`SQLCompiler::as_sql`), when the span is a node. */
-  qualifiedName?: string;
-};
-
-/**
- * The wanted spans a section did NOT deliver in full: some line of the span is
- * in neither what this call sent nor what an earlier call already sent (a
- * back-referenced span counts — the agent holds that copy).
- *
- * Derived from the emitted ranges rather than from a flag each trim site has to
- * remember to set. The oversize-spine window set none until #2068, which is how
- * a 62-line slice of vscode's 968-line `rpcProtocol.ts` went out under "Complete
- * source … do NOT re-read them". Whatever elides source — a member shrink, a
- * ceiling window, a dropped cluster, the per-symbol view, a path added later —
- * shows up here.
- *
- * Most relevant first (spine, then importance), then source order.
- */
-export function elidedWantedSpans(
-  wanted: ReadonlyArray<ExploreWantedSpan>,
-  delivered: ReadonlyArray<ExploreLineRange>,
-): ExploreWantedSpan[] {
-  const merged = mergeRanges(delivered);
-  const out = wanted.filter((w) => w.start > 0 && w.end >= w.start
-    && !merged.some((r) => r.start <= w.start && w.end <= r.end));
-  return out.sort((a, b) =>
-    Number(b.spine) - Number(a.spine) || b.importance - a.importance || a.start - b.start);
-}
-
-/** A rendered file whose section is missing some of what it set out to deliver. */
-export type ExplorePartialFile = { filePath: string; elided: ReadonlyArray<ExploreWantedSpan> };
-
-/** Trimmed files the completeness note names one by one; the rest are a count. */
-const TRIMMED_FILES_NAMED = 3;
-/** Elided symbols the completeness note names, from the spine or named by the agent. */
-const TRIMMED_SYMBOLS_NAMED = 4;
-/**
- * Kinds the note never offers as a follow-up target. A container elided by a
- * trim is too big for one section by construction, so exploring it by name
- * comes back trimmed too; its members are the useful names.
- */
-const TRIMMED_NAME_SKIP_KINDS = new Set([
-  'file', 'module', 'namespace', 'class', 'struct', 'union', 'interface', 'protocol', 'trait',
-]);
-
-/**
- * The name the completeness note offers for an elided symbol: `Owner.member`
- * for a method, so an overloaded name resolves to the definition that was cut
- * (django has 110 `as_sql`s; the note used to offer the bare one and agents
- * then added a path and line to disambiguate it). The bare name otherwise.
- */
-function followUpName(e: ExploreWantedSpan): string {
-  if (e.kind !== 'method' || !e.qualifiedName) return e.name;
-  const segs = e.qualifiedName.split('::');
-  const owner = segs.length >= 2 ? segs[segs.length - 2]! : '';
-  return /^[A-Za-z_$][\w$]*$/.test(owner) ? `${owner}.${e.name}` : e.name;
-}
-
-/**
- * The shortest trailing slice of each path that no other path in `paths`
- * ends with: `extHostExtensionService.ts` alone when it is the only one,
- * `node/extHostExtensionService.ts` beside `common/extHostExtensionService.ts`.
- */
-export function shortestUniqueSuffixes(paths: ReadonlyArray<string>): Map<string, string> {
-  const all = [...new Set(paths)];
-  const out = new Map<string, string>();
-  for (const p of all) {
-    const segs = p.split('/');
-    let n = 1;
-    for (; n < segs.length; n++) {
-      const suffix = segs.slice(-n).join('/');
-      if (!all.some((o) => o !== p && (o === suffix || o.endsWith(`/${suffix}`)))) break;
-    }
-    out.set(p, segs.slice(-n).join('/'));
-  }
-  return out;
-}
-
-/**
- * The large tiers' completeness note (`includeCompletenessSignal`), as
- * candidates from most to least specific. The epilogue fit keeps the first
- * one that fits the room left (CG-26).
- *
- * "Complete" is claimed only when no section elided anything it set out to
- * deliver. Otherwise the note keeps the guarantee that is still true (every
- * block shown is verbatim; treat it as already Read), names the trimmed files
- * and the most relevant elided symbols as room allows, and sends the agent to
- * another codegraph_explore for them. It never offers Read: explore output must
- * not tell the agent to Read (AGENTS.md).
- */
-export function exploreCompletenessNotes(
-  filesIncluded: number,
-  trimmed: ReadonlyArray<ExplorePartialFile>,
-  /** Every path the response can name (sections and pointer list); labels are unique among them. */
-  knownPaths: ReadonlyArray<string>,
-): string[] {
-  // No count when every section is held from an earlier call: "0 files" reads
-  // as nothing shown, beside a note about what was shown.
-  const files = filesIncluded === 0 ? 'these files'
-    : filesIncluded === 1 ? '1 file' : `${filesIncluded} files`;
-  if (trimmed.length === 0) {
-    return [`> **Complete source for ${files} is included above — do NOT re-read them.** If your question also needs files/symbols listed under "Not shown above" (or any area this call didn't cover), make ANOTHER codegraph_explore targeting those names — it returns the same source with line numbers and is cheaper and more complete than reading.`];
-  }
-  const label = shortestUniqueSuffixes([...knownPaths, ...trimmed.map((t) => t.filePath)]);
-  const shownFiles = trimmed.slice(0, TRIMMED_FILES_NAMED).map((t) => `\`${label.get(t.filePath)}\``);
-  const moreFiles = trimmed.length - shownFiles.length;
-  const trimmedList = shownFiles.join(', ') + (moreFiles > 0 ? ` +${moreFiles} more` : '');
-  const names: string[] = [];
-  for (const t of trimmed) {
-    for (const e of t.elided) {
-      if (names.length >= TRIMMED_SYMBOLS_NAMED) break;
-      if (!(e.spine || e.importance >= 9) || TRIMMED_NAME_SKIP_KINDS.has(e.kind)) continue;
-      const name = followUpName(e);
-      if (!names.includes(name)) names.push(name);
-    }
-  }
-  const head = `> **Verbatim source for ${files} is included above — treat it as already Read.**`;
-  const what = 'gap markers and file headers name what was elided';
-  const tail = 'For those, or anything under "Not shown above", make ANOTHER codegraph_explore with those exact names instead of reading the files — it returns their source with line numbers.';
-  const withFiles = `${head} Trimmed for size: ${trimmedList}; ${what}`;
-  const candidates = names.length > 0
-    ? [`${withFiles} (e.g. ${names.map((n) => `\`${n}\``).join(', ')}). ${tail}`]
-    : [];
-  candidates.push(`${withFiles}. ${tail}`, `${head} Some sections were trimmed for size; ${what}. ${tail}`);
-  return candidates;
-}
-
-/** Chars a block of lines costs once joined into the response. */
-const roomForLines = (block: readonly string[]): number =>
-  block.reduce((n, s) => n + s.length + 1, 0);
-
-/**
- * Fit the completeness note and the pointer list into the room the response has
- * left (CG-26). Returns the note (a candidate block, or none), the pointer
- * block, and the room that remains.
- *
- * The note is one of `noteCandidates`, most specific first. A complete-source
- * note keeps the precedence it always had and goes first. A note that YIELDS (a
- * trimmed one) gives way to the pointer list, which names files the response
- * does not show at all, while what a trimmed section elided is already named in
- * its own gap markers and header. It leaves the list's header and first entry
- * when that much could fit, and its optional detail never costs an entry the
- * least specific candidate would have left.
- */
-export function fitExploreEpilogue(opts: {
-  room: number;
-  noteCandidates: ReadonlyArray<readonly string[]>;
-  noteYields: boolean;
-  pointerEntries: readonly string[];
-  pointerOmitted: number;
-}): { note: string[]; pointers: string[]; room: number } {
-  const { noteCandidates, noteYields, pointerEntries, pointerOmitted } = opts;
-  let room = opts.room;
-  // The pointer list as it fits `space`: entries in rank order, and a tail
-  // line confessing every entry left out.
-  const fitPointers = (space: number): { block: string[]; taken: number } => {
-    if (pointerEntries.length === 0) return { block: [], taken: 0 };
-    const head = [POINTER_HEADER, ''];
-    let left = space - roomForLines(head);
-    if (left < 0) return { block: [], taken: 0 };
-    let taken = 0;
-    for (const entry of pointerEntries) {
-      // Every entry we do NOT take has to be confessed by the tail line, so
-      // the tail's cost is part of taking one less than all of them.
-      const dropped = pointerEntries.length - taken - 1 + pointerOmitted;
-      const tail = dropped > 0 ? roomForLines([`- ... and ${dropped} more files`]) : 0;
-      if (entry.length + 1 + tail > left) break;
-      left -= entry.length + 1;
-      taken++;
-    }
-    if (taken === 0) return { block: [], taken: 0 };
-    const block = [...head, ...pointerEntries.slice(0, taken)];
-    const dropped = pointerEntries.length - taken + pointerOmitted;
-    if (dropped > 0) block.push(`- ... and ${dropped} more files`);
-    return { block, taken };
-  };
-
-  const pointerNeed = pointerEntries.length > 0
-    ? roomForLines([POINTER_HEADER, '', pointerEntries[0]!,
-      `- ... and ${pointerEntries.length - 1 + pointerOmitted} more files`])
-    : 0;
-  const pointerMin = noteYields && pointerNeed <= room ? pointerNeed : 0;
-  const leastSpecific = noteCandidates[noteCandidates.length - 1];
-  const entriesBeside = (b: readonly string[]) => fitPointers(room - roomForLines(b)).taken;
-  const entriesFloor = noteYields && leastSpecific ? entriesBeside(leastSpecific) : 0;
-  const note = [...(noteCandidates.find((b) => roomForLines(b) + pointerMin <= room
-    && (!noteYields || entriesBeside(b) >= entriesFloor)) ?? [])];
-  room -= roomForLines(note);
-
-  const pointers = fitPointers(room).block;
-  room -= roomForLines(pointers);
-  return { note, pointers, room };
-}
-
-/**
- * Match response delimiters rather than ASCII "path characters": filenames
- * can contain Unicode, @, +, and other punctuation. Keep line references and
- * a sentence-ending period, but reject prefixes/suffixes of longer paths.
- */
-function mentionsPath(text: string, relPath: string): boolean {
-  const delimiter = /[\s`"'()[\]{}*]/;
-  for (let at = text.indexOf(relPath); at !== -1; at = text.indexOf(relPath, at + 1)) {
-    if (at > 0 && !delimiter.test(text[at - 1] ?? '')) continue;
-    const end = at + relPath.length;
-    if (end === text.length || delimiter.test(text[end] ?? '')) return true;
-    const suffix = text.slice(end);
-    if (/^:\d+(?::\d+|[-–]\d+)?(?=$|[\s`"'()[\]{}*])/.test(suffix)) return true;
-    if (/^:(?=$|\s)/.test(suffix)) return true; // file-list label
-    if (/^\.(?=$|\s)/.test(suffix)) return true; // prose punctuation
-    if (/^[,;](?=$|\s)/.test(suffix)) return true; // list separator
-  }
-  return false;
-}
-
-/**
- * Per-file staleness banner emitted at the top of a tool response when the
- * file watcher has pending events for files referenced by the response.
- * The agent uses this to fall back to Read for those specific files
- * without waiting for the debounced sync (issue #403).
- */
-export function formatStaleBanner(stale: PendingFile[]): string {
-  const now = Date.now();
-  const lines = stale.map((p) => {
-    const ageMs = Math.max(0, now - p.lastSeenMs);
-    const label = p.indexing ? 'indexing in progress' : 'pending sync';
-    return `  - ${p.path} (edited ${ageMs}ms ago, ${label})`;
-  });
-  return (
-    '⚠️ Some files referenced below were edited since the last index sync — ' +
-    'their codegraph entries may be stale:\n' +
-    lines.join('\n') +
-    '\nFor accurate content of those specific files, Read them directly. ' +
-    'The rest of this response is fresh.'
-  );
-}
-
-/**
- * Compact footer listing pending files that are NOT referenced in this
- * response. Gives the agent a complete project-wide freshness picture
- * without bloating the main banner.
- */
-export function formatStaleFooter(stale: PendingFile[]): string {
-  const MAX = 5;
-  const now = Date.now();
-  const shown = stale.slice(0, MAX);
-  const lines = shown.map((p) => {
-    const ageMs = Math.max(0, now - p.lastSeenMs);
-    return `  - ${p.path} (edited ${ageMs}ms ago)`;
-  });
-  const more = stale.length > MAX ? `\n  - …and ${stale.length - MAX} more` : '';
-  return (
-    `(Note: ${stale.length} file(s) elsewhere in this project are pending index ` +
-    `sync but were not referenced above:\n${lines.join('\n')}${more})`
-  );
-}
-
-/**
- * Whole-index degradation banner (issue #876). Emitted at the top of a read
- * tool response when live watching has permanently stopped — at which point
- * `getPendingFiles()` is empty, so the per-file banner above can't fire even
- * though the index is now FROZEN and silently drifting stale. Leads with the
- * agent-actionable instruction (Read directly) and carries the reason, which
- * already names the operator remedy (`codegraph sync` / git hooks).
- */
-export function formatDegradedBanner(reason: string | null): string {
-  return (
-    '⚠️ CodeGraph auto-sync is DISABLED — live file watching stopped, so the index is ' +
-    'frozen and any file edited since then is stale here. Read files directly to confirm ' +
-    'current content before relying on it.' +
-    (reason ? `\n  Reason: ${reason}` : '')
-  );
-}
-
-/** Re-armed watches are not proof of freshness until their full scan commits. */
-export function formatRecoveringBanner(): string {
-  return (
-    '⚠️ CodeGraph auto-sync is RECOVERING — file watching restarted after lock contention, ' +
-    'but the full index catch-up has not completed. Read files directly to confirm ' +
-    'current content before relying on these results.'
-  );
-}
-
-/**
- * MCP Tool definition
- */
-export interface ToolDefinition {
-  name: string;
-  description: string;
-  inputSchema: {
-    type: 'object';
-    properties: Record<string, PropertySchema>;
-    required?: string[];
-  };
-  /** Behavioral hints for clients (see {@link ToolAnnotations}). */
-  annotations?: ToolAnnotations;
-  /**
-   * MCP `_meta` on the tool definition. `anthropic/alwaysLoad: true` makes
-   * Claude Code load the tool at session start instead of deferring it behind
-   * its tool search (https://code.claude.com/docs/en/mcp#exempt-a-server-from-deferral).
-   */
-  _meta?: Record<string, unknown>;
-}
-
-/**
- * MCP ToolAnnotations — behavioral hints a client MAY use to decide how, or
- * whether, to run a tool (introduced in the 2025-03-26 spec, carried in
- * 2025-06-18). They are advisory and never to be trusted for security, but
- * clients gate on them: Cursor's Ask mode, for one, refuses any MCP tool that
- * doesn't advertise `readOnlyHint: true` (issue #1018).
- *
- * The field is purely additive — a client that predates annotations ignores it
- * — so codegraph advertises these even though `initialize` still negotiates the
- * 2024-11-05 protocol version.
- *
- * https://modelcontextprotocol.io/specification/2025-06-18/schema#toolannotations
- */
-export interface ToolAnnotations {
-  /** Human-readable title for the tool. */
-  title?: string;
-  /** If true, the tool does not modify its environment. Default (unset): false. */
-  readOnlyHint?: boolean;
-  /** Meaningful only when NOT read-only: may the tool perform destructive updates? */
-  destructiveHint?: boolean;
-  /** If true, repeat calls with the same arguments have no additional effect. */
-  idempotentHint?: boolean;
-  /** If true, the tool interacts with an open world of external entities. */
-  openWorldHint?: boolean;
-}
-
-interface PropertySchema {
-  type: string;
-  description: string;
-  enum?: string[];
-  default?: unknown;
-}
-
-/**
- * Tool execution result
- */
-export interface ToolResult {
-  content: Array<{
-    type: 'text';
-    text: string;
-  }>;
-  isError?: boolean;
-  /**
-   * INTERNAL side-channel (CG-17): what a `codegraph_explore` call actually put
-   * on the wire — files, line ranges, bytes. It rides the result because the
-   * call may have run on a query-pool worker, while the session state it feeds
-   * lives on the main thread. {@link ToolHandler.execute} records it and DELETES
-   * it, so nothing here ever reaches the client. Keyed by
-   * {@link EXPLORE_EMISSION_KEY}; the two must stay in sync.
-   */
-  _cgExploreEmission?: ExploreEmission;
-  /** Internal structured provenance, preserved by query workers and stripped by execute. */
-  _cgAnswerFiles?: AnswerFile[];
-}
-
-/**
- * Common projectPath property for cross-project queries
- */
-const projectPathProperty: PropertySchema = {
-  type: 'string',
-  description: 'Absolute path to the project to query (or any directory inside it) — codegraph uses the nearest .codegraph/ index at or above that path. Omit to use this session\'s default project. Pass it to query a second codebase, or when the server root has no index of its own (e.g. a monorepo where only sub-projects are indexed, so there is no default project).',
-};
-
-/**
- * EVERY codegraph tool is query-only: it reads the pre-built index and never
- * mutates the workspace (indexing is the user's explicit CLI call, never the
- * agent's). Advertising this read-only contract lets clients that gate on it run
- * the tools where a possibly-mutating tool would be blocked — most concretely,
- * Cursor's Ask mode, which rejects any MCP tool lacking `readOnlyHint: true`
- * (issue #1018). `idempotentHint`: a repeated query has no additional effect.
- * `openWorldHint: false`: the domain is the closed local index, not an open
- * external world. Shared so the contract is declared once; a hypothetical
- * mutating tool would simply not reference it.
- */
-const READ_ONLY_ANNOTATIONS: ToolAnnotations = {
-  readOnlyHint: true,
-  destructiveHint: false,
-  idempotentHint: true,
-  openWorldHint: false,
-};
-
-/**
- * All CodeGraph MCP tools
- *
- * Designed for minimal context usage - use codegraph_explore as the primary tool
- * (one call usually answers the whole question), and only use other tools for
- * targeted follow-up queries.
- *
- * All tools support cross-project queries via the optional `projectPath` parameter.
- */
-export const tools: ToolDefinition[] = [
-  {
-    name: 'codegraph_search',
-    description: 'Quick symbol search by name. Returns locations only (no code). Use codegraph_explore instead to get the actual source / understand an area in one call.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        query: {
-          type: 'string',
-          description: 'Symbol name or partial name (e.g., "auth", "signIn", "UserService")',
-        },
-        kind: {
-          type: 'string',
-          description: 'Filter by node kind',
-          enum: ['function', 'method', 'class', 'interface', 'type', 'variable', 'route', 'component'],
-        },
-        limit: {
-          type: 'number',
-          description: 'Maximum results (default: 10)',
-          default: 10,
-        },
-        projectPath: projectPathProperty,
-      },
-      required: ['query'],
-    },
-    annotations: READ_ONLY_ANNOTATIONS,
-  },
-  {
-    name: 'codegraph_callers',
-    description: 'List functions that call <symbol>. For the full flow, use codegraph_explore.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        symbol: {
-          type: 'string',
-          description: 'Name of the function, method, or class to find callers for',
-        },
-        file: {
-          type: 'string',
-          description: 'Narrow to the definition in this file (path or suffix) when several same-named symbols exist (e.g. one UserService per app in a monorepo)',
-        },
-        limit: {
-          type: 'number',
-          description: 'Maximum number of callers to return (default: 20)',
-          default: 20,
-        },
-        projectPath: projectPathProperty,
-      },
-      required: ['symbol'],
-    },
-    annotations: READ_ONLY_ANNOTATIONS,
-  },
-  {
-    name: 'codegraph_callees',
-    description: 'List functions that <symbol> calls. For the full flow, use codegraph_explore.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        symbol: {
-          type: 'string',
-          description: 'Name of the function, method, or class to find callees for',
-        },
-        file: {
-          type: 'string',
-          description: 'Narrow to the definition in this file (path or suffix) when several same-named symbols exist',
-        },
-        limit: {
-          type: 'number',
-          description: 'Maximum number of callees to return (default: 20)',
-          default: 20,
-        },
-        projectPath: projectPathProperty,
-      },
-      required: ['symbol'],
-    },
-    annotations: READ_ONLY_ANNOTATIONS,
-  },
-  {
-    name: 'codegraph_impact',
-    description: 'List symbols affected by changing <symbol>. Use before a refactor.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        symbol: {
-          type: 'string',
-          description: 'Name of the symbol to analyze impact for',
-        },
-        file: {
-          type: 'string',
-          description: 'Narrow to the definition in this file (path or suffix) when several same-named symbols exist',
-        },
-        depth: {
-          type: 'number',
-          description: 'How many levels of dependencies to traverse (default: 2)',
-          default: 2,
-        },
-        projectPath: projectPathProperty,
-      },
-      required: ['symbol'],
-    },
-    annotations: READ_ONLY_ANNOTATIONS,
-  },
-  {
-    name: 'codegraph_node',
-    description: 'Two modes. (1) READ A FILE — use INSTEAD of the Read tool: pass `file` (a path or basename) with no `symbol` and it returns that file\'s current on-disk source with line numbers, exactly the shape Read gives you (`<n>\\t<line>`, safe to Edit from), narrowable with `offset`/`limit` just like Read — PLUS a one-line note of which files depend on it. Same bytes as Read, faster (served from the index), with the blast radius attached. Use it whenever you would Read a source file. (2) ONE SYMBOL you can name — its location, signature, verbatim source (includeCode=true) and caller/callee trail in one call, so before changing it you see what calls it and what your edit would break. For an AMBIGUOUS name it returns EVERY matching definition\'s body in one call (so you never Read a file to find the right overload); pass `file`/`line` to pin one. Use codegraph_explore for several related symbols or the full flow.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        symbol: {
-          type: 'string',
-          description: 'Name of the symbol to read (symbol mode). Omit it and pass `file` alone to read a whole file like Read.',
-        },
-        includeCode: {
-          type: 'boolean',
-          description: 'Symbol mode: include the symbol\'s full body (default: false). Ignored in file mode, which always returns source unless `symbolsOnly` is set.',
-          default: false,
-        },
-        file: {
-          type: 'string',
-          description: 'A file path or basename (e.g. "harness.rs", "src/auth/session.ts"). Pass it ALONE (no symbol) to READ the file like the Read tool — its full source with line numbers + which files depend on it. Or pass it WITH a symbol to disambiguate an overloaded name to the definition in this file.',
-        },
-        offset: {
-          type: 'number',
-          description: 'File mode: 1-based line to start reading from, exactly like Read\'s offset. Defaults to the start of the file.',
-        },
-        limit: {
-          type: 'number',
-          description: 'File mode: maximum number of lines to return, exactly like Read\'s limit. Defaults to the whole file (capped at 2000 lines, like Read).',
-        },
-        symbolsOnly: {
-          type: 'boolean',
-          description: 'File mode: return just the file\'s symbol map + dependents (a cheap structural overview) instead of its source.',
-          default: false,
-        },
-        line: {
-          type: 'number',
-          description: 'Symbol mode only: disambiguate to the definition at/around this line (use with the file:line a trail showed you).',
-        },
-        projectPath: projectPathProperty,
-      },
-      required: [],
-    },
-    annotations: READ_ONLY_ANNOTATIONS,
-  },
-  {
-    name: 'codegraph_explore',
-    description: 'PRIMARY TOOL — call FIRST for almost any question OR before an edit: how does X work, architecture, a bug, where/what is X, surveying an area, or the symbols you are about to change. Returns the verbatim source of the relevant symbols grouped by file in ONE capped call (Read-equivalent — treat the shown source as already Read; do NOT re-open those files), plus the call path among them. Query can be a natural-language question OR a bag of symbol/file names. Usually the ONLY call you need — more accurate context, in far fewer tokens and round-trips than a search/Read/Grep loop.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        query: {
-          type: 'string',
-          description: 'Symbol names, file names, or short code terms to explore (e.g., "AuthService loginUser session-manager", "GraphTraverser BFS impact traversal.ts"). For a flow question, name the symbols spanning the flow (e.g. "mutateElement renderScene"). A natural-language question works too — no prior codegraph_search needed.',
-        },
-        maxFiles: {
-          type: 'number',
-          description: 'Maximum number of files to include source code from (default: 12)',
-          default: 12,
-        },
-        projectPath: projectPathProperty,
-      },
-      required: ['query'],
-    },
-    annotations: READ_ONLY_ANNOTATIONS,
-    // Loaded from the first prompt in Claude Code, which otherwise defers every
-    // MCP tool behind a ToolSearch step (#1696).
-    _meta: { 'anthropic/alwaysLoad': true },
-  },
-  {
-    name: 'codegraph_status',
-    description: 'Index health check: files, nodes, edges, last indexed time, and added/modified/removed counts. Skip unless debugging.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        projectPath: projectPathProperty,
-      },
-    },
-    annotations: READ_ONLY_ANNOTATIONS,
-  },
-  {
-    name: 'codegraph_files',
-    description: 'Indexed file tree with language + symbol counts. Faster than Glob for project layout.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        path: {
-          type: 'string',
-          description: 'Filter to files under this directory path (e.g., "src/components"). Returns all files if not specified.',
-        },
-        pattern: {
-          type: 'string',
-          description: 'Filter files matching this glob pattern (e.g., "*.tsx", "**/*.test.ts")',
-        },
-        format: {
-          type: 'string',
-          description: 'Output format: "tree" (hierarchical, default), "flat" (simple list), "grouped" (by language)',
-          enum: ['tree', 'flat', 'grouped'],
-          default: 'tree',
-        },
-        includeMetadata: {
-          type: 'boolean',
-          description: 'Include file metadata like language and symbol count (default: true)',
-          default: true,
-        },
-        maxDepth: {
-          type: 'number',
-          description: 'Maximum directory depth to show (default: unlimited)',
-        },
-        projectPath: projectPathProperty,
-      },
-    },
-    annotations: READ_ONLY_ANNOTATIONS,
-  },
-];
-
-/**
- * Return `defs` with `projectPath` marked `required` in each tool's inputSchema.
- *
- * Used for the NO-DEFAULT-PROJECT tool surface (issue #993): when the MCP server
- * has no default project to fall back to — a gateway server started outside any
- * repo, or a monorepo root whose `.codegraph/` indexes live only in sub-projects
- * — every call MUST carry an explicit `projectPath`, so the schema should say so.
- * A `required` field is a HIGH-salience channel (MCP clients surface and often
- * validate it), unlike the instructions text the reporter found too weak to stop
- * the agent omitting the param. When a default project IS open, callers leave
- * projectPath optional and never call this.
- *
- * Pure: clones each tool's schema rather than mutating the shared module-level
- * `tools` array (reused by every session and the static surface). A tool that
- * doesn't expose projectPath, or already requires it, is returned untouched;
- * explore's `['query']` becomes `['query', 'projectPath']`, and a tool with no
- * `required` list (status/files) gains `['projectPath']`.
- */
-function withRequiredProjectPath(defs: ToolDefinition[]): ToolDefinition[] {
-  return defs.map((tool) => {
-    if (!tool.inputSchema.properties.projectPath) return tool;
-    const required = tool.inputSchema.required ?? [];
-    if (required.includes('projectPath')) return tool;
-    return {
-      ...tool,
-      inputSchema: { ...tool.inputSchema, required: [...required, 'projectPath'] },
-    };
-  });
-}
-
-/**
- * Allowlist-filtered tool definitions WITHOUT an engine — the static surface the
- * proxy answers `tools/list` with before any project is open. Mirrors
- * `ToolHandler.getTools()` in the no-CodeGraph case (the dynamic per-repo budget
- * note in a description only adds once `cg` is loaded; the schemas are static).
- */
-export function getStaticTools(): ToolDefinition[] {
-  const raw = process.env.CODEGRAPH_MCP_TOOLS;
-  if (!raw || !raw.trim()) {
-    return tools.filter(t => DEFAULT_MCP_TOOLS.has(t.name.replace(/^codegraph_/, '')));
-  }
-  const allow = new Set(raw.split(',').map(s => s.trim().replace(/^codegraph_/, '')).filter(Boolean));
-  return allow.size ? tools.filter(t => allow.has(t.name.replace(/^codegraph_/, ''))) : tools;
-}
-
-/**
- * The MCP tools served by DEFAULT (short names). Pared to ONLY `codegraph_explore`
- * — the single tool that reliably earns its place: one capped call returns the
- * verbatim source of the relevant symbols grouped by file. Every other tool is a
- * narrower slice of what explore already does, and presence itself steers
- * mis-picks, so they are no longer LISTED to agents.
- *
- * The other defined tools (`node`, `search`, `callers`, plus callees/impact/files/
- * status) remain fully functional — handlers stay, the library API and CLI are
- * untouched, and `CODEGRAPH_MCP_TOOLS=explore,node,...` re-enables any of them.
- */
-const DEFAULT_MCP_TOOLS = new Set(['explore']);
-
-/** realpath when the path exists, the path itself otherwise — never throws. */
-function canonicalPath(p: string): string {
-  try {
-    return realpathSync(p);
-  } catch {
-    return p;
-  }
-}
-
-/**
- * How many explicit-`projectPath` projects a handler keeps open at once
- * (#1835). Each cached project may hold a file watcher, a writer lock and a
- * SQLite connection, so the cache is bounded LRU: opening one more than this
- * closes the least recently used. Small on purpose — a session that queries
- * many repositories still leaks nothing; it only pays a reopen + catch-up.
- */
-export const MAX_CACHED_PROJECTS = 8;
-
-/**
- * How long an explicit-`projectPath` project may go unused before the handler
- * releases it (#2087). Releasing frees its SQLite handle, its watcher and the
- * writer lock the engine may hold on that project — which otherwise stays held
- * for the whole life of this daemon, locking the project's own daemon and
- * `codegraph index` out. The next call reopens it and catches up.
- * `CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS` overrides it; `0` never releases.
- */
-const DEFAULT_PROJECT_IDLE_TIMEOUT_MS = 600_000;
-function resolveProjectIdleTimeoutMs(): number {
-  const raw = process.env.CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS;
-  if (raw === undefined || raw === '') return DEFAULT_PROJECT_IDLE_TIMEOUT_MS;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n < 0) return DEFAULT_PROJECT_IDLE_TIMEOUT_MS;
-  return Math.floor(n);
-}
-
-/**
- * Engine-side lifecycle for a project the ToolHandler opened for an explicit
- * `projectPath` (#1835). `activate` gives it the same treatment the default
- * project gets — a file watcher while it stays open and a catch-up sync — and
- * returns the catch-up promise, which the handler awaits (time-boxed) before
- * calls against that project. `release` runs after active calls drain, so the
- * engine can release shared ownership safely on LRU eviction or shutdown.
- */
-export interface ProjectLifecycle {
-  open(root: string, open: () => CodeGraph): CodeGraph;
-  activate(cg: CodeGraph): Promise<void>;
-  release(cg: CodeGraph): void | Promise<void>;
-}
-
-/**
  * Tool handler that executes tools against a CodeGraph instance
  *
  * Supports cross-project queries via the projectPath parameter.
  * Other projects are opened on-demand and cached for performance.
  */
 export class ToolHandler {
-  // Cache of opened CodeGraph instances for cross-project queries, keyed by the
-  // CANONICAL (realpath) index root. Map insertion order doubles as LRU order:
-  // a hit re-inserts, and `MAX_CACHED_PROJECTS` bounds the size (#1835).
-  private projectCache: Map<string, CodeGraph> = new Map();
-  // When each cached root was last handed to a call, and the one timer that
-  // releases the oldest once it has been idle long enough (#2087).
-  private projectUsedAt: Map<string, number> = new Map();
-  private idleReleaseTimer: NodeJS.Timeout | null = null;
-  // Engine hook that watches + catches up an explicit project (null for the
-  // CLI and worker-thread handlers, which never own a watcher).
-  private projectLifecycle: ProjectLifecycle | null = null;
-  // Every concurrent call shares its project's pending catch-up promise.
-  private projectGates: Map<CodeGraph, Promise<void>> = new Map();
-  private activeCalls = 0;
-  private closing = false;
-  private pendingCloses = 0;
-  private closeWaiters: Array<() => void> = [];
-  // The directory the server last searched for a default project. Surfaced in
-  // the "not initialized" error so users can see why detection missed.
-  private defaultProjectHint: string | null = null;
-  // Indexed sub-projects the engine's bounded down-scan saw below the search
-  // base when no default project resolved (#1607). Listed in the "not
-  // initialized" error so the fact is reachable through the protocol, not just
-  // the host's stderr capture. Engine-maintained (initial resolve + throttled
-  // retry) — tool calls themselves never scan.
-  private knownSubprojects: string[] = [];
-  private knownSubprojectsBase: string | null = null;
-  // Why the default project failed to open, when that is worth telling the
-  // agent instead of "no project loaded" — today only the Windows/WSL
-  // shared-index error (#995). Engine-maintained; cleared by a successful open.
-  private defaultOpenFailure: WslSharedIndexError | null = null;
-  // Per-start-path cache of the git worktree/index mismatch (issue #155). The
-  // mismatch is a fixed property of (where the request came from → which
-  // .codegraph/ it resolves to), so the up-to-two `git rev-parse` spawns run
-  // once and every later tool call reuses the result — never shelling out to
-  // git on the hot path. `undefined` = not computed yet; `null` = no mismatch.
-  // LRU-bounded: a long-lived daemon serving many distinct start paths must
-  // not grow it forever (R-MCP8); an evicted entry just re-runs git once.
-  private worktreeMismatchCache = new LRUCache<string, WorktreeIndexMismatch | null>(MCP_PATH_CACHE_MAX);
-  // Per-(projectPath, index root) cache of the different git repository the
-  // path sits in below that root, if any (#2110) — the git half of
-  // `uncoveredNestedRepo`, memoized like the mismatch above.
-  private nestedRepoCache = new LRUCache<string, NestedRepository | null>(MCP_PATH_CACHE_MAX);
-  // Gate that the MCP engine pokes after `cg.open()` so the first tool call
-  // blocks on the post-open filesystem reconcile (catch-up sync). Without
-  // this, a tool call that races past `catchUpSync()` serves rows for files
-  // that were deleted (or edited) while no MCP server was running — and the
-  // per-file staleness banner can't help, because `getPendingFiles()` is
-  // populated by the watcher, not by catch-up. The wait is time-boxed
-  // (see {@link resolveCatchUpGateTimeoutMs}) so a minutes-long reconcile on a
-  // huge repo can't hang a call (#905); cleared when the reconcile settles.
-  private catchUpGate: Promise<void> | null = null;
-  // Engine hook fired when `freshen` reopened a replaced database (#1902), so
-  // the engine can reconcile the new file with a catch-up sync.
-  private onDatabaseReopened: ((cg: CodeGraph) => void) | null = null;
+  // Project resolution + lifetime (default project, explicit-projectPath
+  // cache, catch-up gates, memoized git checks) — see ProjectRegistry.
+  private readonly projects: ProjectRegistry;
   // Optional worker-thread pool for off-loop read-tool dispatch. When ready +
   // healthy, heavy reads leave the main loop free for the MCP transport.
   private queryPool: QueryPool | null = null;
 
-  constructor(private cg: CodeGraph | null) {}
+  constructor(cg: CodeGraph | null) {
+    this.projects = new ProjectRegistry(cg);
+  }
+
+  /** The default project's CodeGraph (null when none is loaded). */
+  private get cg(): CodeGraph | null {
+    return this.projects.cg;
+  }
+
+  /** See {@link ProjectRegistry.getCodeGraph}. */
+  private getCodeGraph(projectPath?: string): CodeGraph {
+    return this.projects.getCodeGraph(projectPath);
+  }
+
+  /**
+   * Engine-only: own the lifecycle (watcher, catch-up, writer lock) of every
+   * project this handler opens for an explicit `projectPath` (#1835).
+   */
+  setProjectLifecycle(lifecycle: ProjectLifecycle | null): void {
+    this.projects.setProjectLifecycle(lifecycle);
+  }
+
+  /** Update the default CodeGraph instance (e.g. after lazy initialization). */
+  setDefaultCodeGraph(cg: CodeGraph): void {
+    this.projects.setDefaultCodeGraph(cg);
+  }
+
+  /** Engine-only: see {@link ProjectRegistry.setDefaultOpenFailure}. */
+  setDefaultOpenFailure(err: WslSharedIndexError | null): void {
+    this.projects.setDefaultOpenFailure(err);
+  }
+
+  /** Engine-only: see {@link ProjectRegistry.setCatchUpGate}. */
+  setCatchUpGate(p: Promise<void> | null): void {
+    this.projects.setCatchUpGate(p);
+  }
+
+  /** Engine-only: see {@link ProjectRegistry.setOnDatabaseReopened}. */
+  setOnDatabaseReopened(fn: ((cg: CodeGraph) => void) | null): void {
+    this.projects.setOnDatabaseReopened(fn);
+  }
+
+  /** See {@link ProjectRegistry.setDefaultProjectHint}. */
+  setDefaultProjectHint(searchedPath: string): void {
+    this.projects.setDefaultProjectHint(searchedPath);
+  }
+
+  /** Engine-only: see {@link ProjectRegistry.setKnownSubprojects}. */
+  setKnownSubprojects(roots: string[], base: string): void {
+    this.projects.setKnownSubprojects(roots, base);
+  }
+
+  /** Whether a default CodeGraph instance is available. */
+  hasDefaultCodeGraph(): boolean {
+    return this.projects.hasDefaultCodeGraph();
+  }
+
+  /** Close all cached project connections. */
+  closeAll(): Promise<void> {
+    return this.projects.closeAll();
+  }
 
   /**
    * Engine-only: attach (or detach with null) the worker-thread query pool. The
@@ -1983,128 +318,6 @@ export class ToolHandler {
     this.queryPool = pool;
   }
 
-  /**
-   * Engine-only: own the lifecycle (watcher, catch-up, writer lock) of every
-   * project this handler opens for an explicit `projectPath` (#1835).
-   */
-  setProjectLifecycle(lifecycle: ProjectLifecycle | null): void {
-    this.projectLifecycle = lifecycle;
-  }
-
-  /**
-   * Update the default CodeGraph instance (e.g. after lazy initialization)
-   */
-  setDefaultCodeGraph(cg: CodeGraph): void {
-    this.cg = cg;
-    this.defaultOpenFailure = null;
-  }
-
-  /**
-   * Engine-only: record why the default project failed to open (#995), so a
-   * call that needs it answers with that fix rather than "no project loaded".
-   * `null` clears it.
-   */
-  setDefaultOpenFailure(err: WslSharedIndexError | null): void {
-    this.defaultOpenFailure = err;
-  }
-
-  /**
-   * Engine-only: register the catch-up sync promise so the next `execute()`
-   * call awaits it before serving. The handler swallows rejections (the
-   * engine logs them) so a sync failure never propagates as a tool error;
-   * we still want to serve a best-effort result over the same potentially-
-   * stale data, which is what would have happened without the gate.
-   */
-  setCatchUpGate(p: Promise<void> | null): void {
-    this.catchUpGate = p;
-    void p?.then(() => {
-      if (this.catchUpGate === p) this.catchUpGate = null;
-    }, () => {
-      if (this.catchUpGate === p) this.catchUpGate = null;
-    });
-  }
-
-  /**
-   * Engine-only: called after a tool call's {@link freshen} reopened a database
-   * that was replaced on disk (#1902). The engine decides whether a catch-up
-   * sync is its to run (only for the instance it watches and writes).
-   */
-  setOnDatabaseReopened(fn: ((cg: CodeGraph) => void) | null): void {
-    this.onDatabaseReopened = fn;
-  }
-
-  /**
-   * Await the catch-up gate, but no longer than the configured timeout (#905).
-   * If the reconcile settles first, we got the fully-reconciled answer. If the
-   * timeout wins, we serve the call now and let the reconcile finish in the
-   * background — it yields to the event loop (see SYNC_RECONCILE_YIELD_INTERVAL),
-   * so a concurrent read still runs against the same connection. Never throws:
-   * a failed reconcile is logged by the engine, and we serve best-effort over
-   * the same potentially-stale data the un-gated path would have.
-   */
-  private async awaitCatchUpGate(gate: Promise<void>): Promise<void> {
-    const timeoutMs = resolveCatchUpGateTimeoutMs();
-    if (timeoutMs <= 0) {
-      // 0 = opt back into the original unbounded wait.
-      try { await gate; } catch { /* engine already logged */ }
-      return;
-    }
-    let timer: NodeJS.Timeout | undefined;
-    const timedOut = new Promise<'timeout'>((resolve) => {
-      timer = setTimeout(() => resolve('timeout'), timeoutMs);
-      timer.unref?.();
-    });
-    try {
-      const outcome = await Promise.race([
-        gate.then(() => 'done' as const, () => 'done' as const),
-        timedOut,
-      ]);
-      if (outcome === 'timeout') {
-        process.stderr.write(
-          `[CodeGraph MCP] Catch-up reconcile still running after ${timeoutMs}ms; serving this tool call now and finishing the reconcile in the background (#905). ` +
-          `Set CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS=0 to always wait for it.\n`
-        );
-      }
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-  }
-
-  /**
-   * Record the directory the server tried to resolve the default project from.
-   * Used only to make the "no default project" error actionable.
-   */
-  setDefaultProjectHint(searchedPath: string): void {
-    this.defaultProjectHint = searchedPath;
-  }
-
-  /**
-   * Engine-only: record the indexed sub-projects the workspace down-scan saw
-   * when it could not adopt a default project (#1606/#1607). An empty list
-   * clears any previous note.
-   */
-  setKnownSubprojects(roots: string[], base: string): void {
-    this.knownSubprojects = roots;
-    this.knownSubprojectsBase = base;
-  }
-
-  /** One message line naming the indexed sub-projects, or '' when none known. */
-  private formatKnownSubprojects(): string {
-    if (this.knownSubprojects.length === 0) return '';
-    const base = this.knownSubprojectsBase;
-    const rels = this.knownSubprojects.map((r) => (base ? relativePath(base, r) || '.' : r));
-    return (
-      `Indexed sub-projects were found below it: ${rels.join(', ')} — ` +
-      'pass one of them (absolute, or resolved against that directory) as projectPath.\n'
-    );
-  }
-
-  /**
-   * Whether a default CodeGraph instance is available
-   */
-  hasDefaultCodeGraph(): boolean {
-    return this.cg !== null;
-  }
 
   /**
    * Optional allowlist of exposed tools, parsed from the CODEGRAPH_MCP_TOOLS
@@ -2205,272 +418,6 @@ export class ToolHandler {
     }
   }
 
-  /**
-   * Get CodeGraph instance for a project
-   *
-   * If projectPath is provided, opens that project's CodeGraph (cached).
-   * Otherwise returns the default CodeGraph instance.
-   *
-   * Walks up parent directories to find the nearest .codegraph/ folder,
-   * similar to how git finds .git/ directories.
-   */
-  private getCodeGraph(projectPath?: string): CodeGraph {
-    if (!projectPath) {
-      if (!this.cg) {
-        if (this.defaultOpenFailure) throw this.defaultOpenFailure;
-        const searched = this.defaultProjectHint ?? process.cwd();
-        throw new NotIndexedError(
-          'No CodeGraph project is loaded for this session.\n' +
-          `Searched for a .codegraph/ directory starting from: ${searched}\n` +
-          this.formatKnownSubprojects() +
-          'Either the server root has no index of its own (e.g. a monorepo where only ' +
-          "sub-projects are indexed), or the MCP client launched the server outside your " +
-          'project without reporting the workspace root. Either way, target the project ' +
-          'explicitly:\n' +
-          '  • Pass projectPath to the tool call, e.g. projectPath: "/absolute/path/to/your/project" ' +
-          '(any project that has a .codegraph/ — including a sub-project of a monorepo)\n' +
-          '  • Or add --path to the server\'s MCP config args: ["serve", "--mcp", "--path", "/absolute/path/to/your/project"]\n' +
-          'If a project simply has no index, use your built-in tools (Read/Grep/Glob) for THAT ' +
-          "project (the user can run 'codegraph init' there to enable it) — you can still query " +
-          'other indexed projects by projectPath in the same session.'
-        );
-      }
-      return this.freshen(this.cg);
-    }
-
-    // Reject sensitive system directories before opening. Only validate a
-    // path that actually exists — a nested or not-yet-created sub-path of a
-    // real project must still be allowed to resolve UP to its .codegraph/
-    // root below (issue #238), so we don't run the existence-checking
-    // validator on paths that are meant to walk up.
-    if (existsSync(projectPath)) {
-      const pathError = validateProjectPath(projectPath);
-      if (pathError) {
-        throw new PathRefusalError(pathError);
-      }
-    }
-
-    // Always RE-RESOLVE the nearest .codegraph/ from the input path. The walk
-    // is cheap (a few existsSync up the tree) and is the only thing that
-    // notices a path whose index root CHANGED since it was first seen — most
-    // importantly a git worktree that gained its own .codegraph/ after the
-    // (long-lived) server first resolved it up to the parent checkout. We used
-    // to short-circuit on a `projectCache[projectPath]` entry before resolving,
-    // which pinned that first resolution for the server's whole lifetime, so a
-    // worktree kept being served the parent checkout's index until restart
-    // (#926). The DB connection itself is still cached (by resolved root,
-    // below), so re-resolving costs only the stat walk, never a reopen.
-    const resolvedRoot = findNearestCodeGraphRoot(projectPath);
-    // Two spellings of one root (a symlinked checkout, `/tmp` vs
-    // `/private/tmp`) must share one connection and one watcher (#1835).
-    const canonicalRoot = resolvedRoot ? canonicalPath(resolvedRoot) : null;
-
-    if (!resolvedRoot || !canonicalRoot) {
-      throw new NotIndexedError(
-        `The project at ${projectPath} isn't indexed with codegraph (no .codegraph/ directory found ` +
-        'walking up from it), so codegraph cannot query it. Use your built-in tools (Read/Grep/Glob) ' +
-        "for that codebase instead, and don't call codegraph for it again this session. " +
-        "Indexing is the user's decision — they can run 'codegraph init' in that project to enable it."
-      );
-    }
-
-    const cg = this.openProjectRoot(resolvedRoot, canonicalRoot);
-    // The walk above crosses git boundaries. A nested repository the ancestor
-    // index leaves out (typically gitignored) would otherwise be answered from
-    // the ancestor's code, looking like an answer about the requested project
-    // (#2110) — so it gets the same guidance as a project with no index at all.
-    const nested = this.uncoveredNestedRepo(projectPath, canonicalRoot, cg);
-    if (nested) {
-      throw new NotIndexedError(
-        `The project at ${projectPath} isn't indexed with codegraph: it is its own git repository ` +
-        `(${nested.root}), and the nearest index, at ${canonicalRoot}, holds none of its files ` +
-        '(that repository is excluded from it, e.g. by a .gitignore), so codegraph cannot query it. ' +
-        "Use your built-in tools (Read/Grep/Glob) for that codebase instead, and don't call codegraph " +
-        "for it again this session. Indexing is the user's decision — they can run 'codegraph init' " +
-        `in ${nested.root} to enable it.`
-      );
-    }
-    return cg;
-  }
-
-  /**
-   * The open CodeGraph for an index root the up-walk resolved: the default
-   * instance, a cached one, or a newly opened (and cached) one.
-   */
-  private openProjectRoot(resolvedRoot: string, canonicalRoot: string): CodeGraph {
-    // If the path resolves to the default project, reuse the already-open
-    // default instance rather than opening a SECOND connection to the same DB.
-    // A duplicate connection serializes reads against the watcher's auto-sync
-    // writes; when WAL isn't in effect (e.g. a filesystem without shared-memory
-    // support) that surfaces as intermittent
-    // "database is locked" on concurrent tool calls. See issue #238. The
-    // default instance is owned/closed by the server, so it's never cached.
-    // Another spelling of the same root counts too (#1057).
-    if (this.cg && isSameIndexRoot(this.cg.getProjectRoot(), resolvedRoot)) {
-      return this.freshen(this.cg);
-    }
-
-    // Cache the open DB connection by CANONICAL ROOT only — never by the input
-    // path. One key per instance means closeAll() closes each exactly once, and
-    // a changed resolution maps to a different entry instead of a stale hit.
-    const cached = this.projectCache.get(canonicalRoot);
-    if (cached) {
-      // Refresh LRU position.
-      this.projectCache.delete(canonicalRoot);
-      this.projectCache.set(canonicalRoot, cached);
-      this.projectUsedAt.set(canonicalRoot, Date.now());
-      return this.freshen(cached);
-    }
-
-    // Compare current identities on every cache miss: a previously seen alias
-    // may have been retargeted or recreated since the last call (#1057).
-    for (const [root, open] of this.projectCache) {
-      if (isSameIndexRoot(root, resolvedRoot)) {
-        this.projectCache.delete(root);
-        this.projectCache.set(root, open);
-        this.projectUsedAt.set(root, Date.now());
-        return this.freshen(open);
-      }
-    }
-
-    const open = () => loadCodeGraph().openSync(canonicalRoot);
-    const cg = this.projectLifecycle?.open(canonicalRoot, open) ?? open();
-    this.projectCache.set(canonicalRoot, cg);
-    this.projectUsedAt.set(canonicalRoot, Date.now());
-    this.trimProjects();
-    return cg;
-  }
-
-  /**
-   * The nested git repository `projectPath` lives in when the index the
-   * up-walk reached (`indexRoot`'s, open as `cg`) holds none of its files; null
-   * when that index covers it — an ordinary subdirectory, a submodule or
-   * embedded clone the ancestor indexes, a linked worktree (#155) — or when git
-   * can't tell (#2110).
-   *
-   * The git half is memoized per (projectPath, index root), keyed on both for
-   * the reason `worktreeMismatchCache` is (#926). The index half is one
-   * primary-key probe per call, so a sync that brings the repository into the
-   * index is honored without a restart.
-   */
-  private uncoveredNestedRepo(projectPath: string, indexRoot: string, cg: CodeGraph): NestedRepository | null {
-    const cacheKey = `${projectPath}\u0000${indexRoot}`;
-    let nested = this.nestedRepoCache.get(cacheKey);
-    if (nested === undefined) {
-      nested = nestedRepositoryBelow(projectPath, indexRoot);
-      this.nestedRepoCache.set(cacheKey, nested);
-    }
-    if (!nested) return null;
-    try {
-      return cg.hasFilesUnder(nested.relPath) ? null : nested;
-    } catch {
-      // An index we can't read is no evidence the repository is excluded.
-      return null;
-    }
-  }
-
-  private async awaitProjectGate(projectPath: string): Promise<void> {
-    const cg = this.getCodeGraph(projectPath);
-    if (!this.projectLifecycle || cg === this.cg) return;
-    let gate = this.projectGates.get(cg);
-    if (!gate) {
-      gate = this.projectLifecycle.activate(cg).catch(() => { /* engine logs */ });
-      this.projectGates.set(cg, gate);
-      void gate.then(() => {
-        if (this.projectGates.get(cg) === gate) this.projectGates.delete(cg);
-        this.trimProjects();
-      });
-    }
-    await this.awaitCatchUpGate(gate);
-  }
-
-  /**
-   * Never evict a graph while a tool call or its timed-out reconcile uses it.
-   * Evicts over the LRU bound, on close, and once idle past the timeout
-   * (#2087). The cache is in last-use order, so idle entries lead it.
-   */
-  private trimProjects(): void {
-    if (this.activeCalls > 0) return;
-    const idleMs = resolveProjectIdleTimeoutMs();
-    const now = Date.now();
-    for (const [root, cg] of this.projectCache) {
-      const idle = idleMs > 0 && now - (this.projectUsedAt.get(root) ?? now) >= idleMs;
-      if (!this.closing && this.projectCache.size <= MAX_CACHED_PROJECTS && !idle) break;
-      if (this.projectGates.has(cg)) continue;
-      this.projectCache.delete(root);
-      this.projectUsedAt.delete(root);
-      if (this.projectLifecycle) {
-        this.pendingCloses++;
-        void Promise.resolve(this.projectLifecycle.release(cg)).finally(() => {
-          this.pendingCloses--;
-          this.trimProjects();
-        });
-      } else cg.close();
-    }
-    if (this.closing && this.projectCache.size === 0 && this.pendingCloses === 0) {
-      for (const resolve of this.closeWaiters.splice(0)) resolve();
-    }
-    this.scheduleIdleRelease(idleMs);
-  }
-
-  /**
-   * Arm one unref'd timer for the oldest project a trim could release. A
-   * project whose catch-up is still running is trimmed when that settles; the
-   * 1s floor keeps a project a trim must skip from re-arming in a tight loop.
-   */
-  private scheduleIdleRelease(idleMs: number): void {
-    if (this.idleReleaseTimer || this.closing || idleMs <= 0) return;
-    for (const [root, cg] of this.projectCache) {
-      if (this.projectGates.has(cg)) continue;
-      const due = (this.projectUsedAt.get(root) ?? Date.now()) + idleMs - Date.now();
-      this.idleReleaseTimer = setTimeout(() => {
-        this.idleReleaseTimer = null;
-        this.trimProjects();
-      }, Math.min(Math.max(due, 1000), 0x7fffffff)); // setTimeout's 32-bit cap
-      this.idleReleaseTimer.unref();
-      return;
-    }
-  }
-
-  /**
-   * Heal a long-lived connection whose `.codegraph/` was removed and recreated
-   * at the same path (a worktree recreated, or `rm -rf .codegraph` + re-init)
-   * before handing it to a tool. Otherwise the daemon keeps serving the
-   * pre-removal snapshot from its now-unlinked file handle until restart — and
-   * because the daemon registry is keyed by path, a same-path recreate routes
-   * new clients straight back to this same stale daemon (#925). The check is one
-   * stat() and a no-op unless the inode actually changed; it never throws into a
-   * tool call.
-   */
-  private freshen(cg: CodeGraph): CodeGraph {
-    try {
-      if (cg.reopenIfReplaced()) {
-        process.stderr.write(
-          '[CodeGraph MCP] The index was replaced on disk (e.g. a git worktree ' +
-          'recreated at the same path); reopened the live database in place.\n'
-        );
-        this.onDatabaseReopened?.(cg);
-      }
-    } catch {
-      // Best-effort self-heal — a failed reopen must never break the tool call;
-      // the (still stale) handle keeps serving and the next call retries.
-    }
-    return cg;
-  }
-
-  /**
-   * Close all cached project connections
-   */
-  closeAll(): Promise<void> {
-    this.closing = true;
-    this.worktreeMismatchCache.clear();
-    if (this.idleReleaseTimer) clearTimeout(this.idleReleaseTimer);
-    this.idleReleaseTimer = null;
-    this.nestedRepoCache.clear();
-    this.trimProjects();
-    if (this.projectCache.size === 0 && this.activeCalls === 0 && this.pendingCloses === 0) return Promise.resolve();
-    return new Promise((resolve) => this.closeWaiters.push(resolve));
-  }
 
   /**
    * Validate that a value is a non-empty string within length bounds.
@@ -2485,12 +432,19 @@ export class ToolHandler {
     name: string,
     maxLength: number = MAX_INPUT_LENGTH
   ): string | ToolResult {
+    // Success-shaped guidance (#1403): a malformed argument is the CALLER's
+    // fixable mistake, not a broken toolset — an isError here teaches the agent
+    // to stop calling codegraph for the rest of the session.
     if (typeof value !== 'string' || value.length === 0) {
-      return this.errorResult(`${name} must be a non-empty string`);
+      return inputGuidanceResult(
+        `${name} must be a non-empty string (got ${describeArgValue(value)}) — ` +
+        `pass it as a plain string argument named "${name}"`
+      );
     }
     if (value.length > maxLength) {
-      return this.errorResult(
-        `${name} exceeds maximum length of ${maxLength} characters (got ${value.length})`
+      return inputGuidanceResult(
+        `${name} exceeds maximum length of ${maxLength} characters (got ${value.length}) — ` +
+        'shorten it to the symbol or file names you need'
       );
     }
     return value;
@@ -2506,54 +460,16 @@ export class ToolHandler {
   ): string | undefined | ToolResult {
     if (value === undefined || value === null) return undefined;
     if (typeof value !== 'string') {
-      return this.errorResult(`${name} must be a string`);
+      return inputGuidanceResult(`${name} must be a string (got ${describeArgValue(value)})`);
     }
     if (value.length > MAX_PATH_LENGTH) {
-      return this.errorResult(
+      return inputGuidanceResult(
         `${name} exceeds maximum length of ${MAX_PATH_LENGTH} characters (got ${value.length})`
       );
     }
     return value;
   }
 
-  /**
-   * Cached git worktree/index mismatch for a tool call's effective project.
-   *
-   * The "effective project" is what the request targets: an explicit
-   * `projectPath` arg, else the directory the server resolved its default
-   * project from (`defaultProjectHint`), else cwd. Memoized per start path —
-   * see `worktreeMismatchCache`. Best-effort: if the project can't be resolved
-   * (e.g. nothing initialized yet), it reports "no mismatch" so a tool is never
-   * broken by this check.
-   */
-  private worktreeMismatchFor(projectPath?: string): WorktreeIndexMismatch | null {
-    const startPath = projectPath ?? this.defaultProjectHint ?? process.cwd();
-
-    // The verdict depends on BOTH the start path AND the index root it resolves
-    // to, so the cache must be keyed on the pair. Resolve the index root first
-    // (cheap — getCodeGraph re-walks to the nearest .codegraph/, no git), then
-    // key on `(startPath, indexRoot)`. The moment that root changes — most
-    // importantly when a git worktree gains its own index and the walk-up stops
-    // there instead of at the parent checkout — the key changes and the verdict
-    // is recomputed, instead of serving the stale "borrowed the parent's index"
-    // warning for the server's whole lifetime. Keying on startPath alone pinned
-    // that first verdict until restart (#926).
-    let indexRoot: string;
-    try {
-      indexRoot = this.getCodeGraph(projectPath).getProjectRoot();
-    } catch {
-      // No resolvable project (or any other resolution error) → nothing to warn.
-      return null;
-    }
-
-    const cacheKey = `${startPath}\u0000${indexRoot}`;
-    const cached = this.worktreeMismatchCache.get(cacheKey);
-    if (cached !== undefined) return cached;
-
-    const mismatch = detectWorktreeIndexMismatch(startPath, indexRoot);
-    this.worktreeMismatchCache.set(cacheKey, mismatch);
-    return mismatch;
-  }
 
   /**
    * Prefix a successful read-tool result with a compact worktree-mismatch
@@ -2565,7 +481,7 @@ export class ToolHandler {
    */
   private withWorktreeNotice(result: ToolResult, projectPath?: string): ToolResult {
     if (result.isError) return result;
-    const mismatch = this.worktreeMismatchFor(projectPath);
+    const mismatch = this.projects.worktreeMismatchFor(projectPath);
     if (!mismatch) return result;
 
     const notice = worktreeMismatchNotice(mismatch);
@@ -2766,12 +682,22 @@ export class ToolHandler {
    */
   async execute(
     toolName: string,
-    args: Record<string, unknown>,
+    rawArgs: unknown,
     sessionState?: ExploreSessionState,
   ): Promise<ToolResult> {
-    if (this.closing) return this.textResult('This MCP session is closing; retry with a connected session.');
-    this.activeCalls++;
+    if (this.projects.closing) return this.textResult('This MCP session is closing; retry with a connected session.');
+    this.projects.activeCalls++;
     try {
+      // A name this server doesn't define: success-shaped guidance naming the
+      // real tools, never isError (that teaches the agent to abandon codegraph).
+      if (!tools.some((t) => t.name === toolName)) {
+        return this.unknownToolResult(toolName);
+      }
+      // One coercion step for every tool (see coerceToolArgs): non-object
+      // `arguments`, non-finite numbers and invalid enum values never reach a
+      // handler. Throws ToolInputError (→ success-shaped guidance) only for an
+      // enum value it can't map.
+      const args = coerceToolArgs(toolName, rawArgs);
       // Block the first tool call on the engine's post-open reconcile so we
       // never serve rows for files deleted/edited while no MCP server was
       // running. The wait is time-boxed (#905): a huge-repo reconcile takes
@@ -2780,14 +706,17 @@ export class ToolHandler {
       // gate stays installed until reconciliation settles, including on timeout.
       // Catch-up failures are logged by the engine; we proceed regardless so a
       // transient sync error never breaks tools.
-      if (this.catchUpGate) {
-        const gate = this.catchUpGate;
-        await this.awaitCatchUpGate(gate);
+      if (this.projects.catchUpGate) {
+        const gate = this.projects.catchUpGate;
+        await this.projects.awaitCatchUpGate(gate);
       }
       // Honor the optional tool allowlist (CODEGRAPH_MCP_TOOLS): a trimmed
       // surface rejects ablated tools defensively even if a client cached them.
       if (!this.isToolAllowed(toolName)) {
-        return this.errorResult(`Tool ${toolName} is disabled via CODEGRAPH_MCP_TOOLS`);
+        return inputGuidanceResult(
+          `tool ${toolName} is disabled via CODEGRAPH_MCP_TOOLS on this server; ` +
+          `the enabled tools are: ${this.getTools().map((t) => t.name).join(', ') || '(none)'}`
+        );
       }
       // Cross-cutting input validation. All tools accept an optional
       // `projectPath` and most accept either `query`, `task`, or
@@ -2802,7 +731,7 @@ export class ToolHandler {
       // serve it. Resolved on the main thread so the watcher lives here even
       // when dispatch is off-loaded to a worker.
       if (typeof pathCheck === 'string') {
-        await this.awaitProjectGate(pathCheck);
+        await this.projects.awaitProjectGate(pathCheck);
       }
       // The `path` and `pattern` properties used by codegraph_files are
       // also path-shaped — apply the same cap.
@@ -2892,31 +821,14 @@ export class ToolHandler {
       const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
       return this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
     } catch (err) {
-      // Expected condition, not a malfunction: answer as a SUCCESS so the
-      // agent keeps trusting the toolset for projects that ARE indexed.
-      // (An isError here teaches session-long abandonment — see NotIndexedError.)
-      // A running `codegraph index` rebuild is the same kind of expected,
-      // temporary condition (#1325). Matched by name: tools.ts stays free of
-      // the writer-lock module on the MCP startup path.
-      if (err instanceof NotIndexedError || (err as Error | null)?.name === 'RebuildInProgressError') {
-        return this.textResult((err as Error).message);
-      }
-      // Windows and WSL sharing one index (#995): the user's fix, not a malfunction.
-      if (err instanceof WslSharedIndexError) {
-        return this.textResult(wslSharedIndexGuidance(err));
-      }
-      // Security refusal: a clean error, no retry encouragement.
-      if (err instanceof PathRefusalError) {
-        return this.errorResult(err.message);
-      }
-      return this.errorResult(
-        `Tool execution failed: ${err instanceof Error ? err.message : String(err)}. ` +
-        'This is an internal codegraph error — retry the call once; if it persists, ' +
-        'continue without codegraph for this task.'
-      );
+      // One classifier for every path (see ./error-classifier): expected
+      // conditions (not indexed, rebuild running, bad arguments, WSL shared
+      // index) answer SUCCESS-shaped; security refusals and malfunctions stay
+      // isError. The worker path (executeReadTool) uses the same function.
+      return classifyError(err);
     } finally {
-      this.activeCalls--;
-      this.trimProjects();
+      this.projects.activeCalls--;
+      this.projects.trimProjects();
     }
   }
 
@@ -2984,24 +896,11 @@ export class ToolHandler {
    * watched main instance and stay on the main thread. Cross-cutting allowlist +
    * path validation already ran in {@link execute} before routing here.
    */
-  async executeReadTool(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+  async executeReadTool(toolName: string, args: unknown): Promise<ToolResult> {
     try {
-      return await this.dispatchTool(toolName, args);
+      return await this.dispatchTool(toolName, coerceToolArgs(toolName, args));
     } catch (err) {
-      if (err instanceof NotIndexedError) {
-        return this.textResult(err.message);
-      }
-      if (err instanceof WslSharedIndexError) {
-        return this.textResult(wslSharedIndexGuidance(err));
-      }
-      if (err instanceof PathRefusalError) {
-        return this.errorResult(err.message);
-      }
-      return this.errorResult(
-        `Tool execution failed: ${err instanceof Error ? err.message : String(err)}. ` +
-        'This is an internal codegraph error — retry the call once; if it persists, ' +
-        'continue without codegraph for this task.'
-      );
+      return classifyError(err);
     }
   }
 
@@ -3020,7 +919,7 @@ export class ToolHandler {
       case 'codegraph_explore': return await this.handleExplore(args);
       case 'codegraph_node': return await this.handleNode(args);
       case 'codegraph_files': return await this.handleFiles(args);
-      default: return this.errorResult(`Unknown tool: ${toolName}`);
+      default: return this.unknownToolResult(toolName);
     }
   }
 
@@ -3059,7 +958,7 @@ export class ToolHandler {
       return aGen - bGen;
     });
 
-    const formatted = this.formatSearchResults(ranked);
+    const formatted = formatSearchResults(ranked);
     return this.answerResult(cg, this.truncateOutput(formatted), ranked.map(r => r.node.filePath));
   }
 
@@ -3116,7 +1015,7 @@ export class ToolHandler {
             seen.add(c.node.id);
             callers.push(c.node);
             answerPaths.add(c.node.filePath);
-            const label = this.edgeLabel(c.edge);
+            const label = edgeLabel(c.edge);
             if (label) labels.set(c.node.id, label);
           }
         }
@@ -3138,7 +1037,7 @@ export class ToolHandler {
       const cut = callers.length > limit
         ? `\n\n> Showing ${limit} of ${callers.length} callers; pass \`limit\` (up to 100) to widen.`
         : '';
-      const formatted = this.formatNodeList(callers.slice(0, limit), `Callers of ${symbol}`, labels) + cut + note + filterNote;
+      const formatted = formatNodeList(callers.slice(0, limit), `Callers of ${symbol}`, labels) + cut + note + filterNote;
       return this.answerResult(cg, this.truncateOutput(formatted), answerPaths);
     }
 
@@ -3199,7 +1098,7 @@ export class ToolHandler {
             seen.add(c.node.id);
             callees.push(c.node);
             answerPaths.add(c.node.filePath);
-            const label = this.edgeLabel(c.edge);
+            const label = edgeLabel(c.edge);
             if (label) labels.set(c.node.id, label);
           }
         }
@@ -3220,7 +1119,7 @@ export class ToolHandler {
       const cut = callees.length > limit
         ? `\n\n> Showing ${limit} of ${callees.length} callees; pass \`limit\` (up to 100) to widen.`
         : '';
-      const formatted = this.formatNodeList(callees.slice(0, limit), `Callees of ${symbol}`, labels) + cut + note + filterNote;
+      const formatted = formatNodeList(callees.slice(0, limit), `Callees of ${symbol}`, labels) + cut + note + filterNote;
       return this.answerResult(cg, this.truncateOutput(formatted), answerPaths);
     }
 
@@ -3292,7 +1191,7 @@ export class ToolHandler {
 
     // Single definition (or same-file overloads): the familiar merged report.
     if (groups.length === 1) {
-      const formatted = this.formatImpact(symbol, impactOf(groups[0]!)) + (fileFilter && !filteredOut ? "" : allMatches.note) + filterNote;
+      const formatted = formatImpact(symbol, impactOf(groups[0]!)) + (fileFilter && !filteredOut ? "" : allMatches.note) + filterNote;
       return this.answerResult(cg, this.truncateOutput(formatted), answerPaths);
     }
 
@@ -3307,757 +1206,10 @@ export class ToolHandler {
       const line = head.startLine ? `:${head.startLine}` : '';
       sections.push(
         '',
-        this.formatImpact(`${head.qualifiedName} (${head.filePath}${line})`, impactOf(group))
+        formatImpact(`${head.qualifiedName} (${head.filePath}${line})`, impactOf(group))
       );
     }
     return this.answerResult(cg, this.truncateOutput(sections.join('\n') + filterNote), answerPaths);
-  }
-
-  /**
-   * Describe a synthesized (dynamic-dispatch) edge for human output: how the
-   * callback was wired up — the bridge static parsing can't see. Returns null
-   * for ordinary static edges. Used by trace + the node trail so a synthesized
-   * hop reads as "registered via onUpdate at App.tsx:3148", not a bare arrow.
-   */
-  /**
-   * The branch conditions a flow hop's call site runs under, read from the
-   * caller's source now (`graph/branch-guards.ts`); '' when unconditional,
-   * unreadable, or the grammar for that language is not loaded.
-   */
-  private whenLabel(cg: CodeGraph, caller: Node, edge: Edge): string {
-    if (!edge.line || !supportsBranchGuards(caller.language)) return '';
-    try {
-      const rec = cg.getFile(caller.filePath);
-      if (!rec) return '';
-      const abs = validatePathWithinRoot(cg.getProjectRoot(), caller.filePath);
-      if (!abs) return '';
-      const st = statSync(abs);
-      // Drifted since the index: the recorded line may point elsewhere.
-      if (st.size !== rec.size || Math.floor(st.mtimeMs) !== Math.floor(rec.modifiedAt)) return '';
-      const site = { line: edge.line, column: typeof edge.column === 'number' ? edge.column : null };
-      const g = guardsForFileSync(abs, caller.language, [site]).get(siteKey(site));
-      return g ? guardLabel(g) : '';
-    } catch {
-      return '';
-    }
-  }
-
-  private synthEdgeNote(edge: Edge | null): { label: string; compact: string; registeredAt?: string } | null {
-    if (!edge || edge.provenance !== 'heuristic') return null;
-    const m = edge.metadata as Record<string, unknown> | undefined;
-    const registeredAt = typeof m?.registeredAt === 'string' ? m.registeredAt : undefined;
-    const at = registeredAt ? ` @${registeredAt}` : '';
-    if (m?.synthesizedBy === 'callback') {
-      const via = m.via ? `\`${String(m.via)}\`` : 'a registrar';
-      const field = m.field ? ` on .${String(m.field)}` : '';
-      return {
-        label: `callback — registered via ${via}${field} (dynamic dispatch)`,
-        compact: `dynamic: callback via ${via}${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'http-client') {
-      const req = `${String(m.method ?? 'GET')} ${String(m.href ?? '')}`.trim();
-      return {
-        label: `HTTP request \`${req}\` — the client's call onto its own route (cross-tier)`,
-        compact: `dynamic: HTTP ${req}${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'queue-job') {
-      const job = m.event ? `\`${String(m.event)}\`` : 'a job';
-      const queue = m.queue ? ` on queue \`${String(m.queue)}\`` : '';
-      return {
-        label: `queue job ${job}${queue} — producer → consumer (cross-tier)`,
-        compact: `dynamic: queue job ${job}${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'event-bus') {
-      const ev = m.event ? `\`${String(m.event)}\`` : 'an event';
-      const what = m.channel === 'socket' ? 'socket message' : 'bus event';
-      const dir = m.tier === 'client→server' ? ', client → server' : m.tier === 'server→client' ? ', server → client' : '';
-      return {
-        label: `${what} ${ev} — emit → handler${dir} (dynamic dispatch)`,
-        compact: `dynamic: ${what} ${ev}${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'event-emitter') {
-      const ev = m.event ? `\`${String(m.event)}\`` : 'an event';
-      return {
-        label: `event ${ev} — emit → handler (dynamic dispatch)`,
-        compact: `dynamic: event ${ev}${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'react-render') {
-      return {
-        label: `React re-render — \`setState\` re-runs render() (dynamic dispatch)`,
-        compact: `dynamic: React re-render via setState${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'jsx-render') {
-      const child = m.via ? `<${String(m.via)}>` : 'a child component';
-      return {
-        label: `renders ${child} (JSX child — dynamic dispatch)`,
-        compact: `dynamic: renders ${child}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'vue-handler') {
-      const ev = m.event ? `@${String(m.event)}` : 'a template event';
-      return {
-        label: `Vue template handler — bound to ${ev} (dynamic dispatch)`,
-        compact: `dynamic: Vue ${ev} handler`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'interface-impl') {
-      return {
-        label: `interface/abstract dispatch — runs the implementation override (dynamic dispatch)`,
-        compact: `dynamic: interface → impl${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'closure-collection') {
-      const field = m.field ? `\`${String(m.field)}\`` : 'a collection';
-      return {
-        label: `closure collection — runs handlers appended to ${field} (dynamic dispatch)`,
-        compact: `dynamic: runs ${field} handlers${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'fn-pointer-dispatch') {
-      const via = m.via ? `\`${String(m.via)}\`` : 'a function pointer';
-      return {
-        label: `function-pointer dispatch via ${via} (dynamic dispatch)`,
-        compact: `dynamic: fn-pointer ${m.via ? String(m.via) : ''}${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'goframe-route') {
-      const route = m.route ? `\`${String(m.route)}\`` : 'a route';
-      return {
-        label: `GoFrame route ${route} — reflective Bind → controller method (dynamic dispatch)`,
-        compact: `dynamic: GoFrame route ${m.route ? String(m.route) : ''}${at}`,
-        registeredAt,
-      };
-    }
-    // Generic fallback for any other synthesizer (redux-thunk, gin-middleware-chain,
-    // flutter-build, …): a synthesized hop must never read as a bare static `calls`.
-    // It's a dynamic-dispatch bridge — label it as one and keep its wiring site.
-    if (typeof m?.synthesizedBy === 'string') {
-      const kind = m.synthesizedBy.replace(/-/g, ' ');
-      return { label: `${kind} (dynamic dispatch)`, compact: `dynamic: ${kind}${at}`, registeredAt };
-    }
-    return null;
-  }
-
-  /**
-   * Flow-from-named-symbols: an agent's codegraph_explore query is a bag of
-   * symbol names that usually spans the flow it's investigating (e.g.
-   * "PmsProductController getList PmsProductService list PmsProductServiceImpl").
-   * Surface the longest call chain AMONG those named symbols — scoped to what the
-   * agent explicitly named, so (unlike a fuzzy relevance set) there's no
-   * wrong-feature wandering. Rides synthesized edges, so controller→service-
-   * interface→impl shows up. Returns '' if no chain of >=3 nodes exists.
-   *
-   * Ambiguous tokens (Java `list` → dozens of nodes) are disambiguated by
-   * CO-NAMING: the agent names the class too, so we keep only `list` candidates
-   * whose qualifiedName contains another named token (`PmsProductServiceImpl::list`),
-   * dropping unrelated `OmsOrderService::list`.
-   */
-  private buildFlowFromNamedSymbols(cg: CodeGraph, query: string): { text: string; pathNodeIds: Set<string>; namedNodeIds: Set<string>; uniqueNamedNodeIds: Set<string>; spineCallSites: Map<string, number> } {
-    // spineCallSites: for each spine node, the line where it CALLS the next hop —
-    // lets the source assembler window an oversize spine method (e.g. n8n's 962-line
-    // processRunExecutionData) to the call site instead of dumping the whole body.
-    const EMPTY = { text: '', pathNodeIds: new Set<string>(), namedNodeIds: new Set<string>(), uniqueNamedNodeIds: new Set<string>(), spineCallSites: new Map<string, number>() };
-    try {
-      // Token resolution — parsing, overload disambiguation, the CONSTANT/
-      // VARIABLE synth endpoints — is shared with `/api/flow`, so a name written
-      // in the viewer's search box resolves to the same nodes it does here.
-      const flow = resolveNamedSymbolFlow(cg, query);
-      const { named, dynNamed, tokenNodes, tokenFamily, uniqueNamedNodeIds, preciseNamedIds } =
-        flow;
-      if (flow.tokens.length < 2) return EMPTY;
-      // Surface synthesized (heuristic) edges incident to a named symbol — INCLUDING
-      // the non-callable CONSTANT endpoints in `dynNamed`. `skipInChain` drops a hop
-      // already shown in the rendered main chain (a 2-node chain renders nothing, so a
-      // direct named→named synth hop still surfaces — #687).
-      const collectSynthLinks = (skipInChain: ((e: Edge) => boolean) | null): string[] => {
-        const synthLines: string[] = [];
-        const synthSeen = new Set<string>();
-        for (const n of [...named.values(), ...dynNamed.values()]) {
-          if (synthLines.length >= 6) break;
-          // RAW edges for the same reason as hasHeuristicEdge above — a static
-          // edge over the same pair hides the synthesized one from getCallers.
-          const incident = [...cg.getIncomingEdges(n.id), ...cg.getOutgoingEdges(n.id)];
-          for (const edge of incident) {
-            if (synthLines.length >= 6) break;
-            if (edge.provenance !== 'heuristic') continue;
-            const otherId = edge.source === n.id ? edge.target : edge.source;
-            if (otherId === n.id) continue;
-            const other = cg.getNode(otherId);
-            if (!other) continue;
-            if (skipInChain && skipInChain(edge)) continue;
-            const src = edge.source === n.id ? n : other;
-            const tgt = edge.source === n.id ? other : n;
-            const key = `${src.name}>${tgt.name}`;
-            if (synthSeen.has(key)) continue;
-            synthSeen.add(key);
-            const note = this.synthEdgeNote(edge);
-            synthLines.push(`- ${src.name} → ${tgt.name}   [${note ? note.compact : edge.kind}]`);
-          }
-        }
-        return synthLines;
-      };
-      /**
-       * No narrative to print — but the agent still NAMED symbols, and their
-       * identity is a separate output from the prose (CG-38).
-       *
-       * `namedNodeIds` is not decoration: downstream it injects the named def into
-       * the file's cluster ranges and ranks it importance 9, which is the whole
-       * mechanism behind "a symbol the agent named renders" (the assembler's
-       * named-def injection). Returning EMPTY here threw that away whenever the
-       * named symbols happened not to form a call chain — two sibling closures in
-       * one factory (`queueMessage` / `flushQueuedMessages`, neither calling the
-       * other) produce no chain, no synth hop and no dispatch boundary, so BOTH
-       * defs lost importance 9 and the file rendered from its head instead: the
-       * agent got the `QueuedMessage` interface at L70 and had to Read the file
-       * for the functions at L1087/L1102 it had asked for by name.
-       *
-       * Restricted to SHAPE-PRECISE tokens. With a narrative present the prose is
-       * itself corroboration that the resolution was right, so that path keeps
-       * every named id as before; with nothing corroborating it, only an
-       * unambiguous symbol reference may promote — an English word in a prose
-       * question that happens to exact-match a callable must not earn importance 9.
-       * Same distinction, same test, as the gather path's `isPreciseToken`.
-       */
-      const identityOnly = () => (preciseNamedIds.size === 0 ? EMPTY : {
-        text: '',
-        pathNodeIds: new Set<string>(),
-        namedNodeIds: new Set<string>(preciseNamedIds),
-        uniqueNamedNodeIds: new Set<string>([...uniqueNamedNodeIds].filter((id) => preciseNamedIds.has(id))),
-        spineCallSites: new Map<string, number>(),
-      });
-      if (named.size < 2) {
-        // <2 CALLABLES resolved. Two recoveries before giving up: (1) synthesized
-        // edges among named CONSTANT/VARIABLE endpoints — RTK thunk→thunk is
-        // constant→constant, so `named` can be empty while `dynNamed` holds the
-        // whole chain; (2) the one resolved callable's body may hold the
-        // dynamic-dispatch site that EXPLAINS a half-connected flow.
-        const synthLines = collectSynthLinks(null);
-        const boundaries = named.size === 0 ? '' : (this.buildDynamicBoundaries(cg, [...named.values()], named) || '');
-        if (synthLines.length === 0 && !boundaries) return identityOnly();
-        const out: string[] = [];
-        if (synthLines.length) out.push(
-          '**Dynamic-dispatch links among your symbols**',
-          '(synthesized — the indirect hops grep/Read would reconstruct; the `@file:line` is the wiring site)',
-          '', ...synthLines, '');
-        if (boundaries) out.push(boundaries);
-        out.push('> Full source for these symbols is below.\n');
-        return { text: out.join('\n'), pathNodeIds: new Set(), namedNodeIds: new Set<string>([...named.keys(), ...dynNamed.keys()]), uniqueNamedNodeIds, spineCallSites: new Map<string, number>() };
-      }
-      // The search itself lives in `../graph/named-symbol-flow`, so the viewer's
-      // Flow strip rides exactly this path finder rather than a second one that
-      // could disagree with it. What stays here is the PROSE — the narrative,
-      // the dynamic-dispatch links, the boundary announcements.
-      const best = flow.chains[0]?.steps ?? null;
-      const hasMain = !!best && best.length >= 3;
-      const pathIds = new Set((best ?? []).map((s) => s.node.id));
-      // Where each spine node calls the NEXT hop — lets the assembler window an
-      // oversize spine method to the call instead of dumping the whole body.
-      const spineCallSites = flow.chains[0]?.callSites ?? new Map<string, number>();
-
-      // Dynamic-boundary scan (#687) — fires ONLY when the flow the agent
-      // asked about did not fully connect: some token resolved to nodes but
-      // none of them sit on the main chain (or there is no chain at all). A
-      // healthy flow skips this entirely. Scan order: the chain's dead end
-      // first (where the partial flow stops), then the disconnected symbols,
-      // agent-specific (unique-named) ones first.
-      let boundaryText = '';
-      {
-        const uncovered: Node[] = [];
-        if (!hasMain) {
-          // No rendered chain — but a 2-node chain still CONNECTS its two
-          // endpoints (e.g. via one synthesized hop, surfaced below as a
-          // dynamic-dispatch link). Only nodes off that short chain are
-          // unexplained breaks worth scanning.
-          for (const n of named.values()) if (!pathIds.has(n.id)) uncovered.push(n);
-        } else {
-          for (const ids of tokenNodes.values()) {
-            if (ids.length === 0 || ids.some((id) => pathIds.has(id))) continue;
-            for (const id of ids) { const n = named.get(id); if (n) uncovered.push(n); }
-          }
-        }
-        if (uncovered.length > 0) {
-          const scanList: Node[] = [];
-          if (hasMain) scanList.push(best![best!.length - 1]!.node);
-          scanList.push(...uncovered.sort((a, b) =>
-            (uniqueNamedNodeIds.has(b.id) ? 1 : 0) - (uniqueNamedNodeIds.has(a.id) ? 1 : 0)));
-          boundaryText = this.buildDynamicBoundaries(cg, scanList, named);
-        }
-      }
-
-      // Interface/registry-dispatch announcement (extends #687 to GRAPH-visible
-      // polymorphism). A method the agent NAMED that resolves to a large same-name
-      // family AND did not land on the main chain is almost always a runtime
-      // dispatch (plugin/strategy/handler interface): the concrete target is chosen
-      // at runtime from N implementations, so no single static edge is the answer.
-      // The body-scan above can't see this — `nodeType.execute()` is textually an
-      // ordinary call; the polymorphism lives in the graph (implements edges), so
-      // detect it there. Fires ONLY for an uncovered named token; a connected flow
-      // stays silent.
-      let polyText = '';
-      {
-        const POLY_MIN_FAMILY = 8; // smaller families are overload sets, not dispatch
-        const polyCands: Array<{ token: string; family: Node[] }> = [];
-        for (const [t, fam] of tokenFamily) {
-          if (fam.length < POLY_MIN_FAMILY) continue;
-          const ids = tokenNodes.get(t) || [];
-          if (ids.some((id) => pathIds.has(id))) continue; // covered by the flow — silent
-          polyCands.push({ token: t, family: fam });
-        }
-        if (polyCands.length) polyText = this.buildPolymorphicBoundaries(cg, polyCands, named);
-      }
-
-      // Supplementary: dynamic-dispatch (synthesized) edges incident to a named
-      // symbol (incl. the non-callable CONSTANT endpoints in `dynNamed`) — the
-      // indirect hops an agent would otherwise grep/Read to reconstruct ("where do
-      // the appended `validators` actually run?"). Surfaced even when the OTHER end
-      // wasn't named. The skip drops a hop already in the rendered main chain; a
-      // 2-node chain renders nothing (hasMain false) so a direct named→named synth
-      // hop still surfaces — too short for Flow, but #687-visible here.
-      const synthLines = collectSynthLinks(
-        hasMain ? (e: Edge) => pathIds.has(e.source) && pathIds.has(e.target) : null
-      );
-
-      if (!hasMain && synthLines.length === 0 && !boundaryText && !polyText) return identityOnly();
-      const out: string[] = [];
-      if (hasMain) {
-        out.push('**Flow (call path among the symbols you queried)**', '');
-        for (let i = 0; i < best!.length; i++) {
-          const step = best![i]!;
-          if (step.edge) {
-            const sy = this.synthEdgeNote(step.edge);
-            const when = i > 0 ? this.whenLabel(cg, best![i - 1]!.node, step.edge) : '';
-            out.push(`   ↓ ${sy ? sy.compact : step.edge.kind}${when ? ` (when ${when})` : ''}`);
-          }
-          out.push(`${i + 1}. ${step.node.name} (${step.node.filePath}:${step.node.startLine})`);
-        }
-        out.push('');
-      }
-      if (synthLines.length) {
-        out.push(
-          '**Dynamic-dispatch links among your symbols**',
-          '(synthesized — the indirect hops grep/Read would reconstruct; the `@file:line` is the wiring site)',
-          '',
-          ...synthLines,
-          ''
-        );
-      }
-      if (boundaryText) out.push(boundaryText);
-      if (polyText) out.push(polyText);
-      out.push('> Full source for these symbols is below — the call flow among them, followed by their bodies.', '');
-      // namedNodeIds = every callable the agent explicitly named (a superset of
-      // the spine). A file holding one is something the agent asked to SEE, so it
-      // must keep full source even if it's an off-spine polymorphic sibling — the
-      // agent named `getResponseWithInterceptorChain` / `SQLCompiler.execute_sql`
-      // as the mechanism, not as an interchangeable leaf. See the skeleton gate.
-      return { text: out.join('\n'), pathNodeIds: pathIds, namedNodeIds: new Set<string>([...named.keys(), ...dynNamed.keys()]), uniqueNamedNodeIds, spineCallSites };
-    } catch {
-      return EMPTY;
-    }
-  }
-
-  /**
-   * Dynamic-boundary surfacing (#687): when the flow among the agent's named
-   * symbols does not fully connect, scan the disconnected symbols' bodies for
-   * dynamic-dispatch sites (computed member calls, getattr, reflection, typed
-   * message buses, runtime-keyed emits) and ANNOUNCE the boundary — the exact
-   * site, the form, and (when a key is statically visible) candidate targets —
-   * instead of guessing edges. The answer to "how does A reach B" when no
-   * static path exists IS the dispatch site: that's where the flow continues
-   * at runtime. Query-time, deterministic, zero graph mutation; a fully
-   * connected flow never reaches this method.
-   */
-  private buildDynamicBoundaries(cg: CodeGraph, scanList: Node[], named: Map<string, Node>): string {
-    const MAX_NOTES = 4; // boundary bullets per explore
-    // The verdict is not derived here — `findDynamicBoundaries` produces it and
-    // the viewer's end cap renders the same object, so the two can never
-    // disagree about where a flow stops. What is left here is the prose.
-    const reports = findDynamicBoundaries(cg, scanList, { named, maxSites: MAX_NOTES });
-    const notes: string[] = [];
-    for (const report of reports) {
-      if (notes.length >= MAX_NOTES) break;
-      for (const site of report.sites) {
-        if (notes.length >= MAX_NOTES) break;
-        const more = site.moreSites
-          ? ` (+${site.moreSites} more such site${site.moreSites > 1 ? 's' : ''} in this body)`
-          : '';
-        notes.push(`- \`${report.node.name}\` (${report.node.filePath}:${site.line}) — ${site.label}: \`${site.snippet}\`${more}`);
-        const cand = this.boundaryCandidates(site);
-        if (cand) notes.push(`  ${cand}`);
-      }
-    }
-    if (notes.length === 0) return '';
-    return [
-      '**Dynamic boundaries (the static path ends at runtime dispatch)**',
-      '',
-      ...notes,
-      '',
-      '> These sites choose their call target at runtime (registry / bus / reflection) — the site shown IS where the flow continues. To follow it, run codegraph_explore or codegraph_node on a candidate; source for the sites above is included below.',
-      '',
-    ].join('\n');
-  }
-
-  /**
-   * Interface/registry-dispatch announcement — #687 extended to GRAPH-visible
-   * polymorphism (the body-scan can't see it: `nodeType.execute()` is textually
-   * an ordinary call; the polymorphism lives in the `implements`/`extends` edges).
-   *
-   * A method the agent named that resolves to a large same-name family whose
-   * definers overwhelmingly implement/extend ONE supertype is a runtime dispatch:
-   * the concrete target is chosen at runtime from N implementations, so no single
-   * static edge is "the answer" — the implementations ARE the continuations. We
-   * announce the supertype, its TRUE implementer count, and a few concrete targets,
-   * then steer to codegraph_explore. Graph-only, query-time, zero mutation; the
-   * caller fires it ONLY for an UNCOVERED named token, so a connected flow is silent.
-   *
-   * Robust to FTS sampling bias: the same-name family is a capped FTS sample that
-   * over-represents whatever FTS ranks first (n8n: DB `TableOperation.execute`
-   * outnumbered `INodeType.execute` in the sample 7:6 even though INodeType has
-   * 611 implementers vs a handful). So candidate supertypes are ranked by their
-   * TRUE graph-wide implementer count, NOT their frequency in the sample.
-   */
-  private buildPolymorphicBoundaries(cg: CodeGraph, candidates: Array<{ token: string; family: Node[] }>, named: Map<string, Node>): string {
-    const CLASSY = new Set(['class', 'struct', 'interface', 'trait', 'protocol', 'abstract']);
-    const MIN_IMPL = 8;     // a supertype needs >= this many implementers to count as "polymorphic"
-    const MIN_SUPPORT = 2;  // >= this many sampled definers must share the supertype (ties it to the token)
-    const SAMPLE = 40;      // family members inspected per token
-    const MAX_NOTES = 3;
-    const rel = (p: string) => p.replace(/\\/g, '/');
-    const containerOf = (m: Node): Node | null => {
-      try { const ce = cg.getIncomingEdges(m.id).find((e) => e.kind === 'contains'); return ce ? cg.getNode(ce.source) : null; }
-      catch { return null; }
-    };
-    // A supertype dispatches only a member it (or an ancestor) declares. Without
-    // this, any name shared by enough subclasses read as dispatch through their
-    // common base: on vscode the query word `extension`, a getter on unrelated
-    // classes that all extend `Disposable`, was announced as "runtime dispatch to
-    // 2706 types implementing Disposable" at the top of 9 of 31 answers.
-    //
-    // A Swift protocol and each of its extensions are separate nodes of one name,
-    // and a conformer's edge may land on any of them (Alamofire's
-    // `RequestInterceptor` conformers point at an extension in OfflineRetrier.swift
-    // that has no `adapt`), so every same-named type is asked. The answer is
-    // `unknown`, and the announcement stays, whenever absence can't be judged:
-    // nothing on the chain has indexed members of the family's sort, or an
-    // interface/protocol on it has none (Swift requirements aren't nodes, so
-    // `URLRequestConvertible` can't be said to lack `asURLRequest`).
-    const memberOfSupertype = (typeId: string, name: string, callable: boolean): 'declared' | 'absent' | 'unknown' => {
-      const counts = (kind: string) => !callable || kind === 'method' || kind === 'function';
-      let sawMembers = false;
-      let opaque = false;
-      const seen = new Set<string>();
-      const visit = (id: string, depth: number): boolean => {
-        if (seen.has(id)) return false;
-        seen.add(id);
-        let node: Node | null = null;
-        let edges: ReturnType<typeof cg.getOutgoingEdges> = [];
-        try { node = cg.getNode(id); edges = cg.getOutgoingEdges(id); } catch { return false; }
-        let own = 0;
-        for (const e of edges) {
-          if (e.kind !== 'contains') continue;
-          let child: Node | null = null;
-          try { child = cg.getNode(e.target); } catch { child = null; }
-          if (!child) continue;
-          if (child.name === name) return true;
-          if (counts(child.kind)) own++;
-        }
-        if (own > 0) sawMembers = true;
-        else if (node && (node.kind === 'interface' || node.kind === 'protocol' || node.kind === 'trait')) opaque = true;
-        if (depth >= 3) return false;
-        return edges.some((e) => (e.kind === 'extends' || e.kind === 'implements') && visit(e.target, depth + 1));
-      };
-      let root: Node | null = null;
-      try { root = cg.getNode(typeId); } catch { root = null; }
-      let namesakes: Node[] = [];
-      try {
-        namesakes = root
-          ? cg.getNodesByName(root.name).filter((n) => n.language === root!.language && CLASSY.has(n.kind))
-          : [];
-      } catch { namesakes = []; }
-      if (visit(typeId, 0) || namesakes.some((n) => visit(n.id, 0))) return 'declared';
-      return sawMembers && !opaque ? 'absent' : 'unknown';
-    };
-    const notes: string[] = [];
-    const seenSuper = new Set<string>();
-    for (const { token, family } of candidates) {
-      if (notes.length >= MAX_NOTES) break;
-      const memberName = family[0]?.name ?? token;
-      const callableFamily = family[0]?.kind === 'method' || family[0]?.kind === 'function';
-      // supertype id → how many sampled definers share it + a few example definers
-      const supers = new Map<string, { node: Node; count: number; targets: Node[] }>();
-      for (const m of family.slice(0, SAMPLE)) {
-        const container = containerOf(m);
-        if (!container || !CLASSY.has(container.kind)) continue;
-        let sups: Node[] = [];
-        try {
-          sups = cg.getOutgoingEdges(container.id)
-            .filter((e) => e.kind === 'implements' || e.kind === 'extends')
-            .map((e) => { try { return cg.getNode(e.target); } catch { return null; } })
-            .filter((n): n is Node => !!n && CLASSY.has(n.kind) && (n.name?.length || 0) >= 3);
-        } catch { /* no supertypes — free function or unresolved */ }
-        for (const s of sups) {
-          const e = supers.get(s.id) || { node: s, count: 0, targets: [] };
-          e.count++;
-          if (e.targets.length < 6) e.targets.push(m);
-          supers.set(s.id, e);
-        }
-      }
-      // Pick the supertype with the most TRUE implementers (graph-wide), among
-      // those genuinely shared by the token's definers.
-      let best: { node: Node; impl: number; targets: Node[] } | null = null;
-      for (const { node, count, targets } of supers.values()) {
-        if (count < MIN_SUPPORT) continue;
-        // The implementer count is `countImplementers` — the same function the
-        // viewer's type-hierarchy fan counts with, so "dispatch to N types
-        // implementing X" is the same N on both surfaces (CG-58). Distinct
-        // types, not edges: a class tied to its supertype by both a parsed
-        // `extends` and a synthesized `implements` is one implementation.
-        const impl = countImplementers(cg, node.id);
-        if (impl < MIN_IMPL) continue;
-        if (best && impl <= best.impl) continue;
-        if (memberOfSupertype(node.id, memberName, callableFamily) === 'absent') continue;
-        best = { node, impl, targets };
-      }
-      if (!best || seenSuper.has(best.node.id)) continue;
-      seenSuper.add(best.node.id);
-      const namedNames = new Set([...named.values()].map((n) => n.name));
-      const eg = best.targets.slice(0, 4).map((m) => {
-        const cont = containerOf(m);
-        const disp = cont ? `${cont.name}.${m.name}` : (m.qualifiedName || m.name);
-        const mark = cont && namedNames.has(cont.name) ? ' ← you named this' : '';
-        return `\`${disp}\` (${rel(m.filePath)}:${m.startLine})${mark}`;
-      });
-      const more = best.impl > eg.length ? ` +${best.impl - eg.length} more` : '';
-      notes.push(`- \`${token}\` → runtime dispatch to **${best.impl}** types implementing \`${best.node.name}\` — the static path ends here, the target is chosen at runtime. e.g. ${eg.join(', ')}${more}`);
-    }
-    if (notes.length === 0) return '';
-    return [
-      '**Interface dispatch (a named method has many implementations)**',
-      '',
-      ...notes,
-      '',
-      '> The method above is dispatched at runtime to one of the listed implementations (a registry / plugin / strategy interface) — there is no single static caller→callee edge; the implementations ARE the continuations. To follow one, run codegraph_explore on a listed target.',
-      '',
-    ].join('\n');
-  }
-
-  /**
-   * Render the candidate shortlist for a dispatch site as one line.
-   *
-   * The shortlist itself is `shortlistBoundaryCandidates` in
-   * `../graph/dynamic-boundary-report` — shared with the viewer's end cap, so
-   * "candidates for key `save`" names the same symbols in both places. Symbols
-   * the agent already named are marked: that is the "you were right, here's the
-   * wiring" case.
-   */
-  private boundaryCandidates(site: BoundarySite): string {
-    if (site.candidates.length === 0) return site.candidateNote ?? '';
-    const list = site.candidates.map((c) =>
-      `\`${c.display}\` (${c.node.filePath}:${c.node.startLine})${c.named ? ' ← you named this' : ''}`
-    );
-    return `candidates for key \`${site.key}\`: ${list.join(', ')}`;
-  }
-
-  /**
-   * Compact "blast radius" for the entry symbols of an explore result: who
-   * depends on each (callers) and which test files cover it — LOCATIONS ONLY,
-   * no source, so the agent knows what to update / re-verify before editing
-   * without reaching for a separate impact call. Always-on, but skips symbols
-   * that have no dependents (nothing to warn about), and returns '' when none
-   * qualify so a leaf-only exploration stays clean.
-   */
-  private buildBlastRadiusSection(
-    cg: CodeGraph,
-    subgraph: Subgraph,
-    /**
-     * Exact targets (a qualified name, a line anchor) lead the list. The search
-     * roots are whatever FTS ranked first for the bare name, so without this a
-     * query for `SQLCompiler.as_sql` headlined `SQLInsertCompiler.as_sql` — and
-     * the agent took that as the tool having found the wrong method.
-     */
-    leadingIds: Iterable<string> = [],
-  ): string {
-    const ROOT_CAP = 5; // only the symbols the query actually targeted
-    const FILE_CAP = 4; // caller files listed per symbol before "+N more"
-    const MEANINGFUL = new Set<string>([
-      'function', 'method', 'class', 'interface', 'struct', 'union', 'trait', 'protocol',
-      'enum', 'type_alias', 'component', 'constant', 'variable', 'property', 'field',
-    ]);
-    const rel = (p: string) => p.replace(/\\/g, '/');
-
-    const roots = [...new Set([...leadingIds, ...subgraph.roots])]
-      .map((id) => subgraph.nodes.get(id))
-      .filter((n): n is Node => !!n && MEANINGFUL.has(n.kind))
-      .slice(0, ROOT_CAP);
-    if (roots.length === 0) return '';
-
-    const entries: string[] = [];
-    for (const root of roots) {
-      let callers: Array<{ node: Node }> = [];
-      try { callers = cg.getCallers(root.id) as Array<{ node: Node }>; } catch { /* skip this root */ }
-
-      const seen = new Set<string>();
-      const uniq: Node[] = [];
-      for (const c of callers) {
-        if (c?.node && !seen.has(c.node.id)) { seen.add(c.node.id); uniq.push(c.node); }
-      }
-      if (uniq.length === 0) continue; // no blast radius → nothing to flag
-
-      const callerFiles = [...new Set(uniq.map((n) => rel(n.filePath)))];
-      const testFiles = callerFiles.filter((f) => isTestFile(f));
-      const nonTest = callerFiles.filter((f) => !isTestFile(f));
-
-      const shown = nonTest.slice(0, FILE_CAP).map((f) => `\`${f}\``).join(', ');
-      const more = nonTest.length > FILE_CAP ? ` +${nonTest.length - FILE_CAP} more` : '';
-      const where = nonTest.length > 0 ? ` in ${shown}${more}` : '';
-      const tests = testFiles.length > 0
-        ? `; tests: ${testFiles.slice(0, FILE_CAP).map((f) => `\`${f}\``).join(', ')}${testFiles.length > FILE_CAP ? ` +${testFiles.length - FILE_CAP}` : ''}`
-        : this.indirectTestNote(cg, uniq, rel);
-
-      entries.push(
-        `- \`${root.name}\` (${rel(root.filePath)}:${root.startLine}) — ${uniq.length} caller${uniq.length === 1 ? '' : 's'}${where}${tests}`,
-      );
-    }
-    if (entries.length === 0) return '';
-
-    return [
-      '**Blast radius — what depends on these (update/verify before editing)**',
-      '',
-      ...entries,
-      '',
-    ].join('\n');
-  }
-
-  /**
-   * Test-coverage note for a blast-radius entry whose DIRECT callers include no
-   * test file. A helper called only by production code can still be exercised
-   * by tests further up the caller chain (#1475: 40% of directly-unflagged
-   * symbols had a test within 2-3 hops), so walk up to 2 more hops before
-   * claiming anything — and even then claim only what was measured.
-   */
-  private indirectTestNote(cg: CodeGraph, directCallers: Node[], rel: (p: string) => string): string {
-    const MAX_HOPS = 3; // direct callers are hop 1
-    const BUDGET = 64;  // getCallers lookups per entry — bounds god-fan-in symbols
-    const FILE_CAP = 2;
-    let budget = BUDGET;
-    const visited = new Set(directCallers.map((n) => n.id));
-    let frontier = directCallers;
-    for (let hop = 2; hop <= MAX_HOPS && frontier.length > 0 && budget > 0; hop++) {
-      const next: Node[] = [];
-      const found = new Set<string>();
-      for (const node of frontier) {
-        if (budget-- <= 0) break;
-        let callers: Array<{ node: Node }> = [];
-        try { callers = cg.getCallers(node.id) as Array<{ node: Node }>; } catch { continue; }
-        for (const c of callers) {
-          const n = c?.node;
-          if (!n || visited.has(n.id)) continue;
-          visited.add(n.id);
-          const f = rel(n.filePath);
-          if (isTestFile(f)) found.add(f);
-          else next.push(n);
-        }
-      }
-      if (found.size > 0) {
-        const files = [...found];
-        const shown = files.slice(0, FILE_CAP).map((f) => `\`${f}\``).join(', ');
-        const more = files.length > FILE_CAP ? ` +${files.length - FILE_CAP}` : '';
-        return `; tested via callers: ${shown}${more}`;
-      }
-      frontier = next;
-    }
-    // Budget exhaustion means hops 2-3 weren't fully searched — fall back to
-    // the weaker claim that IS established by the direct-caller check.
-    return budget > 0
-      ? `; no tests found within ${MAX_HOPS} caller hops`
-      : '; no test calls this directly';
-  }
-
-  /**
-   * Graph-connectivity relevance via Random-Walk-with-Restart (personalized
-   * PageRank) from the query's matched SEED nodes over the call/reference graph.
-   *
-   * This is the ranking signal text search (FTS/bm25) CANNOT provide, and it's
-   * codegraph's home turf: relevance by STRUCTURE, not words. A file whose
-   * symbols are call-connected to the matched cluster accrues walk mass and
-   * ranks high; a lone TEXT match — e.g. `LensSwitcher.swift` matched the word
-   * "switch" from `switchOrganization`, but calls none of `setUser`/`fetchUser`
-   * — gets only its own restart probability and ranks ~0. Immune to the
-   * tokenization trap that fools term matching, deterministic, no embeddings.
-   *
-   * Undirected adjacency (reachability both ways), restart α=0.25 to the seeds,
-   * power iteration to convergence. Bounded to the already-relevant subgraph, so
-   * it's a few hundred nodes × ~25 iterations — negligible cost.
-   */
-  private computeGraphRelevance(
-    nodeIds: string[],
-    edges: Edge[],
-    seedIds: Set<string>,
-  ): Map<string, number> {
-    const out = new Map<string, number>();
-    const n = nodeIds.length;
-    if (n === 0) return out;
-    const idx = new Map<string, number>();
-    for (let i = 0; i < n; i++) idx.set(nodeIds[i]!, i);
-
-    const RANK_EDGES = new Set<string>([
-      'calls', 'references', 'extends', 'implements', 'overrides',
-      'instantiates', 'returns', 'type_of', 'imports', 'navigates',
-    ]);
-    const adj: number[][] = Array.from({ length: n }, () => []);
-    for (const e of edges) {
-      if (!RANK_EDGES.has(e.kind)) continue;
-      const i = idx.get(e.source);
-      const j = idx.get(e.target);
-      if (i === undefined || j === undefined || i === j) continue;
-      adj[i]!.push(j);
-      adj[j]!.push(i); // undirected — reachable either direction
-    }
-
-    // Restart vector: uniform over seeds present in the candidate set. (Falls
-    // back to uniform-over-all if no seed landed in the set, so we never return
-    // all-zero.)
-    const r = new Array<number>(n).fill(0);
-    let rsum = 0;
-    for (const id of seedIds) {
-      const i = idx.get(id);
-      if (i !== undefined) { r[i] = 1; rsum += 1; }
-    }
-    if (rsum === 0) { for (let i = 0; i < n; i++) r[i] = 1; rsum = n; }
-    for (let i = 0; i < n; i++) r[i]! /= rsum;
-
-    const alpha = 0.25;
-    let s = r.slice();
-    for (let iter = 0; iter < 25; iter++) {
-      const next = new Array<number>(n).fill(0);
-      for (let i = 0; i < n; i++) {
-        const si = s[i]!;
-        if (si === 0) continue;
-        const d = adj[i]!.length;
-        if (d === 0) { next[i]! += si; continue; } // dangling: keep its mass
-        const share = si / d;
-        for (const j of adj[i]!) next[j]! += share;
-      }
-      for (let i = 0; i < n; i++) s[i] = (1 - alpha) * next[i]! + alpha * r[i]!;
-    }
-    for (let i = 0; i < n; i++) out.set(nodeIds[i]!, s[i]!);
-    return out;
   }
 
   /**
@@ -4878,7 +2030,7 @@ export class ToolHandler {
       if (seed && isDampedDeclaration(seed.filePath)) continue;
       rwrSeedIds.add(id);
     }
-    const nodeRwr = this.computeGraphRelevance(
+    const nodeRwr = computeGraphRelevance(
       // Fall back to the unfiltered seeds when EVERY seed is damped: the walk
       // must not lose its restart vector and return all-uniform.
       [...subgraph.nodes.keys()], subgraph.edges,
@@ -5086,7 +2238,7 @@ export class ToolHandler {
     // Blast radius (always-on, compact): for the entry symbols, who depends on
     // them + which tests cover them — locations only, no source — so the agent
     // knows what to update/verify before editing without a separate call.
-    const blastRadius = this.buildBlastRadiusSection(cg, subgraph, exactNodeIds);
+    const blastRadius = buildBlastRadiusSection(cg, subgraph, exactNodeIds);
     if (blastRadius) lines.push(blastRadius);
 
     // Relationship map — show how symbols connect
@@ -5131,7 +2283,7 @@ export class ToolHandler {
     // The Flow section labels each hop with its branch conditions; that read
     // is synchronous, so the grammars it needs are loaded here, once.
     await warmBranchGuardGrammars();
-    const flow = this.buildFlowFromNamedSymbols(cg, matchQuery);
+    const flow = buildFlowFromNamedSymbols(cg, matchQuery);
 
     // The symbols the question is about: exact targets, the named ones, the spine.
     const questionIds = new Set([...exactNodeIds, ...flow.pathNodeIds, ...flow.namedNodeIds]);
@@ -7595,7 +4747,18 @@ export class ToolHandler {
 
     let matches = this.findSymbolMatches(cg, symbol);
     if (matches.length === 0) {
-      return this.textResult(`Symbol "${symbol}" not found in the codebase`);
+      const suggestions = suggestSymbolNames(cg, symbol);
+      // Success-shaped, and never a fuzzy body presented as the typed name
+      // (#1473): close names are offered as suggestions only.
+      const lines = [`Symbol "${symbol}" not found in the codebase (no exact match).`];
+      if (suggestions.length > 0) {
+        lines.push(
+          '',
+          `Did you mean: ${suggestions.map((n) => `\`${n}\``).join(', ')}?`,
+          '_These are suggestions, not answers — call codegraph_node again with the exact name you want._',
+        );
+      }
+      return this.textResult(lines.join('\n'));
     }
 
     // Disambiguate a heavily-overloaded name to a specific definition the caller
@@ -7887,13 +5050,13 @@ export class ToolHandler {
       // (members + signatures + line numbers) instead; leaf symbols return their
       // full body.
       if (CONTAINER_NODE_KINDS.has(node.kind)) {
-        outline = this.buildContainerOutline(cg, node);
+        outline = buildContainerOutline(cg, node);
       }
       if (!outline) {
         code = await cg.getCode(node.id);
       }
     }
-    return this.formatNodeDetails(node, code, outline) + this.formatTrail(cg, node);
+    return formatNodeDetails(node, code, outline) + formatTrail(cg, node);
   }
 
   // Whole-file fallback caps for a drifted file (#1474): small enough to fit
@@ -7953,46 +5116,7 @@ export class ToolHandler {
         `> ⚠ \`${node.filePath}\` changed on disk after it was last indexed — the indexed line range for this symbol no longer reliably matches, so its body is omitted rather than risk showing a different symbol's code. For current content, call codegraph_node with \`file: "${node.filePath}"\` (no symbol; \`offset\`/\`limit\` narrow it like Read), or Read the file. The change is picked up automatically on that project's next index sync.`,
       );
     }
-    return lines.join('\n') + this.formatTrail(cg, node);
-  }
-
-  /**
-   * Build the "trail" for a symbol: its direct callees (what it calls) and
-   * callers (what calls it), each with file:line — so codegraph_node doubles as
-   * the structural Grep→Read→expand primitive: a spot PLUS where to go next.
-   * Capped to stay cheap. Walk the graph by calling codegraph_node on a trail
-   * entry; no Read needed for covered hops. Empty edges on a non-leaf often mean
-   * dynamic dispatch the static graph couldn't resolve — that absence is itself
-   * a signal (read that one hop) rather than a dead end.
-   */
-  private formatTrail(cg: CodeGraph, node: Node): string {
-    const TRAIL_CAP = 12;
-    const fmt = (e: { node: Node; edge: Edge }) => {
-      const base = `${e.node.name} (${e.node.filePath}:${e.node.startLine})`;
-      const synth = this.synthEdgeNote(e.edge);
-      return synth ? `${base} [${synth.compact}]` : base;
-    };
-    const collect = (edges: Array<{ node: Node; edge: Edge }>): Array<{ node: Node; edge: Edge }> => {
-      const seen = new Set<string>([node.id]);
-      const out: Array<{ node: Node; edge: Edge }> = [];
-      for (const e of edges) {
-        if (seen.has(e.node.id)) continue;
-        seen.add(e.node.id);
-        out.push(e);
-      }
-      return out;
-    };
-    const callees = collect(cg.getCallees(node.id));
-    const callers = collect(cg.getCallers(node.id));
-    if (callees.length === 0 && callers.length === 0) return '';
-    const lines: string[] = ['', '**Trail — codegraph_node any of these to follow it (no Read needed)**'];
-    if (callees.length > 0) {
-      lines.push(`**Calls →** ${callees.slice(0, TRAIL_CAP).map(fmt).join(', ')}${callees.length > TRAIL_CAP ? `, +${callees.length - TRAIL_CAP} more` : ''}`);
-    }
-    if (callers.length > 0) {
-      lines.push(`**Called by ←** ${callers.slice(0, TRAIL_CAP).map(fmt).join(', ')}${callers.length > TRAIL_CAP ? `, +${callers.length - TRAIL_CAP} more` : ''}`);
-    }
-    return lines.join('\n');
+    return lines.join('\n') + formatTrail(cg, node);
   }
 
   /**
@@ -8018,7 +5142,7 @@ export class ToolHandler {
     // Queries then reflect that tree's branch, not the worktree being edited.
     // status shows the verbose, multi-line form; the read tools get the compact
     // one-liner via withWorktreeNotice. Both share the cached detection.
-    const mismatch = this.worktreeMismatchFor(args.projectPath as string | undefined);
+    const mismatch = this.projects.worktreeMismatchFor(args.projectPath as string | undefined);
 
     const lines: string[] = [
       '**CodeGraph Status**',
@@ -8171,8 +5295,9 @@ export class ToolHandler {
 
     // Filter by glob pattern
     if (pattern) {
-      const regex = this.globToRegex(pattern);
-      files = files.filter(f => regex.test(f.path));
+      const matcher = compileFileGlob(pattern);
+      if (typeof matcher === 'string') return inputGuidanceResult(matcher);
+      files = files.filter(f => matcher(f.path));
     }
 
     if (files.length === 0) {
@@ -8183,155 +5308,18 @@ export class ToolHandler {
     let output: string;
     switch (format) {
       case 'flat':
-        output = this.formatFilesFlat(files, includeMetadata);
+        output = formatFilesFlat(files, includeMetadata);
         break;
       case 'grouped':
-        output = this.formatFilesGrouped(files, includeMetadata);
+        output = formatFilesGrouped(files, includeMetadata);
         break;
       case 'tree':
       default:
-        output = this.formatFilesTree(files, includeMetadata, maxDepth);
+        output = formatFilesTree(files, includeMetadata, maxDepth);
         break;
     }
 
     return this.textResult(this.truncateOutput(output));
-  }
-
-  /**
-   * Convert glob pattern to regex
-   */
-  private globToRegex(pattern: string): RegExp {
-    const escaped = pattern
-      .replace(/[.+^${}()|[\]\\]/g, '\\$&')  // Escape special regex chars except * and ?
-      .replace(/\*\*/g, '{{GLOBSTAR}}')       // Temp placeholder for **
-      .replace(/\*/g, '[^/]*')                // * matches anything except /
-      .replace(/\?/g, '[^/]')                 // ? matches single char except /
-      .replace(/\{\{GLOBSTAR\}\}/g, '.*');    // ** matches anything including /
-    return new RegExp(escaped);
-  }
-
-  /**
-   * Format files as a flat list
-   */
-  private formatFilesFlat(files: { path: string; language: string; nodeCount: number }[], includeMetadata: boolean): string {
-    const lines: string[] = [`**Files (${files.length})**`, ''];
-
-    for (const file of files.sort((a, b) => a.path.localeCompare(b.path))) {
-      if (includeMetadata) {
-        lines.push(`- ${file.path} (${file.language}, ${file.nodeCount} symbols)`);
-      } else {
-        lines.push(`- ${file.path}`);
-      }
-    }
-
-    return lines.join('\n');
-  }
-
-  /**
-   * Format files grouped by language
-   */
-  private formatFilesGrouped(files: { path: string; language: string; nodeCount: number }[], includeMetadata: boolean): string {
-    const byLang = new Map<string, typeof files>();
-
-    for (const file of files) {
-      const existing = byLang.get(file.language) || [];
-      existing.push(file);
-      byLang.set(file.language, existing);
-    }
-
-    const lines: string[] = [`**Files by Language (${files.length} total)**`, ''];
-
-    // Sort languages by file count (descending)
-    const sortedLangs = [...byLang.entries()].sort((a, b) => b[1].length - a[1].length);
-
-    for (const [lang, langFiles] of sortedLangs) {
-      lines.push(`**${lang} (${langFiles.length})**`);
-      for (const file of langFiles.sort((a, b) => a.path.localeCompare(b.path))) {
-        if (includeMetadata) {
-          lines.push(`- ${file.path} (${file.nodeCount} symbols)`);
-        } else {
-          lines.push(`- ${file.path}`);
-        }
-      }
-      lines.push('');
-    }
-
-    return lines.join('\n');
-  }
-
-  /**
-   * Format files as a tree structure
-   */
-  private formatFilesTree(
-    files: { path: string; language: string; nodeCount: number }[],
-    includeMetadata: boolean,
-    maxDepth?: number
-  ): string {
-    // Build tree structure
-    interface TreeNode {
-      name: string;
-      children: Map<string, TreeNode>;
-      file?: { language: string; nodeCount: number };
-    }
-
-    const root: TreeNode = { name: '', children: new Map() };
-
-    for (const file of files) {
-      const parts = file.path.split('/');
-      let current = root;
-
-      for (let i = 0; i < parts.length; i++) {
-        const part = parts[i];
-        if (!part) continue;
-
-        if (!current.children.has(part)) {
-          current.children.set(part, { name: part, children: new Map() });
-        }
-        current = current.children.get(part)!;
-
-        // If this is the last part, it's a file
-        if (i === parts.length - 1) {
-          current.file = { language: file.language, nodeCount: file.nodeCount };
-        }
-      }
-    }
-
-    // Render tree
-    const lines: string[] = [`**Project Structure (${files.length} files)**`, ''];
-
-    const renderNode = (node: TreeNode, prefix: string, isLast: boolean, depth: number): void => {
-      if (maxDepth !== undefined && depth > maxDepth) return;
-
-      const connector = isLast ? '└── ' : '├── ';
-      const childPrefix = isLast ? '    ' : '│   ';
-
-      if (node.name) {
-        let line = prefix + connector + node.name;
-        if (node.file && includeMetadata) {
-          line += ` (${node.file.language}, ${node.file.nodeCount} symbols)`;
-        }
-        lines.push(line);
-      }
-
-      const children = [...node.children.values()];
-      // Sort: directories first, then files, both alphabetically
-      children.sort((a, b) => {
-        const aIsDir = a.children.size > 0 && !a.file;
-        const bIsDir = b.children.size > 0 && !b.file;
-        if (aIsDir !== bIsDir) return aIsDir ? -1 : 1;
-        return a.name.localeCompare(b.name);
-      });
-
-      for (let i = 0; i < children.length; i++) {
-        const child = children[i]!;
-        const nextPrefix = node.name ? prefix + childPrefix : prefix;
-        renderNode(child, nextPrefix, i === children.length - 1, depth + 1);
-      }
-    };
-
-    renderNode(root, '', true, 0);
-
-    return lines.join('\n');
   }
 
   // =========================================================================
@@ -8339,73 +5327,15 @@ export class ToolHandler {
   // =========================================================================
 
   /**
-   * Find a symbol by name, handling disambiguation when multiple matches exist.
-   * Returns the best match and a note about alternatives if any.
-   */
-  /**
-   * Check if a node matches a symbol query — see `matchesSymbol` in
-   * `../graph/symbol-lookup`, which owns the rules.
-   */
-  private matchesSymbol(node: Node, symbol: string): boolean {
-    return matchesSymbol(node, symbol);
-  }
-
-  /**
    * Find ALL definitions matching a name, ranked, so codegraph_node can return
-   * every overload instead of guessing one (the wrong guess → a Read). Keepers
-   * rank before generated stubs (.pb.go etc.); stable within a group preserves
-   * FTS order. Returns [] when nothing matches; a qualified lookup that finds no
-   * exact match returns [] rather than a misleading fuzzy file hit (#173); a
-   * bare name with no exact match falls back to the single top fuzzy result.
+   * every overload instead of guessing one (the wrong guess → a Read). Thin
+   * wrapper over `lookupSymbolNodes` in `../graph/symbol-lookup` — the one
+   * derivation shared with callers/callees/impact and the CLI. Returns [] when
+   * nothing matches exactly: a partial or mistyped name never resolves to the
+   * top fuzzy hit (#1473, #1455).
    */
   private findSymbolMatches(cg: CodeGraph, symbol: string): Node[] {
-    const isQualified = /[.\/]|::/.test(symbol);
-
-    // For a bare name, enumerate EVERY exact-name definition via the direct index
-    // (not FTS, which caps + ranks): tokio's `poll` has 50+ defs and the one the
-    // caller wants (`Harness::poll` at harness.rs:153) ranks below any search cut,
-    // so it could be neither rendered nor pinned by the file/line disambiguator —
-    // and the agent Read it. With the full set, the multi-overload render + the
-    // file/line filter can both reach it.
-    if (!isQualified) {
-      const exact = cg.getNodesByName(symbol);
-      if (exact.length > 0) {
-        const isGen = cg.generatedFilePredicate(exact.map((n) => n.filePath));
-        return [...exact].sort((a, b) => (isGen(a.filePath) ? 1 : 0) - (isGen(b.filePath) ? 1 : 0));
-      }
-      // No exact match — use the single top fuzzy result (e.g. a file basename).
-      const fuzzy = cg.searchNodes(symbol, { limit: 10 });
-      return fuzzy[0] ? [fuzzy[0].node] : [];
-    }
-
-    // Qualified lookup (`Session.request`, `stage_apply::run`): FTS + matchesSymbol.
-    const limit = 50;
-    let results = cg.searchNodes(symbol, { limit });
-
-    // FTS strips colons, so `stage_apply::run` searches the literal
-    // `stage_applyrun` and finds nothing. Re-search by the bare last part and
-    // let `matchesSymbol` filter by qualifier.
-    if (isQualified && results.length === 0) {
-      const tail = lastQualifierPart(symbol);
-      if (tail && tail !== symbol) results = cg.searchNodes(tail, { limit });
-    }
-
-    if (results.length === 0) return [];
-
-    const exactMatches = results.filter((r) => this.matchesSymbol(r.node, symbol));
-    if (exactMatches.length === 0) {
-      // No exact match — a qualified lookup must not fall back to a fuzzy file
-      // hit (#173); a bare name may use the single top fuzzy result.
-      return isQualified ? [] : results[0] ? [results[0].node] : [];
-    }
-
-    // Down-rank generated files (.pb.go, .pulsar.go, _grpc.pb.go, and anything
-    // whose header declares it generated) so a flow query prefers the keeper
-    // implementation over the generated stub.
-    const isGen = cg.generatedFilePredicate(exactMatches.map((r) => r.node.filePath));
-    return [...exactMatches]
-      .sort((a, b) => (isGen(a.node.filePath) ? 1 : 0) - (isGen(b.node.filePath) ? 1 : 0))
-      .map((r) => r.node);
+    return lookupSymbolNodes(cg, symbol).nodes;
   }
 
   /**
@@ -8434,143 +5364,21 @@ export class ToolHandler {
   // Formatting helpers (compact by default to reduce context usage)
   // =========================================================================
 
-  private formatSearchResults(results: SearchResult[]): string {
-    const lines: string[] = [`**Search Results (${results.length} found)**`, ''];
-
-    for (const result of results) {
-      const { node } = result;
-      const location = node.startLine ? `:${node.startLine}` : '';
-      // Compact format: one line per result with key info
-      lines.push(`**${node.name}** (${node.kind})`);
-      lines.push(`${node.filePath}${location}`);
-      if (node.signature) lines.push(`\`${node.signature}\``);
-      lines.push('');
-    }
-
-    return lines.join('\n');
-  }
-
-  private formatNodeList(nodes: Node[], title: string, labels?: Map<string, string>): string {
-    const lines: string[] = [`**${title} (${nodes.length} found)**`, ''];
-
-    for (const node of nodes) {
-      const location = node.startLine ? `:${node.startLine}` : '';
-      // Compact: just name, kind, location — plus the relationship when it
-      // isn't a plain call (callback registration, instantiation, …).
-      const label = labels?.get(node.id);
-      lines.push(
-        `- ${node.name} (${node.kind}) - ${node.filePath}${location}${label ? ` — via ${label}` : ''}`
-      );
-    }
-
-    return lines.join('\n');
-  }
-
-  /**
-   * Relationship label for a non-`calls` edge in callers/callees lists. A
-   * function-as-value edge (#756) is the high-signal one: `callers(cb)`
-   * showing "via callback registration" tells the agent this is where the
-   * callback is WIRED, not where it's invoked.
-   */
-  private edgeLabel(edge: Edge): string | null {
-    if (edge.kind === 'calls') return null;
-    if (edge.metadata?.fnRef === true) return 'callback registration';
-    if (edge.kind === 'instantiates') return 'instantiation';
-    if (edge.kind === 'imports') return 'import';
-    if (edge.kind === 'references') return 'reference';
-    return edge.kind;
-  }
-
-  private formatImpact(symbol: string, impact: Subgraph): string {
-    const nodeCount = impact.nodes.size;
-
-    // Compact format: just list affected symbols grouped by file
-    const lines: string[] = [
-      `**Impact: "${symbol}" affects ${nodeCount} symbols**`,
-      '',
-    ];
-
-    // Group by file
-    const byFile = new Map<string, Node[]>();
-    for (const node of impact.nodes.values()) {
-      const existing = byFile.get(node.filePath) || [];
-      existing.push(node);
-      byFile.set(node.filePath, existing);
-    }
-
-    for (const [file, nodes] of byFile) {
-      lines.push(`**${file}:**`);
-      // Compact: inline list
-      const nodeList = nodes.map(n => `${n.name}:${n.startLine}`).join(', ');
-      lines.push(nodeList);
-      lines.push('');
-    }
-
-    return lines.join('\n');
-  }
-
-  /**
-   * Build a compact structural outline of a container symbol from its
-   * indexed children (methods, fields, properties, …) — name, kind,
-   * line number, and signature — so the agent gets the shape of a class
-   * without the full source of every method. Returns '' when the container
-   * has no indexed children, so the caller can fall back to full source.
-   */
-  private buildContainerOutline(cg: CodeGraph, node: Node): string {
-    const children = cg.getChildren(node.id)
-      .filter(c => c.kind !== 'import' && c.kind !== 'export')
-      .sort((a, b) => (a.startLine ?? 0) - (b.startLine ?? 0));
-    if (children.length === 0) return '';
-
-    const lines = [`**Members (${children.length}):**`, ''];
-    for (const c of children) {
-      const loc = c.startLine ? `:${c.startLine}` : '';
-      const sig = c.signature ? ` — \`${c.signature}\`` : '';
-      lines.push(`- ${c.name} (${c.kind})${loc}${sig}`);
-    }
-    return lines.join('\n');
-  }
-
-  private formatNodeDetails(node: Node, code: string | null, outline?: string | null): string {
-    const location = node.startLine ? `:${node.startLine}` : '';
-    const lines: string[] = [
-      `**${node.name}** (${node.kind})`,
-      '',
-      `**Location:** ${node.filePath}${location}`,
-    ];
-
-    if (node.signature) {
-      lines.push(`**Signature:** \`${node.signature}\``);
-    }
-
-    // Only include docstring if it's short and useful
-    if (node.docstring && node.docstring.length < 200) {
-      lines.push('', node.docstring);
-    }
-
-    if (outline) {
-      lines.push('', outline, '',
-        `> Structural outline only. Read \`${node.filePath}\` or call codegraph_node on a specific member for its body.`);
-    } else if (code) {
-      // Line-numbered (cat -n style, like codegraph_explore and Read) so the
-      // agent can cite/edit exact lines without re-Reading the file for them.
-      const numbered = node.startLine ? numberSourceLines(code, node.startLine) : code;
-      lines.push('', '```' + node.language, numbered, '```');
-    }
-
-    return lines.join('\n');
-  }
-
   private textResult(text: string): ToolResult {
     return {
       content: [{ type: 'text', text }],
     };
   }
 
-  private errorResult(message: string): ToolResult {
-    return {
-      content: [{ type: 'text', text: `Error: ${message}` }],
-      isError: true,
-    };
+  /**
+   * Success-shaped guidance for a tool name this server doesn't define (a typo,
+   * a stale cached name, a client-added prefix): names the real tools so the
+   * next call lands.
+   */
+  private unknownToolResult(toolName: string): ToolResult {
+    return inputGuidanceResult(
+      `unknown tool "${toolName}"; the tools this server exposes are: ` +
+      (this.getTools().map((t) => t.name).join(', ') || '(none)')
+    );
   }
 }

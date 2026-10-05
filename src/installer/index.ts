@@ -72,6 +72,12 @@ export interface RunInstallerOptions {
    * autoAllow=true, target=auto. For scripting / CI.
    */
   yes?: boolean;
+  /**
+   * Opt into the Claude Code search gate hook (#2313) without the prompt.
+   * `undefined` → ask interactively (default NO); under `--yes` it is left
+   * untouched, never enabled.
+   */
+  gateHook?: boolean;
 }
 
 /**
@@ -230,6 +236,25 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     }
   }
 
+  // Step 4⅞: search gate hook (Claude Code only, #2313). A PreToolUse hook
+  // that holds Grep/Glob and Bash rg/grep/find in an indexed project until the
+  // session has made one CodeGraph call. Strictly opt-in, default NO: --yes
+  // never enables it (`undefined` leaves whatever is there untouched), and
+  // `codegraph upgrade` / `install --refresh` never wire it.
+  let gateHook: boolean | undefined = opts.gateHook;
+  if (gateHook === undefined && !useDefaults && targets.some((t) => t.id === 'claude')) {
+    const ans = await clack.confirm({
+      message:
+        'Require a CodeGraph query before Grep/Glob/rg/find in indexed projects? Blocks text search until the session asks CodeGraph once (opt-in; Claude Code only).',
+      initialValue: false,
+    });
+    if (clack.isCancel(ans)) {
+      clack.cancel('Installation cancelled.');
+      process.exit(0);
+    }
+    gateHook = ans; // false → opt out; install() strips any prior gate hook
+  }
+
   // Step 5: per-target install loop.
   const installedIds: TargetId[] = [];
   let sawCreated = false;
@@ -241,7 +266,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
       );
       continue;
     }
-    const result = target.install(location, { autoAllow, promptHook });
+    const result = target.install(location, { autoAllow, promptHook, gateHook });
     installedIds.push(target.id);
     for (const file of result.files) {
       if (file.action === 'created') sawCreated = true;
@@ -408,7 +433,7 @@ export interface RefreshReport {
  * Strictly a refresh, never a first install:
  *   - targets that aren't `alreadyConfigured` are skipped untouched;
  *   - permissions are not written (`autoAllow: false`) and the prompt
- *     hook is left as-is (`promptHook: undefined`), so choices the user
+ *     and gate hooks are left as-is (`promptHook`/`gateHook: undefined`), so choices the user
  *     made at install time — or by hand since — are preserved.
  *
  * Every write underneath is the targets' own idempotent upsert, so a
@@ -428,7 +453,7 @@ export function refreshTargets(
     if (!target.detect(location).alreadyConfigured) {
       return { ...base, status: 'not-configured' as const, changedPaths: [] };
     }
-    const result = target.install(location, { autoAllow: false, promptHook: undefined });
+    const result = target.install(location, { autoAllow: false, promptHook: undefined, gateHook: undefined });
     const changedPaths = result.files
       .filter((f) => f.action === 'created' || f.action === 'updated' || f.action === 'removed')
       .map((f) => f.path);

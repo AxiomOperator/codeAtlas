@@ -75,6 +75,12 @@ export interface InstallOptions {
    * leaves it untouched. Targets without a prompt-hook concept ignore it.
    */
   promptHook?: boolean;
+  /**
+   * Opt-in search gate hook (Claude `PreToolUse`, #2313): holds Grep/Glob and
+   * Bash rg/grep/find until the session has made one CodeGraph call. Same
+   * tri-state as `promptHook`; never auto-enabled. Ignored by other targets.
+   */
+  gateHook?: boolean;
 }
 
 export interface AgentTarget {

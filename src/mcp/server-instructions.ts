@@ -16,7 +16,21 @@
  * DEFAULT_MCP_TOOLS in tools.ts) — reference only that tool here. The other
  * tools (node/search/callers/…) stay defined and are re-enablable via
  * CODEGRAPH_MCP_TOOLS, but they are NOT listed to agents, so don't name them.
+ *
+ * Tool names: the text says `codegraph_explore` in every mode. With the
+ * default names that is the tool's own name; with `CODEGRAPH_TOOL_PREFIX=none`
+ * (bare `explore`, for clients that prefix tools with the server key — #1267,
+ * see tool-names.ts) the client itself turns it back into `codegraph_explore`,
+ * so the names written here are the ones the model actually sees either way.
+ *
+ * A project can APPEND its own notes via `.codegraph/instructions.md` (#765) —
+ * see {@link withProjectInstructions}. They never replace this text.
  */
+
+import * as fs from 'fs';
+import * as path from 'path';
+import { getCodeGraphDir } from '../directory';
+
 export const SERVER_INSTRUCTIONS = `# Codegraph — code intelligence over an indexed knowledge graph
 
 Codegraph is a SQLite knowledge graph of every symbol, edge, and file in
@@ -109,3 +123,54 @@ default project — but the tools are available and work **per project**:
   if it comes up they can run \`codegraph init\` in a project to enable codegraph
   there (a new index is picked up live, no restart).
 `;
+
+/** Cap on the appended project notes — they ride every session's system prompt. */
+export const PROJECT_INSTRUCTIONS_MAX_BYTES = 4096;
+export const PROJECT_INSTRUCTIONS_FILE = 'instructions.md';
+
+/**
+ * Contents of `<root>/.codegraph/instructions.md`, trimmed and capped at
+ * {@link PROJECT_INSTRUCTIONS_MAX_BYTES} — or null when absent, empty, not a
+ * regular file (a symlink is refused, so the file can't be pointed at
+ * something outside the project), or unreadable. Synchronous and bounded (one
+ * lstat + one ≤4 KB read) so the #172 respond-fast handshake contract holds.
+ */
+export function readProjectInstructions(root: string | null | undefined): string | null {
+  if (!root) return null;
+  try {
+    const file = path.join(getCodeGraphDir(root), PROJECT_INSTRUCTIONS_FILE);
+    const st = fs.lstatSync(file);
+    if (!st.isFile()) return null;
+    const fd = fs.openSync(file, 'r');
+    let text: string;
+    try {
+      const buf = Buffer.alloc(Math.min(st.size, PROJECT_INSTRUCTIONS_MAX_BYTES));
+      const n = fs.readSync(fd, buf, 0, buf.length, 0);
+      text = buf.subarray(0, n).toString('utf8');
+    } finally {
+      fs.closeSync(fd);
+    }
+    // A cut inside a multi-byte character decodes to U+FFFD — drop it.
+    text = text.replace(/\uFFFD+$/, '').trim();
+    if (!text) return null;
+    return st.size > PROJECT_INSTRUCTIONS_MAX_BYTES
+      ? `${text}\n\n[…truncated: .codegraph/${PROJECT_INSTRUCTIONS_FILE} exceeds ${PROJECT_INSTRUCTIONS_MAX_BYTES} bytes]`
+      : text;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `base` with the project's `.codegraph/instructions.md` APPENDED (#765) — a
+ * supported place to qualify the built-in guidance for one workspace (e.g. "edges
+ * between same-named Swift and TS symbols are name-matched; confirm them"). The
+ * notes are fenced under their own heading so the agent can tell them from the
+ * server's text; the built-in playbook is never replaced. Returns `base`
+ * unchanged when there is no such file.
+ */
+export function withProjectInstructions(base: string, root: string | null | undefined): string {
+  const notes = readProjectInstructions(root);
+  if (!notes) return base;
+  return `${base}\n## Project notes (from .codegraph/${PROJECT_INSTRUCTIONS_FILE})\n\n${notes}\n`;
+}

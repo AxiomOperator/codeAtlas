@@ -215,7 +215,7 @@ describe('ToolHandler connection cache (#1057)', () => {
 
     // Evict the entry the way a bounded cache does: drop the key, close the
     // connection. The other spelling must not be left holding a closed handle.
-    const cache = (handler as unknown as { projectCache: Map<string, CodeGraph> }).projectCache;
+    const cache = (handler as unknown as { projects: { projectCache: Map<string, CodeGraph> } }).projects.projectCache;
     for (const [key, cg] of cache) {
       if (cg === first) {
         cache.delete(key);

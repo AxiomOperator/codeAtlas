@@ -49,7 +49,7 @@ describe('CODEGRAPH_MCP_TOOLS allowlist', () => {
   it('rejects a disabled tool on execute (defense in depth)', async () => {
     process.env[ENV] = 'node';
     const res = await new ToolHandler(null).execute('codegraph_explore', {});
-    expect(res.isError).toBe(true);
+    expect(res.isError).toBeFalsy(); // success-shaped guidance (plan 3.2)
     expect(res.content[0].text).toMatch(/disabled via CODEGRAPH_MCP_TOOLS/);
   });
 

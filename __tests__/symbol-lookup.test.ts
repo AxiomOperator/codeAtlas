@@ -415,11 +415,17 @@ describe.skipIf(!HAS_SQLITE)('lookupSymbolNodes — the shared path used by call
   it.each(['grou', 'Group'])('rejects fuzzy-only bare name "%s" (#1473)', (symbol) => {
     expect(cg.getNodesByName(symbol)).toEqual([]);
     expect(cg.searchNodes(symbol).length).toBeGreaterThan(0);
-    expect(lookupSymbolNodes(cg, symbol)).toEqual({ nodes: [], ambiguous: false });
+    const res = lookupSymbolNodes(cg, symbol);
+    expect(res.nodes).toEqual([]);
+    expect(res.ambiguous).toBe(false);
+    // Fuzzy hits survive only as did-you-mean suggestions, never as nodes.
+    expect(res.suggestions).toContain('group');
   });
 
   it('rejects an unknown qualifier even when the bare tail exists (#173)', () => {
     expect(cg.getNodesByName('group').length).toBeGreaterThan(0);
-    expect(lookupSymbolNodes(cg, 'missing.group')).toEqual({ nodes: [], ambiguous: false });
+    const res = lookupSymbolNodes(cg, 'missing.group');
+    expect(res.nodes).toEqual([]);
+    expect(res.ambiguous).toBe(false);
   });
 });

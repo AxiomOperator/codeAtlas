@@ -49,28 +49,28 @@ describe('MCP input size limits', () => {
   it('rejects an oversize query on codegraph_search', async () => {
     const huge = 'a'.repeat(20_000);
     const result = await handler.execute('codegraph_search', { query: huge });
-    expect(result.isError).toBe(true);
+    expect(result.isError).toBeFalsy(); // success-shaped guidance (plan 3.2)
     expect(result.content[0]!.text).toMatch(/maximum length/i);
   });
 
   it('rejects an oversize query on codegraph_explore', async () => {
     const huge = 'b'.repeat(50_000);
     const result = await handler.execute('codegraph_explore', { query: huge });
-    expect(result.isError).toBe(true);
+    expect(result.isError).toBeFalsy(); // success-shaped guidance (plan 3.2)
     expect(result.content[0]!.text).toMatch(/maximum length/i);
   });
 
   it('rejects an oversize symbol on codegraph_callers', async () => {
     const huge = 'c'.repeat(15_000);
     const result = await handler.execute('codegraph_callers', { symbol: huge });
-    expect(result.isError).toBe(true);
+    expect(result.isError).toBeFalsy(); // success-shaped guidance (plan 3.2)
     expect(result.content[0]!.text).toMatch(/maximum length/i);
   });
 
   it('rejects an oversize symbol on codegraph_impact', async () => {
     const huge = 'd'.repeat(11_000);
     const result = await handler.execute('codegraph_impact', { symbol: huge });
-    expect(result.isError).toBe(true);
+    expect(result.isError).toBeFalsy(); // success-shaped guidance (plan 3.2)
     expect(result.content[0]!.text).toMatch(/maximum length/i);
   });
 
@@ -80,21 +80,21 @@ describe('MCP input size limits', () => {
       query: 'alpha',
       projectPath: hugePath,
     });
-    expect(result.isError).toBe(true);
+    expect(result.isError).toBeFalsy(); // success-shaped guidance (plan 3.2)
     expect(result.content[0]!.text).toMatch(/projectPath/);
   });
 
   it('rejects an oversize path filter on codegraph_files', async () => {
     const hugePath = 'src/' + 'y'.repeat(5_000);
     const result = await handler.execute('codegraph_files', { path: hugePath });
-    expect(result.isError).toBe(true);
+    expect(result.isError).toBeFalsy(); // success-shaped guidance (plan 3.2)
     expect(result.content[0]!.text).toMatch(/path/);
   });
 
   it('rejects an oversize glob pattern on codegraph_files', async () => {
     const hugePattern = '*'.repeat(5_000);
     const result = await handler.execute('codegraph_files', { pattern: hugePattern });
-    expect(result.isError).toBe(true);
+    expect(result.isError).toBeFalsy(); // success-shaped guidance (plan 3.2)
     expect(result.content[0]!.text).toMatch(/pattern/);
   });
 
@@ -103,7 +103,7 @@ describe('MCP input size limits', () => {
       query: 'alpha',
       projectPath: 12345 as unknown as string,
     });
-    expect(result.isError).toBe(true);
+    expect(result.isError).toBeFalsy(); // success-shaped guidance (plan 3.2)
     expect(result.content[0]!.text).toMatch(/projectPath/);
   });
 });

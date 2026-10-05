@@ -375,13 +375,13 @@ describe('MCP Input Validation', () => {
 
   it('should reject non-string query in codegraph_search', async () => {
     const result = await handler.execute('codegraph_search', { query: null });
-    expect(result.isError).toBe(true);
+    expect(result.isError).toBeFalsy(); // success-shaped guidance (plan 3.2)
     expect(result.content[0].text).toContain('non-empty string');
   });
 
   it('should reject empty string query in codegraph_search', async () => {
     const result = await handler.execute('codegraph_search', { query: '' });
-    expect(result.isError).toBe(true);
+    expect(result.isError).toBeFalsy(); // success-shaped guidance (plan 3.2)
     expect(result.content[0].text).toContain('non-empty string');
   });
 
@@ -398,13 +398,13 @@ describe('MCP Input Validation', () => {
 
   it('should reject non-string symbol in codegraph_callers', async () => {
     const result = await handler.execute('codegraph_callers', { symbol: 123 });
-    expect(result.isError).toBe(true);
+    expect(result.isError).toBeFalsy(); // success-shaped guidance (plan 3.2)
     expect(result.content[0].text).toContain('non-empty string');
   });
 
   it('should reject non-string query in codegraph_explore', async () => {
     const result = await handler.execute('codegraph_explore', { query: undefined });
-    expect(result.isError).toBe(true);
+    expect(result.isError).toBeFalsy(); // success-shaped guidance (plan 3.2)
     expect(result.content[0].text).toContain('non-empty string');
   });
 
@@ -441,17 +441,17 @@ describe('MCP Input Validation', () => {
 
   it('should reject non-string symbol in codegraph_impact', async () => {
     const result = await handler.execute('codegraph_impact', { symbol: [] });
-    expect(result.isError).toBe(true);
+    expect(result.isError).toBeFalsy(); // success-shaped guidance (plan 3.2)
   });
 
   it('should reject non-string symbol in codegraph_node', async () => {
     const result = await handler.execute('codegraph_node', { symbol: false });
-    expect(result.isError).toBe(true);
+    expect(result.isError).toBeFalsy(); // success-shaped guidance (plan 3.2)
   });
 
   it('should reject non-string symbol in codegraph_callees', async () => {
     const result = await handler.execute('codegraph_callees', { symbol: {} });
-    expect(result.isError).toBe(true);
+    expect(result.isError).toBeFalsy(); // success-shaped guidance (plan 3.2)
   });
 
   it('should handle NaN limit gracefully', async () => {

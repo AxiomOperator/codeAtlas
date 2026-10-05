@@ -162,6 +162,36 @@ export function validatePathWithinRoot(
   }
 }
 
+/** Options for {@link validateProjectPath}. */
+export interface ValidateProjectPathOptions {
+  /**
+   * Whether `dir` holds a codegraph index (normally `directory.isInitialized`,
+   * injected so this low-level module stays free of that import). When given,
+   * a path under `~/.config` that IS — or sits inside — an indexed project
+   * (an index at the path or an ancestor within `~/.config`) is allowed.
+   * Omitted → the blanket `~/.config` refusal applies.
+   */
+  isIndexed?: (dir: string) => boolean;
+}
+
+/** Walk from `resolved` up to `boundary` (inclusive) looking for an index. */
+function hasIndexedProjectWithin(
+  resolved: string,
+  boundary: string,
+  isIndexed: (dir: string) => boolean,
+): boolean {
+  let current = resolved;
+  for (;;) {
+    try {
+      if (isIndexed(current)) return true;
+    } catch { /* unreadable — keep refusing */ }
+    if (current === boundary) return false;
+    const parent = path.dirname(current);
+    if (parent === current) return false;
+    current = parent;
+  }
+}
+
 /**
  * Validate that a path is a safe project root directory.
  *
@@ -172,7 +202,7 @@ export function validatePathWithinRoot(
  * @param dirPath - The path to validate
  * @returns An error message if invalid, or null if valid
  */
-export function validateProjectPath(dirPath: string): string | null {
+export function validateProjectPath(dirPath: string, options: ValidateProjectPathOptions = {}): string | null {
   const resolved = path.resolve(dirPath);
 
   // Block sensitive system directories
@@ -186,6 +216,16 @@ export function validateProjectPath(dirPath: string): string | null {
   for (const dir of sensitiveHomeDirs) {
     const sensitivePath = path.join(homeDir, dir);
     if (resolved === sensitivePath || resolved.startsWith(sensitivePath + path.sep)) {
+      // `~/.config` holds real projects too (dotfiles repos, editor configs
+      // under version control). One the user deliberately indexed — it has a
+      // `.codegraph/` at the path or an ancestor within `~/.config` — is
+      // allowed; the blanket refusal still covers every un-indexed path there,
+      // and credentials dirs (.ssh/.gnupg/.aws) are never relaxed.
+      if (
+        dir === '.config' &&
+        options.isIndexed &&
+        hasIndexedProjectWithin(resolved, sensitivePath, options.isIndexed)
+      ) continue;
       return `Refusing to operate on sensitive directory: ${resolved}`;
     }
   }
@@ -218,8 +258,13 @@ export function safeJsonParse<T>(value: string, fallback: T): T {
 /**
  * Clamp a numeric value to a range.
  * Used to enforce sane limits on MCP tool inputs.
+ *
+ * A non-finite input (`NaN` from a cast like `"max" as number`, ±Infinity, or a
+ * non-number that slipped through) returns `min`: `Math.min`/`Math.max`
+ * propagate NaN, which silently disabled the very limit being enforced.
  */
 export function clamp(value: number, min: number, max: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return min;
   return Math.max(min, Math.min(max, value));
 }
 

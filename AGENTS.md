@@ -84,7 +84,7 @@ The public API surface is `src/index.ts` — the `CodeGraph` class wires all the
 - `src/context/` — `ContextBuilder` + formatter for markdown/JSON output.
 - `src/search/` — full-text query parser and helpers for FTS5.
 - `src/sync/` — `FileWatcher` (native FSEvents/inotify/RDCW) with debounce + filter, and git-hook helpers.
-- `src/mcp/` — MCP server (`MCPServer`, `tools.ts`, `transport.ts`). `server-instructions.ts` is what the server returns in the MCP `initialize` response — keep it in sync with the user-facing tool guidance.
+- `src/mcp/` — MCP server (`MCPServer`, `tools.ts`, `transport.ts`). `tools.ts` holds `ToolHandler` and the tool handlers; the tool schemas (`tool-definitions.ts`), arg coercion (`tool-args.ts`), project resolution (`project-registry.ts` — `ProjectRegistry`), explore's budget/allocation/rendering/sections (`explore-*.ts`) and the plain-text formatters (`tool-formatters.ts`) live beside it, re-exported from `tools.ts`. `server-instructions.ts` is what the server returns in the MCP `initialize` response — keep it in sync with the user-facing tool guidance.
 - `src/installer/` — see below.
 - `src/bin/codegraph.ts` — CLI (commander). Subcommands: `install`, `init`, `uninit`, `index`, `sync`, `status`, `query`, `files`, `context`, `affected`, `serve --mcp`.
 - `src/ui/` — terminal UI (shimmer progress, worker).
@@ -107,7 +107,9 @@ Defined in `src/types.ts`. Both extractors and resolvers must use these exact st
 - Current targets: `claude.ts`, `cursor.ts`, `codex.ts`, `opencode.ts`.
 - `targets/toml.ts` is a hand-rolled TOML serializer scoped to `[mcp_servers.codegraph]` (used by Codex). Sibling tables and `[[array_of_tables]]` are preserved verbatim. No new dependency.
 - opencode reads `opencode.jsonc` by default; the installer prefers existing `.jsonc`, falls back to `.json`, and creates `.jsonc` for greenfield installs. Edits are surgical via `jsonc-parser` so user comments and formatting survive install/re-install/uninstall round-trips. The MCP entry is OpenCode 2's native `mcp.servers.codegraph` with `disabled: false` and `codemode: false` (so `codegraph_explore` stays on the native tool list); a pre-#1698 `mcp.codegraph` + `enabled` entry is migrated on re-install and removed by uninstall.
-- `instructions-template.ts` no longer holds an instructions body — it exports only the `<!-- CODEGRAPH_START -->`/`<!-- CODEGRAPH_END -->` markers. The installer **stopped writing** a `## CodeGraph` block into each agent's instructions file (`CLAUDE.md` / `~/.codex/AGENTS.md` / `~/.config/opencode/AGENTS.md` / `~/.gemini/GEMINI.md` / `.cursor/rules/codegraph.mdc` / Kiro steering doc) because it duplicated the MCP `initialize` instructions verbatim (issue #529). Each target's `install` (self-heal on upgrade) and `uninstall` use the markers to **strip** a block a previous install left behind. `server-instructions.ts` is the single source of truth for agent-facing guidance.
+- `instructions-template.ts` holds the `<!-- CODEGRAPH_START -->`/`<!-- CODEGRAPH_END -->` markers and the **short** marker-fenced CodeGraph block (#704). The long `## CodeGraph` block that duplicated the MCP `initialize` instructions verbatim is gone (issue #529), but `upsertInstructionsEntry` (`targets/shared.ts`) still **writes the short block** into the instruction files of targets whose subagents / non-MCP harnesses never see the `initialize` text — Claude (`CLAUDE.md`), Codex (`~/.codex/AGENTS.md`), opencode (`AGENTS.md`) and Gemini (`GEMINI.md`) — and upserting it self-heals a stale pre-#529 long block. The other targets (Cursor's `.cursor/rules/codegraph.mdc`, Kiro steering, …) no longer write one; their `install`/`uninstall` only **strip** what a previous install left behind, and every target's `uninstall` removes its block. `server-instructions.ts` remains the single source of truth for the full agent-facing guidance — keep the short block a pointer, not a copy.
+- opencode registers MCP tools as `<server>_<tool>` (verified on 1.18), which doubled ours into `codegraph_codegraph_explore` (#1267). Its entry therefore sets `environment.CODEGRAPH_TOOL_PREFIX=none` (also `serve --tool-prefix none`): `tools/list` advertises bare names (`explore`) so the model sees `codegraph_explore`; `tools/call` accepts both spellings in every mode (`src/mcp/tool-names.ts`). Don't enable it for a client unless you've verified that client prefixes.
+- Claude hooks: the front-load `prompt-hook` (`UserPromptSubmit`, default-yes) and the search **gate hook** (`codegraph gate-hook`, `PreToolUse`, #2313 — `src/hooks/gate-hook.ts`) are both written/stripped surgically in Claude `settings.json` and persisted in `~/.codegraph/preferences.json`. The gate is **opt-in only** (default NO, `--gate-hook` to script it): `--yes`, `install --refresh` and `codegraph upgrade` never wire it.
 - All installer changes need matching coverage in `__tests__/installer-targets.test.ts` — there are ~47 parameterized contract tests covering install idempotency, sibling preservation, uninstall reverses install, byte-equal re-runs returning `unchanged`, and partial-state recovery for Codex.
 
 ### Cursor MCP working-directory quirk
@@ -116,7 +118,7 @@ Cursor launches MCP subprocesses with the wrong cwd and doesn't pass `rootUri` i
 
 ### MCP server instructions
 
-`src/mcp/server-instructions.ts` is sent back to the agent in the MCP `initialize` response. This is the *first* thing every agent sees about how to use the tools, and as of issue #529 it is the **single source of truth** for agent-facing tool guidance — the installer no longer writes a duplicate `## CodeGraph` instructions block into `CLAUDE.md` / `AGENTS.md` / `.cursor/rules/codegraph.mdc`. Edit tool guidance here and nowhere else.
+`src/mcp/server-instructions.ts` is sent back to the agent in the MCP `initialize` response. This is the *first* thing every agent sees about how to use the tools, and as of issue #529 it is the **single source of truth** for agent-facing tool guidance — the installer no longer writes a full duplicate of it into `CLAUDE.md` / `AGENTS.md` / `.cursor/rules/codegraph.mdc` (only the short #704 pointer block in `instructions-template.ts`, for subagents and non-MCP harnesses). Edit tool guidance here; touch the short block only when a tool or command name changes. A project may also append its own notes via `.codegraph/instructions.md` (#765, capped at 4 KB; local-only, since `.codegraph/` is gitignored).
 
 ## Retrieval performance & dynamic-dispatch coverage (do not regress)
 
@@ -141,14 +143,17 @@ The remaining lever under this axis is **coverage**: every flow made to connect 
 
 ### Explore budget — keep BOTH budgets monotonic with repo size
 
-Two functions in `src/mcp/tools.ts` scale explore with indexed file count. This is the expected resolution (a regression here silently forces agents back to Read):
+Two functions in `src/mcp/explore-budget.ts` (re-exported from `src/mcp/tools.ts`) scale explore with indexed file count. This is the expected resolution (a regression here silently forces agents back to Read):
 
-| Repo | files | explore calls | chars/call | per-file |
-|---|---|---|---|---|
-| express (small) | 147 | 1 | 18K | 3800 |
-| excalidraw/django (medium) | 643–3043 | 2 | 28K | 6500 |
-| vscode (large) | 10446 | 3 | 35K | 7000 |
-| ~20k / ~40k | — | 4 / 5 | 38K | 7000 |
+| indexed files | example | explore calls | chars/call (cap) | default files | per-file |
+|---|---|---|---|---|---|
+| <150 | express (147) | 1 | 13K | 4 | 3800 |
+| 150–499 | — | 1 | 18K | 5 | 3800 |
+| 500–4999 | excalidraw / django (643–3043) | 2 | 24K | 8 | 6500 |
+| 5000–14999 | vscode (10446) | 3 | 24K | 8 | 7000 |
+| 15000–24999 / ≥25000 | — | 4 / 5 | 24K | 8 | 7000 |
+
+The per-call output cap tops out at **24K** on purpose: it must stay under the host's ~25K-char inline tool-result limit, above which the result is externalized to a file the agent then Reads back. The two functions share the 500 / 5000 / 15000 breakpoints; the output budget adds a `<150` tier and has no 25000 break.
 
 - `getExploreBudget(fileCount)` → **call** budget: `<500→1, <5000→2, <15000→3, <25000→4, ≥25000→5` (max 5).
 - `getExploreOutputBudget(fileCount)` → **per-call** output (chars / files / per-file). **Invariant: a larger tier must never get a smaller `maxCharsPerFile` than a smaller tier.** (Regression that motivated this doc: the `<5000` tier's 2500 was *below* the `<500` tier's 3800, so on a god-file repo — excalidraw's 415 KB `App.tsx` — one explore returned <1% of the file and forced a Read.)
@@ -279,7 +284,7 @@ publish actions on shared state. Write the files, hand the user the commands.
 ## House rules
 
 - The `0.7.x` line is in active multi-agent rollout. Any change to `src/installer/` (especially `targets/`) needs corresponding test coverage and a CHANGELOG entry — installer regressions break every new install silently.
-- When changing what the MCP tools do or how agents should use them, edit `src/mcp/server-instructions.ts` — it is the **single source of truth** for agent-facing tool guidance (issue #529). The installer no longer writes a duplicate instructions block into `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` / `.cursor/rules/codegraph.mdc` / Kiro steering, so there's nothing to keep in sync anymore. (The repo's own checked-in `.cursor/rules/codegraph.mdc` is dogfooding config — update it too if you use Cursor on this repo, but it ships nowhere.)
+- When changing what the MCP tools do or how agents should use them, edit `src/mcp/server-instructions.ts` — it is the **single source of truth** for agent-facing tool guidance (issue #529). The installer no longer writes a duplicate of it into `.cursor/rules/codegraph.mdc` / Kiro steering, and writes only the short #704 pointer block (`instructions-template.ts`) into `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` — keep that block's tool/command names in sync with the server, nothing more. (The repo's own checked-in `.cursor/rules/codegraph.mdc` is dogfooding config — update it too if you use Cursor on this repo, but it ships nowhere.)
 - **Before adding or extending a router, a web framework, or a language's `WHEN` rules, read `docs/design/framework-coverage.md`.** It is the standing answer to "what is supported and what is left" across the three axes (route nodes → Entry points, `navigates` edges → Screens, branch-guard rules → the `WHEN` labels), with what each remaining item needs, the traps that have already cost debugging time, and the queries to re-verify it. Update it in the same change that moves a row.
 - CodeGraph provides **code context**, not product requirements. For new features, ask the user about UX, edge cases, and acceptance criteria — the graph won't tell you.
 - **When the user references issues, PR comments, or external reports, anchor them to a date and version before drawing conclusions.** Check the comment's `createdAt` against:

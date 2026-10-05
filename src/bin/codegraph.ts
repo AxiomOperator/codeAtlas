@@ -381,8 +381,7 @@ function warn(message: string): void {
 }
 
 /** "not found" (+ optional did-you-mean) when no exact symbol matches. */
-function formatSymbolNotFound(symbol: string, fuzzyNames: string[]): string {
-  const suggestions = [...new Set(fuzzyNames.filter((n) => n !== symbol))].slice(0, 3);
+function formatSymbolNotFound(symbol: string, suggestions: string[]): string {
   if (suggestions.length === 0) return `Symbol "${symbol}" not found`;
   return `Symbol "${symbol}" not found — did you mean: ${suggestions.join(', ')}?`;
 }
@@ -1652,6 +1651,54 @@ program
   });
 
 /**
+ * codegraph gate-hook  (hidden)
+ *
+ * Opt-in Claude Code `PreToolUse` hook (#2313): in an indexed project, holds
+ * Grep/Glob and Bash rg/grep/find/… until the session has made one CodeGraph
+ * call. Decision logic + the session-marker design live in
+ * `src/hooks/gate-hook.ts`.
+ *
+ * Output contract: a deny is exit code 2 with the reason on stderr — Claude
+ * Code's stable PreToolUse blocking form, which feeds the reason back to the
+ * model. Everything else (allow, kill-switch, TTY, malformed stdin, any
+ * error) exits 0 with no output: this hook must FAIL OPEN.
+ */
+program
+  .command('gate-hook', { hidden: true })
+  .description('Claude PreToolUse hook: hold Grep/Glob/rg/grep/find until the session has queried CodeGraph once (reads hook JSON on stdin)')
+  .action(async () => {
+    try {
+      if (process.env.CODEGRAPH_NO_GATE_HOOK === '1' || process.env.CODEGRAPH_GATE_HOOK === '0') return;
+      if (process.stdin.isTTY) return;
+      const raw = await new Promise<string>((resolve) => {
+        let data = '';
+        process.stdin.setEncoding('utf8');
+        process.stdin.on('data', (c) => { data += c; });
+        process.stdin.on('end', () => resolve(data));
+        process.stdin.on('error', () => resolve(data));
+      });
+      let input: unknown;
+      try { input = JSON.parse(raw); } catch { return; }
+      if (!input || typeof input !== 'object') return;
+      const { decideGate, hasGateMarker, writeGateMarker } = await import('../hooks/gate-hook');
+      const decision = decideGate(input as Record<string, unknown>, {
+        findIndexedRoot: (p) => findNearestCodeGraphRoot(p),
+        hasMarker: (id) => hasGateMarker(id),
+      });
+      if (decision.action === 'mark') {
+        writeGateMarker(String((input as { session_id?: unknown }).session_id));
+      } else if (decision.action === 'deny') {
+        // Counter name only — never the command or path (see TELEMETRY.md).
+        try { getTelemetry().recordUsage('cli_command', 'gate-hook-deny', true); } catch { /* never break the hook */ }
+        process.stderr.write(decision.reason + '\n');
+        process.exitCode = 2;
+      }
+    } catch {
+      // Fail open: never block a tool call because the gate itself broke.
+    }
+  });
+
+/**
  * codegraph node [name]
  *
  * The CLI face of the MCP codegraph_node tool: one symbol's source +
@@ -2212,8 +2259,15 @@ program
   .option('--mcp', 'Run as MCP server (stdio transport)')
   .option('--no-watch', 'Disable the file watcher (no auto-sync; useful on slow filesystems like WSL2 /mnt drives)')
   .option('--no-telemetry', 'Disable usage telemetry for this server (same as CODEGRAPH_TELEMETRY=0)')
-  .action(async (options: { path?: string; mcp?: boolean; watch?: boolean; telemetry?: boolean }) => {
+  .option('--tool-prefix <mode>', 'Tool names advertised to the client: "codegraph" (default, codegraph_explore) or "none" (explore — for clients that prefix tools with the server name themselves; same as CODEGRAPH_TOOL_PREFIX=none)')
+  .action(async (options: { path?: string; mcp?: boolean; watch?: boolean; telemetry?: boolean; toolPrefix?: string }) => {
     const projectPath = options.path ? resolveProjectPath(options.path) : undefined;
+
+    // `--tool-prefix none` (#1267): route through the env chokepoint the
+    // session/proxy read, like --no-watch below.
+    if (options.toolPrefix !== undefined) {
+      process.env.CODEGRAPH_TOOL_PREFIX = options.toolPrefix;
+    }
 
     // Commander sets watch=false when --no-watch is passed. Route it through
     // the same env-var chokepoint the watcher and MCP server already honor.
@@ -2336,9 +2390,9 @@ for (const direction of ['callers', 'callees'] as const) {
         const cg = await CodeGraph.open(projectPath);
         try {
           const limit = parseInt(options.limit || '20', 10);
-          const { nodes: targets } = lookupSymbolNodes(cg, symbol);
+          const { nodes: targets, suggestions } = lookupSymbolNodes(cg, symbol);
           if (targets.length === 0) {
-            info(formatSymbolNotFound(symbol, cg.searchNodes(symbol, { limit: 5 }).map((m) => m.node.name)));
+            info(formatSymbolNotFound(symbol, suggestions));
             return;
           }
 
@@ -2460,9 +2514,9 @@ program
       const cg = await CodeGraph.open(projectPath);
       try {
         const depth = Math.min(Math.max(parseInt(options.depth || '2', 10), 1), 10);
-        const { nodes: targets } = lookupSymbolNodes(cg, symbol);
+        const { nodes: targets, suggestions } = lookupSymbolNodes(cg, symbol);
         if (targets.length === 0) {
-          info(formatSymbolNotFound(symbol, cg.searchNodes(symbol, { limit: 5 }).map((m) => m.node.name)));
+          info(formatSymbolNotFound(symbol, suggestions));
           return;
         }
 
@@ -2699,6 +2753,7 @@ program
   .option('-y, --yes', 'Non-interactive: defaults to --location=global --target=auto, auto-allow on')
   .option('-i, --init', 'After wiring agents, also run `codegraph init` in the current directory — builds this project’s index, so install + index is one command (combine with --yes for an unattended bootstrap)')
   .option('--no-permissions', 'Skip writing the auto-allow permissions list (Claude Code only)')
+  .option('--gate-hook', 'Opt into the search gate hook: Grep/Glob/rg/find wait until the session has queried CodeGraph once (Claude Code only; off by default)')
   .option('--print-config <id>', 'Print MCP config snippet for the named agent and exit (no file writes)')
   .option('--refresh', 'Rewrite what previous installs configured, for already-configured agents only (never adds new ones). Run automatically by `codegraph upgrade`')
   .action(async (opts: {
@@ -2709,6 +2764,7 @@ program
     permissions?: boolean;
     printConfig?: string;
     refresh?: boolean;
+    gateHook?: boolean;
   }) => {
     if (opts.printConfig) {
       const { getTarget, listTargetIds } = await import('../installer/targets/registry');
@@ -2778,6 +2834,8 @@ program
         location: opts.location as 'global' | 'local' | undefined,
         autoAllow,
         yes: opts.yes,
+        // Only an explicit `--gate-hook` opts in; absent → the installer asks (default NO).
+        gateHook: opts.gateHook === true ? true : undefined,
       });
     } catch (err) {
       error(err instanceof Error ? err.message : String(err));

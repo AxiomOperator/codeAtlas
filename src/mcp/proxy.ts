@@ -28,8 +28,9 @@ import { armStartupHandshakeTimeout } from './startup-handshake';
 import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { CodeGraphPackageVersion, isOlderRelease } from './version';
 import { SERVER_INFO, PROTOCOL_VERSION, initializeInstructions } from './session';
-import { SERVER_INSTRUCTIONS } from './server-instructions';
-import { getStaticTools } from './tools';
+import { SERVER_INSTRUCTIONS, withProjectInstructions } from './server-instructions';
+import { getStaticTools, tools as toolDefinitions } from './tools';
+import { canonicalToolName, presentToolNames } from './tool-names';
 import { ErrorCodes } from './transport';
 import { ExploreSessionState } from './explore-session-state';
 import { getTelemetry, ClientInfo } from '../telemetry';
@@ -354,9 +355,10 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
       try {
         const local = await ensureEngine();
         const params = (msg.params || {}) as { name: string; arguments?: Record<string, unknown> };
-        const result = await local.getToolHandler().execute(params.name, params.arguments || {}, exploreSession);
+        const name = canonicalToolName(params.name, toolDefinitions.map((t) => t.name)); // bare names too (#1267)
+        const result = await local.getToolHandler().execute(name, params.arguments || {}, exploreSession);
         writeClient({ jsonrpc: '2.0', id, result });
-        getTelemetry().recordUsage('mcp_tool', params.name, !result.isError, telemetryClient);
+        getTelemetry().recordUsage('mcp_tool', name, !result.isError, telemetryClient);
       } catch (err) {
         writeClient({ jsonrpc: '2.0', id, error: { code: -32603, message: err instanceof Error ? err.message : String(err) } });
       }
@@ -406,10 +408,10 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
             version: typeof initParams.clientInfo.version === 'string' ? initParams.clientInfo.version : undefined,
           };
         }
-        writeClient({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: SERVER_INFO, instructions: initializeInstructions(SERVER_INSTRUCTIONS) } });
+        writeClient({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: SERVER_INFO, instructions: initializeInstructions(withProjectInstructions(SERVER_INSTRUCTIONS, deps.root)) } });
         routeToDaemon(line); // prime the daemon so it resolves the project (its reply is suppressed below)
       } else if (msg.method === 'tools/list') {
-        writeClient({ jsonrpc: '2.0', id: msg.id, result: { tools: getStaticTools() } });
+        writeClient({ jsonrpc: '2.0', id: msg.id, result: { tools: presentToolNames(getStaticTools()) } });
       } else if (msg.method === 'resources/list') {
         // No resources exposed — answer the probe locally so it never reaches
         // the daemon as an unhandled method and logs `-32601`. (#621)

@@ -23,6 +23,7 @@
 
 import { parentPort, workerData } from 'worker_threads';
 import type { ToolResult } from './tools';
+import { classifyError } from './error-classifier';
 
 interface WorkerInit {
   root: string | null;
@@ -51,17 +52,21 @@ if (parentPort) {
   // own per-handler cache. openSync does not start a watcher — workers are pure
   // readers; the single watcher/writer stays on the daemon's main thread.
   let handler: InstanceType<typeof import('./tools').ToolHandler> | null = null;
-  let initError: string | null = null;
+  let initError: unknown = null;
   try {
     const cg = root ? loadCodeGraph().openSync(root) : null;
     handler = new (loadToolHandler())(cg);
   } catch (err) {
-    initError = err instanceof Error ? err.message : String(err);
+    initError = err;
   }
 
   // Tell the pool we're up. `ok:false` lets the pool count a hard open failure
   // against its crash budget (→ fall back to in-process) without hanging.
-  port.postMessage({ type: 'ready', ok: initError === null, error: initError });
+  port.postMessage({
+    type: 'ready',
+    ok: initError === null,
+    error: initError === null ? null : initError instanceof Error ? initError.message : String(initError),
+  });
 
   port.on('message', (msg: CallMessage) => {
     if (!msg || msg.type !== 'call') return;
@@ -79,7 +84,10 @@ if (parentPort) {
       port.postMessage({
         type: 'result',
         id: msg.id,
-        result: errorResult(`codegraph worker could not open the project: ${initError}`),
+        // Same classifier as the in-process path: a project that is not
+        // indexed (or mid-rebuild) is guidance, a real open failure is an
+        // internal error with a retry note.
+        result: classifyError(initError),
       });
       return;
     }
@@ -92,12 +100,8 @@ if (parentPort) {
       port.postMessage({
         type: 'result',
         id: msg.id,
-        result: errorResult(err instanceof Error ? err.message : String(err)),
+        result: classifyError(err),
       });
     }
   };
-}
-
-function errorResult(text: string): ToolResult {
-  return { isError: true, content: [{ type: 'text', text }] };
 }

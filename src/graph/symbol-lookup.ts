@@ -117,6 +117,8 @@ export function matchesSymbol(node: Node, symbol: string): boolean {
 /** The slice of CodeGraph a symbol lookup needs — keeps this module testable. */
 export interface SymbolLookupHost {
   getNodesByName(name: string): Node[];
+  /** Index range scan; used for the exact file-basename convenience. */
+  getNodesByNamePrefix?(prefix: string, limit?: number): Node[];
   searchNodes(query: string, options?: { limit?: number }): Array<{ node: Node }>;
   generatedFilePredicate(paths: string[]): (path: string) => boolean;
 }
@@ -130,6 +132,12 @@ export interface SymbolLookupResult {
    * symbol's answer is the over-reporting failure described at the top.
    */
   ambiguous: boolean;
+  /**
+   * Only when `nodes` is empty: a few close names (case-insensitive qualified
+   * spellings first, then top fuzzy hits) to offer as "did you mean". These are
+   * SUGGESTIONS — never render one as the answer for the typed name (#1473).
+   */
+  suggestions: string[];
 }
 
 /**
@@ -161,41 +169,106 @@ export function groupDefinitions(
   return { groups: [...byDef.values()], filteredOut };
 }
 
+/** How many did-you-mean names a not-found answer offers. */
+export const MAX_SYMBOL_SUGGESTIONS = 3;
+
 /**
- * Resolve a user-supplied symbol name to the definitions it names.
+ * Resolve a user-supplied symbol name to the definitions it names — the ONE
+ * derivation behind `codegraph_node`, `codegraph_callers` / `callees` /
+ * `impact` (via `findAllSymbols`), explore's Flow tokens and the CLI verbs.
  *
  * The exact-name index is consulted FIRST and is authoritative: it is complete
  * and uncapped, whereas FTS ranks and truncates, and tokenises away `::` — so
- * a qualified query could miss a symbol that exists, or land on whatever
- * happened to rank first. FTS candidates still have to satisfy the matcher;
- * partial or mistyped names must never select the top fuzzy hit (#1473).
+ * a qualified query could miss a symbol that exists (tokio `Harness::poll`
+ * among 50+ `poll`s), or land on whatever happened to rank first. A qualified
+ * query enumerates every def of its LAST part and filters by the qualifier the
+ * user wrote. A bare name that names no symbol may still name a FILE by its
+ * exact basename (`product-card` → `product-card.liquid`); nothing fuzzy.
+ * Partial or mistyped names never select the top fuzzy hit (#1473, #1455) —
+ * they come back empty with `suggestions`.
  */
 export function lookupSymbolNodes(cg: SymbolLookupHost, symbol: string): SymbolLookupResult {
   const qualified = isQualifiedSymbol(symbol);
+  const seen = new Set<string>();
+  const add = (into: Node[], list: Node[]) => {
+    for (const n of list) if (!seen.has(n.id)) { seen.add(n.id); into.push(n); }
+  };
 
-  // Exact-name index, then filter by the qualifier the user actually wrote.
-  const tail = qualified ? lastQualifierPart(symbol) : symbol;
-  let nodes = tail ? cg.getNodesByName(tail) : [];
-  if (qualified) nodes = nodes.filter((n) => matchesSymbol(n, symbol));
-
-  if (nodes.length === 0) {
-    const hits = cg.searchNodes(symbol, { limit: 50 }).map((h) => h.node);
-    const exact = hits.filter((n) => matchesSymbol(n, symbol));
-    if (exact.length > 0) {
-      nodes = exact;
-    }
-    // Any query with no exact match resolves to NOTHING rather than a
-    // misleading fuzzy hit (#1473; qualified lookups already did this in #173).
+  const nodes: Node[] = [];
+  // A literal name first: some names carry separators themselves (a file node
+  // `auth.ts`, a dotted Nix/Elixir name, Go `pkg/mod.Fn` stored verbatim).
+  add(nodes, cg.getNodesByName(symbol).filter((n) => matchesSymbol(n, symbol)));
+  let tailNodes: Node[] = [];
+  if (qualified) {
+    const tail = lastQualifierPart(symbol);
+    tailNodes = tail && tail !== symbol ? cg.getNodesByName(tail) : [];
+    add(nodes, tailNodes.filter((n) => matchesSymbol(n, symbol)));
   }
 
-  if (nodes.length === 0) return { nodes: [], ambiguous: false };
+  // Exact file-basename convenience (`stage_apply` → `stage_apply.rs`). An
+  // index range scan, not FTS; `matchesSymbol` keeps it to an EXACT basename.
+  if (nodes.length === 0 && cg.getNodesByNamePrefix) {
+    add(
+      nodes,
+      cg.getNodesByNamePrefix(`${symbol}.`, 50).filter((n) => n.kind === 'file' && matchesSymbol(n, symbol))
+    );
+  }
+
+  if (nodes.length === 0) {
+    return { nodes: [], ambiguous: false, suggestions: suggestSymbolNames(cg, symbol, tailNodes) };
+  }
 
   // Keepers before generated stubs (.pb.go and friends), stable otherwise.
   const isGenerated = cg.generatedFilePredicate(nodes.map((n) => n.filePath));
   const ranked = [...nodes].sort(
     (a, b) => (isGenerated(a.filePath) ? 1 : 0) - (isGenerated(b.filePath) ? 1 : 0)
   );
-  return { nodes: ranked, ambiguous: groupDefinitions(ranked).groups.length > 1 };
+  return { nodes: ranked, ambiguous: groupDefinitions(ranked).groups.length > 1, suggestions: [] };
+}
+
+/**
+ * Did-you-mean names for a symbol query that resolved to nothing. A qualified
+ * query whose only fault is letter case (`a.b.c.d.e` for `a.b.c.D.e`, #1455)
+ * gets the real spelling first; then the top fuzzy FTS names. Never the typed
+ * name itself.
+ */
+export function suggestSymbolNames(
+  cg: SymbolLookupHost,
+  symbol: string,
+  tailNodes?: Node[]
+): string[] {
+  const out: string[] = [];
+  const push = (name: string) => {
+    if (name && name !== symbol && !out.includes(name) && out.length < MAX_SYMBOL_SUGGESTIONS) out.push(name);
+  };
+
+  if (isQualifiedSymbol(symbol)) {
+    const lowered = symbol.toLowerCase();
+    const tail = lastQualifierPart(symbol);
+    const pool = tailNodes ?? (tail ? cg.getNodesByName(tail) : []);
+    for (const n of pool) {
+      const lc: Node = {
+        ...n,
+        name: n.name.toLowerCase(),
+        qualifiedName: (n.qualifiedName ?? '').toLowerCase(),
+        filePath: n.filePath.toLowerCase(),
+      };
+      if (matchesSymbol(lc, lowered)) push(canonicalScope(n.qualifiedName || n.name));
+    }
+  }
+
+  let fuzzy: Array<{ node: Node }> = [];
+  try {
+    fuzzy = cg.searchNodes(symbol, { limit: 10 });
+    if (fuzzy.length === 0 && isQualifiedSymbol(symbol)) {
+      const tail = lastQualifierPart(symbol);
+      if (tail && tail !== symbol) fuzzy = cg.searchNodes(tail, { limit: 10 });
+    }
+  } catch {
+    fuzzy = [];
+  }
+  for (const { node } of fuzzy) push(node.name);
+  return out;
 }
 
 /** One-line "kind at path:line" label used when disclosing an ambiguous query. */

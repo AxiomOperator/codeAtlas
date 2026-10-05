@@ -162,6 +162,13 @@ const HIGH_VALUE_NODE_KINDS: NodeKind[] = [
 ];
 
 /**
+ * Languages whose `import`-kind nodes are include / copybook / program-call
+ * TARGETS (the thing a reader searches for), not import statements. Explore
+ * admits their import nodes on an exact name match (#2342).
+ */
+const INCLUDE_TARGET_LANGUAGES: ReadonlySet<string> = new Set(['cobol']);
+
+/**
  * Default options for finding relevant context
  */
 const DEFAULT_FIND_OPTIONS: Required<FindRelevantContextOptions> = {
@@ -619,6 +626,50 @@ export class ContextBuilder {
       }
     }
 
+    // Step 2d: include / copybook targets the query names exactly (#2342).
+    // Import nodes are excluded from every channel above because a JS/TS/Python
+    // `import` statement carries no information. In languages where an
+    // `import`-kind node IS the only representation of the dependency — a
+    // COBOL `COPY` / `EXEC SQL INCLUDE` copybook or a CICS LINK/XCTL target —
+    // that exclusion makes the target unfindable by name. Admit them only on an
+    // EXACT name match, only for those languages, and only when the caller has
+    // not narrowed `nodeKinds` to exclude imports, so ordinary explore output is
+    // untouched.
+    const allowsIncludeTargets = options.nodeKinds === undefined
+      || options.nodeKinds.length === 0
+      || options.nodeKinds.includes('import');
+    const exactIncludeMatches: SearchResult[] = [];
+    if (allowsIncludeTargets) {
+      const tokens = new Set<string>(symbolsFromQuery);
+      for (const raw of query.split(/[\s,;()'"`]+/)) {
+        const t = raw.replace(/^[.:]+|[.:]+$/g, '');
+        if (t) tokens.add(t);
+      }
+      const seenInclude = new Set<string>();
+      for (const t of tokens) {
+        // COBOL is case-insensitive and its names are conventionally upper-case.
+        for (const spelling of new Set([t, t.toUpperCase()])) {
+          for (const node of this.queries.getNodesByName(spelling)) {
+            if (node.kind !== 'import' || !INCLUDE_TARGET_LANGUAGES.has(node.language)) continue;
+            if (seenInclude.has(node.id)) continue;
+            seenInclude.add(node.id);
+            // The include statement is one line; the paragraph / section that
+            // holds it is what explore can render as source. Lead with that
+            // enclosing callable, then the include node itself.
+            const enclosing = this.queries.getNodesByFile(node.filePath)
+              .filter((n) => (n.kind === 'function' || n.kind === 'method')
+                && n.startLine <= node.startLine && n.endLine >= node.endLine)
+              .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
+            if (enclosing && !seenInclude.has(enclosing.id)) {
+              seenInclude.add(enclosing.id);
+              exactIncludeMatches.push({ node: enclosing, score: 1 });
+            }
+            exactIncludeMatches.push({ node, score: 1 });
+          }
+        }
+      }
+    }
+
     // Step 3: Run text search for natural language term matching
     // This catches file-name and node-name matches that semantic search may miss,
     // which is critical for template-heavy codebases (e.g., Liquid/Shopify themes)
@@ -1023,6 +1074,23 @@ export class ContextBuilder {
       filteredResults = [
         ...exactFileMatches,
         ...filteredResults.filter((result) => !exactFileIds.has(result.node.id)),
+      ];
+    }
+
+    // Exactly-named include targets (Step 2d) survive the import resolution
+    // above, which drops an unresolved import as low-value — for a copybook
+    // that is not in the repo, the include site IS the answer.
+    if (exactIncludeMatches.length > 0) {
+      const includeIds = new Set(exactIncludeMatches.map((result) => result.node.id));
+      const firstNonFile = filteredResults.findIndex(
+        (result) => !exactFileMatches.some((f) => f.node.id === result.node.id)
+      );
+      const at = firstNonFile < 0 ? filteredResults.length : firstNonFile;
+      const rest = filteredResults.filter((result) => !includeIds.has(result.node.id));
+      filteredResults = [
+        ...rest.slice(0, at),
+        ...exactIncludeMatches,
+        ...rest.slice(at),
       ];
     }
 

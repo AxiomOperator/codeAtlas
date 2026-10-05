@@ -23,7 +23,7 @@ import { parse as parseJsonc } from 'jsonc-parser';
 import { ALL_TARGETS, getTarget, resolveTargetFlag } from '../src/installer/targets/registry';
 import { uninstallTargets, refreshTargets } from '../src/installer';
 import { upsertTomlTable, removeTomlTable, buildTomlTable } from '../src/installer/targets/toml';
-import { cleanupLegacyHooks, writePromptHookEntry, removePromptHookEntry } from '../src/installer/targets/claude';
+import { cleanupLegacyHooks, writePromptHookEntry, removePromptHookEntry, writeGateHookEntry, removeGateHookEntry, GATE_HOOK_MATCHER } from '../src/installer/targets/claude';
 
 function mkTmpDir(label: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `cg-targets-${label}-`));
@@ -1390,6 +1390,105 @@ describe('Installer targets — partial-state idempotency', () => {
     const stopCmds = (s.hooks?.Stop ?? []).flatMap((g: any) => (g.hooks ?? []).map((h: any) => h.command));
     expect(stopCmds).toContain('codegraph sync-if-dirty');
   });
+
+  // ---- Search gate hook (PreToolUse) — #2313 ----
+  // Strictly opt-in: written only for gateHook:true, stripped for false, left
+  // alone for undefined (refresh / upgrade / --yes). Surgical like the prompt hook.
+  const GATE_CMD = process.platform === 'win32' ? 'codegraph.cmd gate-hook' : 'codegraph gate-hook';
+  const OTHER_PLATFORM_GATE_CMD = process.platform === 'win32' ? 'codegraph gate-hook' : 'codegraph.cmd gate-hook';
+  const preToolGroups = (s: any): any[] => s.hooks?.PreToolUse ?? [];
+  const gateCommands = (s: any): string[] =>
+    preToolGroups(s).flatMap((g: any) => (g.hooks ?? []).map((h: any) => h.command));
+  const readClaudeSettings = (): any => JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude', 'settings.json'), 'utf-8'));
+
+  it('claude: install without gateHook does NOT add the gate hook (default off)', () => {
+    getTarget('claude')!.install('global', { autoAllow: true, promptHook: true });
+    expect(gateCommands(readClaudeSettings())).not.toContain(GATE_CMD);
+  });
+
+  it('claude: install with gateHook:true writes a PreToolUse hook that also matches codegraph MCP tools', () => {
+    getTarget('claude')!.install('global', { autoAllow: true, gateHook: true });
+    const groups = preToolGroups(readClaudeSettings());
+    const ours = groups.find((g: any) => (g.hooks ?? []).some((h: any) => h.command === GATE_CMD));
+    expect(ours).toBeDefined();
+    expect(ours.matcher).toBe(GATE_HOOK_MATCHER);
+    const re = new RegExp(`^(?:${ours.matcher})$`);
+    for (const tool of ['Grep', 'Glob', 'Bash', 'mcp__codegraph__codegraph_explore', 'mcp__plugin_x_codegraph__codegraph_explore']) {
+      expect(re.test(tool)).toBe(true);
+    }
+    expect(re.test('Read')).toBe(false);
+  });
+
+  it('claude: install with gateHook:true is idempotent (byte-identical re-run, one entry)', () => {
+    const claude = getTarget('claude')!;
+    const file = path.join(tmpHome, '.claude', 'settings.json');
+    claude.install('global', { autoAllow: true, gateHook: true });
+    const first = fs.readFileSync(file, 'utf-8');
+    claude.install('global', { autoAllow: true, gateHook: true });
+    expect(fs.readFileSync(file, 'utf-8')).toBe(first);
+    expect(gateCommands(JSON.parse(first)).filter((c) => c === GATE_CMD)).toHaveLength(1);
+  });
+
+  it('claude: install with gateHook:false strips a prior gate hook and persists the opt-out', async () => {
+    const claude = getTarget('claude')!;
+    claude.install('global', { autoAllow: true, gateHook: true });
+    claude.install('global', { autoAllow: true, gateHook: false });
+    expect(gateCommands(readClaudeSettings())).not.toContain(GATE_CMD);
+    const { readPreferences } = await import('../src/installer/preferences');
+    expect(readPreferences().gateHook).toBe('declined');
+  });
+
+  it('claude: gateHook:undefined (refresh / upgrade) leaves an existing gate hook in place and never adds one', () => {
+    const claude = getTarget('claude')!;
+    claude.install('global', { autoAllow: true });
+    claude.install('global', { autoAllow: false, promptHook: undefined, gateHook: undefined });
+    expect(gateCommands(readClaudeSettings())).not.toContain(GATE_CMD);
+    claude.install('global', { autoAllow: true, gateHook: true });
+    claude.install('global', { autoAllow: false, promptHook: undefined, gateHook: undefined });
+    expect(gateCommands(readClaudeSettings())).toContain(GATE_CMD);
+  });
+
+  it('claude: `codegraph upgrade` prompt-hook self-heal never wires the gate hook', async () => {
+    const { defaultWirePromptHook } = await import('../src/upgrade');
+    getTarget('claude')!.install('global', { autoAllow: true });
+    await defaultWirePromptHook();
+    expect(gateCommands(readClaudeSettings())).not.toContain(GATE_CMD);
+  });
+
+  it('claude: writeGateHookEntry preserves a sibling PreToolUse hook and migrates the other platform spelling', () => {
+    const file = seedSettings('global', {
+      hooks: {
+        PreToolUse: [
+          { matcher: 'Bash', hooks: [{ type: 'command', command: 'my-bash-guard' }] },
+          { matcher: GATE_HOOK_MATCHER, hooks: [{ type: 'command', command: OTHER_PLATFORM_GATE_CMD }] },
+        ],
+      },
+    });
+    expect(writeGateHookEntry('global').action).toBe('updated');
+    expect(gateCommands(JSON.parse(fs.readFileSync(file, 'utf-8')))).toEqual(['my-bash-guard', GATE_CMD]);
+    expect(writeGateHookEntry('global').action).toBe('unchanged');
+  });
+
+  it('claude: uninstall removes the gate hook but keeps the user\'s sibling and the prompt hook removal intact', () => {
+    const file = seedSettings('global', {
+      hooks: {
+        PreToolUse: [
+          { matcher: GATE_HOOK_MATCHER, hooks: [{ type: 'command', command: GATE_CMD }] },
+          { matcher: 'Bash', hooks: [{ type: 'command', command: 'my-bash-guard' }] },
+        ],
+        UserPromptSubmit: [{ hooks: [{ type: 'command', command: HOOK_CMD }] }],
+      },
+    });
+    getTarget('claude')!.uninstall('global');
+    const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(gateCommands(s)).toEqual(['my-bash-guard']);
+    expect(promptCommands(s)).toEqual([]);
+  });
+
+  it('claude: removeGateHookEntry is a no-op (unchanged) when no gate hook is present', () => {
+    seedSettings('global', { hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: HOOK_CMD }] }] } });
+    expect(removeGateHookEntry('global').action).toBe('unchanged');
+  });
 });
 
 describe('Installer targets — registry', () => {
@@ -2018,6 +2117,8 @@ describe('Installer targets — opencode native MCP shape (#1698)', () => {
       command: ['codegraph', 'serve', '--mcp'],
       disabled: false,
       codemode: false,
+      // opencode prefixes tools with the server key itself (#1267) — serve bare names.
+      environment: { CODEGRAPH_TOOL_PREFIX: 'none' },
     });
   });
 
@@ -2062,11 +2163,26 @@ describe('Installer targets — opencode native MCP shape (#1698)', () => {
       command: ['codegraph', 'serve', '--mcp'],
       disabled: false,
       codemode: false,
+      // opencode prefixes tools with the server key itself (#1267) — serve bare names.
+      environment: { CODEGRAPH_TOOL_PREFIX: 'none' },
     });
 
     // Idempotent after migration.
     const second = opencode.install('global', { autoAllow: true });
     expect(second.files.find((f) => f.path === configFile())!.action).toBe('unchanged');
+  });
+
+  it('re-install adds the bare-tool-name env to a pre-#1267 native entry (refresh heals double-prefixing)', () => {
+    fs.mkdirSync(path.dirname(configFile()), { recursive: true });
+    fs.writeFileSync(configFile(), JSON.stringify({
+      $schema: 'https://opencode.ai/config.json',
+      mcp: { servers: { codegraph: { type: 'local', command: ['codegraph', 'serve', '--mcp'], disabled: false, codemode: false } } },
+    }, null, 2) + '\n');
+    const opencode = getTarget('opencode')!;
+    expect(opencode.install('global', { autoAllow: false }).files.find((f) => f.path === configFile())!.action).toBe('updated');
+    const cfg = parseJsonc(fs.readFileSync(configFile(), 'utf-8'));
+    expect(cfg.mcp.servers.codegraph.environment).toEqual({ CODEGRAPH_TOOL_PREFIX: 'none' });
+    expect(opencode.install('global', { autoAllow: false }).files.find((f) => f.path === configFile())!.action).toBe('unchanged');
   });
 
   it('uninstall removes a leftover v1 mcp.codegraph entry', () => {

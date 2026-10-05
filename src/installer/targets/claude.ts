@@ -166,6 +166,19 @@ class ClaudeCodeTarget implements AgentTarget {
       if (removed.action === 'removed') files.push(removed);
     }
 
+    // 2d. Search gate hook (Claude PreToolUse, #2313). Opt-in only, default
+    // NO: `gateHook === true` writes it, `=== false` strips it, `undefined`
+    // (refresh sweeps, `codegraph upgrade`, --yes) leaves it untouched — it is
+    // never wired automatically. The choice is persisted like the prompt hook.
+    if (opts.gateHook === true) {
+      writePreferences({ gateHook: 'accepted' });
+      files.push(writeGateHookEntry(loc));
+    } else if (opts.gateHook === false) {
+      writePreferences({ gateHook: 'declined' });
+      const removed = removeGateHookEntry(loc);
+      if (removed.action === 'removed') files.push(removed);
+    }
+
     // 3. CLAUDE.md instructions — the short marker-fenced CodeGraph
     // block (#704). The MCP initialize instructions reach only the main
     // agent; CLAUDE.md is what Task-tool subagents (and non-MCP
@@ -235,6 +248,10 @@ class ClaudeCodeTarget implements AgentTarget {
     // 2c. Remove the front-load prompt hook this installer may have written.
     const promptHookCleanup = removePromptHookEntry(loc);
     if (promptHookCleanup.action === 'removed') files.push(promptHookCleanup);
+
+    // 2d. Remove the opt-in search gate hook, if the user had enabled it.
+    const gateHookCleanup = removeGateHookEntry(loc);
+    if (gateHookCleanup.action === 'removed') files.push(gateHookCleanup);
 
     // 3. Instructions — strip the legacy CodeGraph block if present.
     files.push(removeInstructionsEntry(loc));
@@ -426,6 +443,75 @@ export function cleanupLegacyHooks(loc: Location): WriteResult['files'][number] 
  */
 export function removePromptHookEntry(loc: Location): WriteResult['files'][number] {
   return removeHookCommandsMatching(loc, isPromptHookCommand);
+}
+
+/**
+ * The opt-in search gate hook (#2313) — see `src/hooks/gate-hook.ts`. Same
+ * Windows `.cmd` rule as the prompt hook (#1466).
+ */
+const GATE_HOOK_COMMAND = process.platform === 'win32'
+  ? 'codegraph.cmd gate-hook'
+  : 'codegraph gate-hook';
+const GATE_HOOK_FORMS = ['codegraph gate-hook', 'codegraph.cmd gate-hook'];
+/**
+ * Claude Code matchers are regexes. Besides the search tools it gates, the
+ * hook must also SEE CodeGraph's own MCP tool calls — that is how it learns a
+ * session has asked the index (it writes the per-session marker then), so the
+ * matcher includes every `mcp__…codegraph…` spelling (`mcp__codegraph__…`,
+ * plugin-namespaced servers).
+ */
+export const GATE_HOOK_MATCHER = 'Grep|Glob|Bash|mcp__.*codegraph.*';
+function isGateHookCommand(command: unknown): boolean {
+  return typeof command === 'string' && GATE_HOOK_FORMS.some((f) => command.includes(f));
+}
+
+/**
+ * Write the opt-in `PreToolUse` gate hook into Claude `settings.json`.
+ * Idempotent (an existing gate-hook command anywhere under PreToolUse →
+ * `unchanged`, after migrating an installer spelling to this platform's form);
+ * sibling hooks are preserved. Only called when the user explicitly opted in.
+ */
+export function writeGateHookEntry(loc: Location): WriteResult['files'][number] {
+  const file = settingsJsonPath(loc);
+  const created = !fs.existsSync(file);
+  const settings = readJsonFile(file);
+
+  if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) {
+    settings.hooks = {};
+  }
+  if (!Array.isArray(settings.hooks.PreToolUse)) settings.hooks.PreToolUse = [];
+
+  let migrated = false;
+  for (const group of settings.hooks.PreToolUse) {
+    if (!group || !Array.isArray(group.hooks)) continue;
+    for (const h of group.hooks) {
+      if (h && GATE_HOOK_FORMS.includes(h.command) && h.command !== GATE_HOOK_COMMAND) {
+        h.command = GATE_HOOK_COMMAND;
+        migrated = true;
+      }
+    }
+  }
+
+  const already = settings.hooks.PreToolUse.some(
+    (g: any) => g && Array.isArray(g.hooks) && g.hooks.some((h: any) => isGateHookCommand(h?.command)),
+  );
+  if (already) {
+    if (!migrated) return { path: file, action: 'unchanged' };
+    writeJsonFile(file, settings);
+    return { path: file, action: 'updated' };
+  }
+
+  settings.hooks.PreToolUse.push({
+    matcher: GATE_HOOK_MATCHER,
+    hooks: [{ type: 'command', command: GATE_HOOK_COMMAND }],
+  });
+  writeJsonFile(file, settings);
+  return { path: file, action: created ? 'created' : 'updated' };
+}
+
+/** Remove the opt-in gate hook (uninstall, or install with the gate declined). */
+export function removeGateHookEntry(loc: Location): WriteResult['files'][number] {
+  return removeHookCommandsMatching(loc, isGateHookCommand);
 }
 
 export function writePermissionsEntry(loc: Location): WriteResult['files'][number] {

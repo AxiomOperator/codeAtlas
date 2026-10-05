@@ -36,7 +36,7 @@ import type CodeGraph from '../index';
 import type { Node, Edge } from '../types';
 import { isTestFile } from '../search/query-utils';
 
-import { lastQualifierPart, matchesSymbol } from './symbol-lookup';
+import { lookupSymbolNodes } from './symbol-lookup';
 
 // Preserve the existing imports while sharing the matcher with the CLI and MCP.
 export { RUST_PATH_PREFIXES, lastQualifierPart, matchesSymbol } from './symbol-lookup';
@@ -71,30 +71,12 @@ export function findAllSymbols(cg: CodeGraph, symbol: string): { nodes: Node[]; 
     }
   }
 
-  const isQualified = /[.\/]|::/.test(symbol);
-  let exactNodes: Node[];
+  // Everything else rides the one shared resolver (exact-name index, uncapped
+  // qualified lookup, exact file basename; never a fuzzy hit), so callers /
+  // callees / impact, codegraph_node and the CLI cannot disagree on a name.
+  const { nodes, suggestions } = lookupSymbolNodes(cg, symbol);
 
-  if (!isQualified) {
-    // Direct index — every exact-name overload, case-sensitive. Avoids FTS
-    // ranking a differently-cased sibling above the real node (#1473 Fetch).
-    exactNodes = cg.getNodesByName(symbol);
-  } else {
-    let results = cg.searchNodes(symbol, { limit: 50 });
-    // Mirror findSymbolMatches — FTS strips colons, so re-search by bare tail.
-    if (results.length === 0) {
-      const tail = lastQualifierPart(symbol);
-      if (tail && tail !== symbol) results = cg.searchNodes(tail, { limit: 50 });
-    }
-    exactNodes = results
-      .filter((r) => matchesSymbol(r.node, symbol))
-      .map((r) => r.node);
-  }
-
-  if (exactNodes.length === 0) {
-    const fuzzy = cg.searchNodes(symbol, { limit: 5 });
-    const suggestions = [
-      ...new Set(fuzzy.map((r) => r.node.name).filter((n) => n !== symbol)),
-    ].slice(0, 3);
+  if (nodes.length === 0) {
     const note =
       suggestions.length > 0
         ? `\n\n> **Note:** no symbol named "${symbol}". Did you mean: ${suggestions.join(', ')}?`
@@ -102,25 +84,15 @@ export function findAllSymbols(cg: CodeGraph, symbol: string): { nodes: Node[]; 
     return { nodes: [], note };
   }
 
-  if (exactNodes.length === 1) {
-    return { nodes: exactNodes, note: '' };
+  if (nodes.length === 1) {
+    return { nodes, note: '' };
   }
 
-  // Same generated-file down-rank as findSymbol — keeps callers/callees
-  // /impact aggregation aligned (a query against "Send" returns the
-  // hand-written implementations before the protobuf scaffold).
-  const isGen = cg.generatedFilePredicate(exactNodes.map((n) => n.filePath));
-  const ranked = [...exactNodes].sort((a, b) => {
-    const aGen = isGen(a.filePath) ? 1 : 0;
-    const bGen = isGen(b.filePath) ? 1 : 0;
-    return aGen - bGen;
-  });
-
-  const locations = ranked.map(
+  const locations = nodes.map(
     (n) => `${n.kind} at ${n.filePath}:${n.startLine}`
   );
-  const note = `\n\n> **Note:** Aggregated results across ${ranked.length} symbols named "${symbol}": ${locations.join(', ')}`;
-  return { nodes: ranked, note };
+  const note = `\n\n> **Note:** Aggregated results across ${nodes.length} symbols named "${symbol}": ${locations.join(', ')}`;
+  return { nodes, note };
 }
 
 /** Node kinds that can sit on a call chain. */

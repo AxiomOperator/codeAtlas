@@ -27,6 +27,7 @@ import { Worker } from 'worker_threads';
 import * as path from 'path';
 import * as os from 'os';
 import type { ToolResult } from './tools';
+import { internalErrorResult } from './error-classifier';
 
 /** Compiled sibling — `query-worker.js` lives next to this file in `dist/mcp/`. */
 const WORKER_FILE = path.join(__dirname, 'query-worker.js');
@@ -281,7 +282,9 @@ export class QueryPool {
         job.retries++;
         this.queue.unshift(job); // head of line — retry promptly
       } else {
-        this.settle(job, { isError: true, content: [{ type: 'text', text: 'codegraph worker crashed; please retry the call.' }] });
+        // A genuine malfunction (retries exhausted): isError with the shared
+        // retry-once note, worded the same as every other malfunction.
+        this.settle(job, internalErrorResult('the codegraph query worker crashed while serving this call'));
       }
     }
     this.drain();

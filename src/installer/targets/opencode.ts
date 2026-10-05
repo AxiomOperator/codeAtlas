@@ -28,7 +28,8 @@
  *           "type": "local",
  *           "command": [...],
  *           "disabled": false,
- *           "codemode": false
+ *           "codemode": false,
+ *           "environment": { "CODEGRAPH_TOOL_PREFIX": "none" }
  *         }
  *       }
  *     }
@@ -131,6 +132,7 @@ function getOpencodeServerEntry(): {
   command: string[];
   disabled: boolean;
   codemode: boolean;
+  environment: Record<string, string>;
 } {
   return {
     type: 'local',
@@ -139,6 +141,13 @@ function getOpencodeServerEntry(): {
     // Keep codegraph_explore on the native tool list — OpenCode 2's
     // default Code Mode would otherwise hide the one-tool server (#1698).
     codemode: false,
+    // opencode registers MCP tools as `<server>_<tool>`, which turned our
+    // `codegraph_explore` into `codegraph_codegraph_explore` (#1267). Serve
+    // bare names (`explore`) so the model sees `codegraph_explore` — the name
+    // the server instructions and AGENTS.md block use. An env var rather than
+    // a `--tool-prefix` flag so an older codegraph on PATH ignores it instead
+    // of refusing to start.
+    environment: { CODEGRAPH_TOOL_PREFIX: 'none' },
   };
 }
 

@@ -1,10 +1,10 @@
 /**
  * User choices the installer must remember across runs.
  *
- * Stored in `~/.codegraph/preferences.json`. Today it holds one thing: whether
- * the user declined the Claude Code front-load prompt hook. Without it, an
- * opt-out at install time was forgotten and the next `codegraph upgrade`
- * wired the hook straight back in.
+ * Stored in `~/.codegraph/preferences.json`: whether the user declined the
+ * Claude Code front-load prompt hook, and whether they opted into the search
+ * gate hook. Without it, an opt-out at install time was forgotten and the next
+ * `codegraph upgrade` wired the prompt hook straight back in.
  */
 
 import * as fs from 'fs';
@@ -14,6 +14,8 @@ import * as path from 'path';
 export interface InstallerPreferences {
   /** `declined`: never wire the prompt hook automatically. */
   promptHook?: 'accepted' | 'declined';
+  /** The opt-in search gate hook (#2313). Absent = never asked (treated as off). */
+  gateHook?: 'accepted' | 'declined';
 }
 
 export function preferencesPath(): string {

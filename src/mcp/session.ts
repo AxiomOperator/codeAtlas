@@ -16,7 +16,8 @@ import * as path from 'path';
 import { JsonRpcRequest, JsonRpcNotification, JsonRpcTransport, ErrorCodes } from './transport';
 import { MCPEngine } from './engine';
 import { tools } from './tools';
-import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_NO_ROOT_INDEX } from './server-instructions';
+import { canonicalToolName, presentToolNames } from './tool-names';
+import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_NO_ROOT_INDEX, withProjectInstructions } from './server-instructions';
 import { CodeGraphPackageVersion } from './version';
 import { resolveServerRoot } from '../directory';
 import { getTelemetry, ClientInfo } from '../telemetry';
@@ -246,14 +247,18 @@ export class MCPSession {
     // sub-projects indexed) and never surfaced the tools after a mid-session
     // `codegraph init`. When no explicit path is known yet (roots/list dance
     // pending), cwd is the best predictor of where the default will resolve.
-    const indexed = resolveServerRoot(explicitPath ?? process.cwd()).root !== null;
+    const serverRoot = resolveServerRoot(explicitPath ?? process.cwd()).root;
+    const indexed = serverRoot !== null;
 
     // Respond to the handshake BEFORE doing any heavy init — see issue #172.
     this.transport.sendResult(request.id, {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: { tools: {} },
       serverInfo: SERVER_INFO,
-      instructions: initializeInstructions(indexed ? SERVER_INSTRUCTIONS : SERVER_INSTRUCTIONS_NO_ROOT_INDEX),
+      // + the project's own `.codegraph/instructions.md`, appended (#765).
+      instructions: initializeInstructions(
+        indexed ? withProjectInstructions(SERVER_INSTRUCTIONS, serverRoot) : SERVER_INSTRUCTIONS_NO_ROOT_INDEX,
+      ),
     });
 
     if (explicitPath) {
@@ -278,7 +283,8 @@ export class MCPSession {
     // teach the agent to abandon codegraph. `getTools()` returns the default
     // surface even before a project is open.
     this.transport.sendResult(request.id, {
-      tools: this.engine.getToolHandler().getTools(),
+      // Bare names when the client namespaces tools itself (#1267; see tool-names.ts).
+      tools: presentToolNames(this.engine.getToolHandler().getTools()),
     });
   }
 
@@ -293,18 +299,15 @@ export class MCPSession {
       return;
     }
 
-    const toolName = params.name;
-    const toolArgs = params.arguments || {};
-
-    const tool = tools.find((t) => t.name === toolName);
-    if (!tool) {
-      this.transport.sendError(
-        request.id,
-        ErrorCodes.InvalidParams,
-        `Unknown tool: ${toolName}`,
-      );
-      return;
-    }
+    // Accept both the canonical `codegraph_*` name and the bare one a
+    // `CODEGRAPH_TOOL_PREFIX=none` client was shown (#1267) — unconditionally,
+    // since a shared daemon serves clients configured either way.
+    const toolName = canonicalToolName(params.name, tools.map((t) => t.name));
+    // Passed through as-is: the handler's single coercion step object-checks it
+    // (a string/array/null becomes `{}` or parsed JSON), and an unknown tool
+    // name answers with success-shaped guidance naming the real tools — a
+    // protocol error there reads to the agent like a broken toolset.
+    const toolArgs: unknown = params.arguments ?? {};
 
     if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} pre-init\n`);
     await this.retryInitIfNeeded();
@@ -315,7 +318,11 @@ export class MCPSession {
     this.transport.sendResult(request.id, result);
     // After the reply is on the wire — telemetry must never delay a tool
     // response (in-memory increment only; see src/telemetry).
-    getTelemetry().recordUsage('mcp_tool', toolName, !result.isError, this.clientInfo);
+    // Only names this server defines — an arbitrary client-sent name never
+    // reaches telemetry.
+    if (tools.some((t) => t.name === toolName)) {
+      getTelemetry().recordUsage('mcp_tool', toolName, !result.isError, this.clientInfo);
+    }
   }
 
   /**

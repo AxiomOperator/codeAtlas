@@ -27,11 +27,20 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- An opt-in search gate for Claude Code: `codegraph install --gate-hook` (or answering yes in the installer) makes Claude ask CodeGraph once before it can fall back to Grep, Glob or a shell search in an indexed project. It is off unless you turn it on, never blocks outside an indexed project, and `CODEGRAPH_NO_GATE_HOOK=1` switches it off. (#2313)
+- A project can add its own notes to the guidance CodeGraph gives agents by writing them in `.codegraph/instructions.md`. (#765)
+- `codegraph_explore` now finds COBOL copybooks named in `EXEC SQL INCLUDE` and CICS `LINK`/`XCTL` when you ask for them by name. (#2342)
+- `codegraph_files` patterns now work like real globs: `*.ts` no longer also matches `.tsx`, brace sets like `*.{ts,tsx}` work, and `**/foo.ts` also finds a `foo.ts` at the project root. A plain word with no wildcards still matches any path containing it.
+
 - `codegraph serve --mcp --no-telemetry` turns telemetry off for that MCP server. (#1908)
 - Telemetry is off by default in CI, where nobody sees the first-run notice; a stored choice or `CODEGRAPH_TELEMETRY=1` still turns it on. Tool names a client sends that aren't CodeGraph's own are counted as `other`, and agent names that aren't plain identifiers are dropped. (#1868)
 
 ### Fixes
 
+- `codegraph_node` and `codegraph node` no longer show a different symbol's code when a name is mistyped or partial; they say it wasn't found and suggest the closest names, putting a wrong-case match first. (#1455)
+- In opencode, CodeGraph's tools are no longer listed under doubled names like `codegraph_codegraph_explore`, which models failed to call. (#1267)
+- Invalid tool arguments, unknown tool names and disabled tools now come back as guidance the agent can act on instead of an error that made it stop using CodeGraph, and a non-numeric `depth` or `limit` can no longer make a query run unbounded. (#1403)
+- Passing a file instead of a folder as `projectPath` now works, and a project kept under `~/.config` can be used once it is indexed.
 - Opening a project after an interrupted index no longer repeats the same slow repair on every start: the repair is skipped while another process is still indexing, runs in the background so the server stays responsive, and keeps what it finished if it is stopped partway. (#1887)
 - A first index that was killed partway is detected on the next start and rebuilt cleanly, instead of risking a damaged index file.
 - Background workers now shut down by finishing on their own instead of being stopped from outside, which avoids a rare crash on Windows during long indexes.
